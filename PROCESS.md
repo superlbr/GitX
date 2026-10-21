@@ -286,7 +286,7 @@ Create/Apply Patch、Custom Actions、Move/Revert to Revision、冲突 Mark Reso
 
 **功能面**：设置卡（工具栏 11 枚里只剩 index 10「设置」没接，点了是显式提示）、
 push/pull 端到端判据（fetch 有，push/pull 仍无 remote 样本）、命令层 + 命令面板（⌘K 那半在 egui 版还没搬）、
-多选、文件溯源/blame、拖拽与「扫描文件夹」入口、原生目录选择器（要引 `rfd`）、深色模式、
+多选、拖拽与「扫描文件夹」入口、原生目录选择器（要引 `rfd`）、深色模式、
 按**行**暂存（`line.hunk` 已经给每一行留了值）、差异区右上角那条「搜索」、
 `COL_GRAPH` 超过 4 道目前是 **assert 报错**（没做列宽自适应）、`--depth`/bare/submodule、
 克隆进度与 stderr 流式（现在只有结果一条 note）、`.gitignore` 编辑器、amend / `--no-verify` / `-S` 签名、
@@ -770,3 +770,132 @@ M2 顺带抓到一条**探针口径**：`visible_texts` 里 hunk 那一行的两
   单文件那格不受影响（也是用户点的那条）。要不要换成我们自己画一条文件名分隔，
   是 SourceTree 没有的东西 —— 想做必须先按契约第②条登记。
 - 分类行 +8 与文件行 +17 之间**只剩 9pt**，视觉上分不分得开只有眼睛说了算，而这批眼睛用不了。
+
+## 文件溯源浮层：历史 / 逐行归属 / 全文 / 恢复旧版（任务 #40，2026-10-21 深夜）
+
+**决定与依据**
+
+- 核心层的 `file_log` / `blame` / `rev_file_text` / `restore_file` **早已有单测、界面零调用**。
+  这一批只接界面，不改 git 语义。
+- SourceTree 4.2.19 的文件历史是**独立窗口**，两张参考截图都没拍到，`.nib` 里也没读到它的控件结构。
+  所以这一块按契约第②条登记为**我们的增强**：用同层浮层、页签式布局，不声称「照抄 SourceTree」。
+  尺寸 `HIST_W/H`、`HIST_LIST_W` 都是估的，没有量值。
+- 三个请求各走一条线程，回复带 `seq` + `path`（全文/补丁再带 `index`）：
+  换文件、换仓库、换选中项之后，迟到的旧回复对不上号就丢掉。帧里不跑 git。
+- `blame` 走**工作区那份**（`oid = None`）：「现在这些行是谁写的」；历史页签选中项则走那条提交的补丁。
+- 「恢复到这一版」是覆盖工作区和索引的破坏性动作，必须走 `land` → 确认卡，不能 `act` 直落。
+- 「全文」与「补丁」分开取：看全文的人通常是在找「这行原来长什么样」，和逐行差异不是同一件事。
+
+**改了什么**
+
+- `src/ui/state.rs`：`HistTab` / `HistView` / `FileHistory`（含 `full_for` 防换行错配）、
+  四条消息 `FileLog` / `HistoryPatch` / `HistoryText` / `HistoryBlame`、`Action::RestoreFile`。
+- `src/ui/data.rs`：`spawn_file_log` / `spawn_history_patch` / `spawn_history_text` / `spawn_history_blame`、
+  `change_label`、文件行菜单新增「查看文件历史」、提交改动列表的 `commit_file_menu`。
+- `src/ui/widgets.rs`：`history_row` / `blame_row` / `history_diff_row` / `history_text_row` / `history_note`；
+  `section` 多一个 `hist` 出参。
+- `src/ui/app.rs`：`open_history`、`history_layer`（遮罩 + 页签 + 双栏 + Esc/点外关闭）、poll 四个分支、
+  切换仓库时清面板、`Failed` 时熄灭所有「读取中」。
+- `src/ui/theme.rs`：`HIST_*` 九个无参考图常量。
+- `src/geometry.rs`：6 条新判据 + `history_repo` / `open_history_for_test` / `history_click` 三个助手。
+  `history_click` 按**字号 11.5** 认面板行：日志行是 12.5，按文字找会先撞上遮罩后面的日志行。
+
+**判据 + 反向变异表**
+
+| 判据 | 钉的是 |
+|---|---|
+| `the_file_history_lists_the_commits_that_touched_the_file` | 右键菜单 → `git log --follow` → 面板列表；默认选最新；右侧是那条提交对该文件的补丁 |
+| `picking_an_older_entry_swaps_the_patch` | 选中项变化 → 新请求 → 同 `seq`/`path`/`index` 才落地；旧补丁不残留 |
+| `the_blame_tab_attributes_each_line_to_a_commit` | 真 `git blame`：四行、第二行内容/作者/提交号；blame 行与作者真的画出来 |
+| `the_full_text_view_shows_the_file_at_that_version` | 「全文」拉的是该版本原文件；换选中项后 `full_for` 跟着换 |
+| `restoring_an_old_version_asks_before_it_overwrites_the_worktree` | 恢复按钮**只开确认卡**；确认前工作区一个字节不许变；点「确定」后才覆盖；面板不关 |
+| `the_file_history_layer_closes_on_escape_and_outside_click` | Esc 关；点卡片外遮罩关（按/松必须同一个 Context） |
+
+| # | 变异 | 期望 | 实际 |
+|---|---|---|---|
+| M1 | 选中项变化时删掉 `spawn_history_patch` | `picking…` 红 | 红：600 帧还没等到（`patch_loading` 永远亮着） |
+| M2 | 恢复改成 `self.act(...)`，绕过 `land` | `restoring…` 红 | 红：`没问一句就动手了` |
+| M3 | 文件列表不调 `open_history` | `the_file_history_lists…` 红 | 红：600 帧还没等到（面板从没打开） |
+
+**仍然没看到过的**
+
+- **这一批同样欠一次真窗口目视**：浮层的宽度、列表 320pt、46pt 行高、双栏分隔位置全是估的；
+  没有 SourceTree 的对应截图可量。要看三件事：① 860×500 在 870 宽窗口里会不会缩得太窄；
+  ② 历史行两行文字在 46pt 里是否挤；③ 页签右侧三个按钮（改动/全文/恢复到这一版）在窄窗口会不会撞。
+- **`blame` 只认工作区**：选中历史里某条提交时，逐行归属仍显示当前文件。SourceTree 是否跟随选中项，
+  没有依据；要做成两态得先登记（契约第②条）。
+- **历史只取 200 条**（`FILE_LOG_MAX`）。再多没有分页，也没有「加载更多」。
+- **恢复的副作用写进了确认文案**：`git checkout <oid> -- <path>` 会连索引一起改，
+  所以恢复完这个文件处于**已暂存修改**。这是 git 语义，不是我们的选择，但没有真窗口复看过。
+- **选中「删除该文件的提交」时全文是一句错误提示**（`rev_file_text` 读不到），
+  不是空白页；这条只在核心层有单测，面板里的呈现没目视过。
+- **超长 / 二进制文件**：全文走核心层字节上限，超限时同样是一句错误提示；没有流式或截断提示。
+
+---
+
+## 冲突解决 + 继续/中止（任务 #41，2026-10-21 深夜）
+
+**决定与依据**
+
+- 核心层的 `resolve_ours` / `resolve_theirs` / `conflict_content` / `resolve_manual` /
+  `continue_op` / `abort_op` 早已存在、界面零调用；`repo_state` 也在 `status()` 里算好了，
+  只是没人读。这一批只接界面，外加两个核心缺口：`mark_resolved` / `mark_unresolved`。
+- **修了一个核心 bug**：`repo_state` 原来跑 `git rev-parse --git-dir`（输出是 `.git`），
+  再拿这个相对路径去 `exists()`——查的是壳进程 cwd，不是被打开的仓库。所以任何仓库都报
+  `repo_state = "none"`，冲突横幅永远画不出来。改成 `--absolute-git-dir`，三条核心判据守住。
+- `parse_status` 把 `u` 行标成 `staged: true`（porcelain 里它确实占着索引）。界面不能照搬：
+  冲突文件若混进「已暂存文件」，用户会以为已经解决。`file_list` 先按 `Unmerged` 挑出来单独成组，
+  **不改核心的状态模型**。
+- 文案全部取自本机 SourceTree 4.2.19 `zh_CN.lproj/Localizable.strings`：
+  「冲突的文件」「未解决的合并：」「未解决的变基:」「继续」「终止」「放弃变基」
+  「确认使用「我的版本」解决冲突」等。遴选按官方菜单叫「遴选」。
+- 冲突行**不带方框**（`check: None`）：冲突不是「暂存/未暂存」两态，勾上不等于解决。
+  点行看的是工作区那份（带冲突标记）的差异，不是 `--cached`。
+- 继续/终止、ours/theirs、标记未解决都会丢东西或落提交，全部进 `needs_confirm`；
+  文件表出口从 `self.act(...)` 改成 `land(Intent{..})`，让右键菜单里的「放弃」也走同一条确认路径。
+- 横幅只在 `repo_state != "none"` 时占位（30pt）；正常仓库的几何一个像素都不动。
+
+**改了什么**
+
+- `src/git.rs`：`mark_resolved`（`git add -- path`）、`mark_unresolved`（`git checkout -m -- path`）；
+  `repo_state` 改绝对 git-dir；三条核心判据 + `merge_conflict()` 夹具（真分支、真冲突）。
+- `src/ui/state.rs`：`Action::{ResolveOurs, ResolveTheirs, MarkResolved, MarkUnresolved, ContinueOp, AbortOp}`。
+- `src/ui/data.rs`：`conflict_menu`、`is_conflict`。
+- `src/ui/widgets.rs`：`conflict_section`（无组框、无整组操作）、`op_banner`（标题 + 冲突数 + 继续/终止）、
+  `op_noun/op_title/continue_label/abort_label`、确认文案；`needs_confirm` 新增六条。
+- `src/ui/app.rs`：`act()` 映射；`file_list` 冲突分组 + 横幅 + 出口改走 `land`；
+  提交描述框的 Inter 行高溢出 1.6pt 记录在 `COMMIT_H` 注释里。
+- `src/ui/theme.rs`：`WARN_BG` / `CONFLICT_BANNER_H` 两个无参考图常量。
+- `src/geometry.rs`：3 条新判据 + `conflict_repo` 夹具；`band()` 容差 1.5 → 2.0（Inter 行盒）。
+
+**判据 + 反向变异表**
+
+| 判据 | 钉的是 |
+|---|---|
+| `resolving_with_theirs_stages_that_side_and_continue_finishes_the_merge` | 真冲突 → theirs 改工作区并暂存 → `continue_op` 落合并提交、状态回到 none（核心层） |
+| `mark_resolved_stages_the_hand_edited_file_and_mark_unresolved_puts_it_back` | 手工合并后 `add` 离开未合并态；`checkout -m` 把冲突标记放回去（核心层） |
+| `abort_restores_the_pre_merge_worktree` | `merge --abort` 回到合并前内容（核心层） |
+| `a_half_finished_merge_gets_its_own_banner_and_conflict_group` | 横幅「未解决的合并：冲突：1」；冲突单独成组、**不**混进已暂存 |
+| `resolving_with_ours_and_continuing_finishes_the_merge` | 右键 ours → 确认卡 → 冲突组消失、横幅还在 → 继续 → 确认 → 真合并提交 |
+| `aborting_a_merge_asks_before_it_rolls_back` | 「终止」先开卡；点「取消」仓库一动不许动；确认后回到 `mine` |
+
+| # | 变异 | 期望 | 实际 |
+|---|---|---|---|
+| M1 | `is_conflict` 恒 false | 分组/横幅那两条红 | 红：横幅只剩「未解决的合并：」，没有冲突数，`已暂存文件（1）` 里混着 `a.txt` |
+| M2 | `needs_confirm` 删掉 `ResolveOurs` | `resolving…` 红 | 红：`覆盖工作区之前没先问一句` |
+| M3 | `needs_confirm` 删掉 `AbortOp` | `aborting…` 红 | 红：终止直接执行，确认卡是 None |
+| M4 | `repo_state` 退回 `--git-dir` | 三条核心冲突判据红 | 红：`repo_state` 恒为 `none`，合并提交/中止断言全挂 |
+
+**仍然没看到过的**
+
+- **真窗口目视**：横幅只在冲突时出现，30pt 高、左侧标题右侧两枚小按钮；窄到 870 时
+  「未解决的合并：冲突：1」会不会撞按钮，没有目视。`WARN_BG` 的浅红也是估的。
+- **rebase / cherry-pick 只验证了 `repo_state` 的分支逻辑**（核心层读 sentinel 文件），
+  没有造真 rebase / cherry-pick 冲突仓库跑端到端；界面文案按官方 strings 写，但三种操作的
+  continue/abort 语义（尤其 rebase 的 `--continue` 与 `--abort`）没有真仓库判据。
+- **手动编辑冲突文件**没有内置编辑器：用户得在外部改完再点「标记为已解决」。
+  `conflict_content` / `resolve_manual` 仍是零调用（那需要文本编辑器，不在这一批）。
+- **继续合并不会帮用户填提交信息**：`git merge --continue` 会开编辑器，无头/无 TTY 下
+  行为依赖 `GIT_EDITOR`；核心层测试能过是仓库里已有默认信息。真窗口若卡住，要先设
+  `GIT_EDITOR=true`——这一条没有判据。
+

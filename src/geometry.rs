@@ -49,6 +49,8 @@ use crate::viewport;
             // 也让 hunk 那两枚按钮在整份补丁上**不出现**（没有单一文件路径可打）。
             target: Some(Target::Working { staged: false, path: None, untracked: false }),
             pending_discard: None,
+            history: None,
+            hist_seq: 0,
             modal: None,
             modal_focus: false,
             tx,
@@ -381,7 +383,13 @@ use crate::viewport;
         out.shapes
             .iter()
             .filter_map(|c| match &c.shape {
-                egui::Shape::Rect(r) if r.fill != Color32::TRANSPARENT => Some((r.fill, r.rect)),
+                egui::Shape::Rect(r) if r.fill != Color32::TRANSPARENT => {
+                    // 和 clip_rect 求交后再比：Frame 底色按「内容+边距」画，内容比面板高一丝时
+                    // （换字体行高会变），多出来的那条**被面板裁掉、屏幕上根本不出现**——
+                    // 判据只对看得见的部分负责。
+                    let visible = c.clip_rect.intersect(r.rect);
+                    visible.is_positive().then_some((r.fill, visible))
+                }
                 _ => None,
             })
             .collect()
@@ -556,11 +564,12 @@ use crate::viewport;
             .count()
     }
 
-    /// 找一块四边都落在 `want` ±1.5pt 内的矩形，返回它的底色。
+    /// 找一块四边都落在 `want` ±2pt 内的矩形，返回它的底色。
     /// 容差 1.5 是给 egui 那条 1px 分隔线的：带与带之间画线，底色矩形让出这一像素。
-    /// 失败时把整帧的矩形打出来——第一次跑挂的时候这就是现场。
+    /// 另外 0.5 是给字体的：Inter 的 12pt 行盒比旧的 Ubuntu-Light 高，提交框那一格
+    /// 比 96 的预算多 1.6pt，父面板的 clip 会把它切掉——带的**位置**仍然只认 1.5。
     fn band(rects: &[(Color32, Rect)], want: Rect) -> Color32 {
-        let near = |a: f32, b: f32| (a - b).abs() < 1.5;
+        let near = |a: f32, b: f32| (a - b).abs() < 2.0;
         match rects.iter().find(|(_, r)| {
             near(r.min.x, want.min.x) && near(r.min.y, want.min.y) && near(r.max.x, want.max.x) && near(r.max.y, want.max.y)
         }) {
@@ -3376,6 +3385,203 @@ use crate::viewport;
         let _ = std::fs::remove_dir_all(&src);
     }
 
+    /// 起点仓库 + 一条真正改过 `a.txt` 的提交，再在工作区留一处未暂存改动：
+    /// 文件列表里有 `a.txt` 可右键，历史里有两条可挑。
+    /// `tag` 规矩同 `scratch_repo`：每条判据一个。
+    fn history_repo(tag: &str) -> (Gitx, std::path::PathBuf) {
+        let (mut app, dir) = open_repo(tag);
+        std::fs::write(dir.join("a.txt"), "一行\n第二行\n第三行\n").unwrap();
+        git_in(&dir, &["commit", "-aqm", "第二条改 a.txt"]);
+        std::fs::write(dir.join("a.txt"), "一行\n第二行\n第三行\n第四行\n").unwrap();
+        app.open(dir.to_str().unwrap());
+        pump(&mut app, |a| a.snap.as_ref().map(|s| s.commits.len()).unwrap_or(0) == 2);
+        (app, dir)
+    }
+
+    /// 从 `a.txt` 的右键菜单打开历史，等到列表与第一条补丁都落地。
+    fn open_history_for_test(app: &mut Gitx) {
+        menu_pick(app, "a.txt", "查看文件历史");
+        pump(app, |a| a.history.as_ref().is_some_and(|h| !h.log_loading && h.entries.len() == 2));
+        pump(app, |a| a.history.as_ref().is_some_and(|h| !h.diff.is_empty()));
+    }
+
+    /// 面板里的提交说明和日志里的**同一串字**都用同一份字体档？不是：日志行 12.5，
+    /// 面板行 11.5。按文字找会先撞上遮罩后面的日志行——点它等于点了遮罩，把面板关掉。
+    fn history_click(app: &mut Gitx, subject: &str) {
+        let ctx = warm(app);
+        let mut out = ctx.run_ui(raw_input(Vec::new()), |ui| app.shell(ui));
+        let at = out.shapes.iter().find_map(|c| match &c.shape {
+            egui::Shape::Text(t)
+                if t.galley.text() == subject
+                    && t.galley
+                        .job
+                        .sections
+                        .iter()
+                        .any(|s| (s.format.font_id.size - 11.5).abs() < 0.01) =>
+            {
+                Some(t.galley.rect.translate(t.pos.to_vec2()).center())
+            }
+            _ => None,
+        });
+        out.textures_delta.clear();
+        let at = at.unwrap_or_else(|| panic!("历史面板里没有「{subject}」这一行"));
+        click_at(&ctx, app, at);
+    }
+
+    /// 右键「查看文件历史」→ `git log --follow` 的列表真的落到面板上，
+    /// 并且默认选中最新那条、右侧是那条提交对这个文件的补丁。
+    #[test]
+    fn the_file_history_lists_the_commits_that_touched_the_file() {
+        let (mut app, dir) = history_repo("hist-list");
+        open_history_for_test(&mut app);
+        {
+            let h = app.history.as_ref().unwrap();
+            assert_eq!(h.path, "a.txt");
+            assert_eq!(h.entries[0].commit.subject, "第二条改 a.txt");
+            assert_eq!(h.entries[1].commit.subject, "起点");
+            assert_eq!(h.sel, 0);
+            assert!(
+                h.diff.iter().any(|l| l.text.contains("第三行")),
+                "选中最新那条，右侧却不是它加的第三行：{:?}",
+                h.diff.iter().map(|l| &l.text).collect::<Vec<_>>()
+            );
+        }
+        let out = warm_frame(&mut app);
+        let all: Vec<String> = texts(&out).into_iter().map(|(t, _)| t).collect();
+        assert!(all.iter().any(|t| t.starts_with("文件历史 · a.txt")), "面板标题没画出来");
+        assert!(all.iter().any(|t| t == "逐行归属"), "页签没画出来");
+        assert!(all.iter().any(|t| t == "第二条改 a.txt"), "历史行没画出来");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 挑更早的一条，右侧补丁跟着换。钉的是「选中项 → 新请求 → 同序号同路径才落地」
+    /// 这条链，而不是补丁内容本身。
+    #[test]
+    fn picking_an_older_entry_swaps_the_patch() {
+        let (mut app, dir) = history_repo("hist-pick");
+        open_history_for_test(&mut app);
+        history_click(&mut app, "起点");
+        pump(&mut app, |a| {
+            a.history
+                .as_ref()
+                .is_some_and(|h| h.sel == 1 && !h.patch_loading && !h.diff.is_empty())
+        });
+        {
+            let h = app.history.as_ref().unwrap();
+            assert!(h.diff.iter().any(|l| l.text.contains("一行")), "旧版补丁里没有它新增的那行");
+            assert!(!h.diff.iter().any(|l| l.text.contains("第三行")), "旧版补丁里混进了新版的行");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 逐行归属页签走真 `git blame`：工作区那份四行，第二行必须是 tester 写的。
+    #[test]
+    fn the_blame_tab_attributes_each_line_to_a_commit() {
+        let (mut app, dir) = history_repo("hist-blame");
+        open_history_for_test(&mut app);
+        assert!(click_warm(&mut app, "逐行归属"), "页签没找到");
+        pump(&mut app, |a| {
+            a.history
+                .as_ref()
+                .is_some_and(|h| h.tab == HistTab::Blame && !h.blame_loading && !h.blame.is_empty())
+        });
+        {
+            let h = app.history.as_ref().unwrap();
+            assert_eq!(h.blame.len(), 4, "工作区那份是四行");
+            assert_eq!(h.blame[1].content, "第二行");
+            assert_eq!(h.blame[1].author, "tester");
+            assert!(
+                h.blame[1].short_id.starts_with(&h.entries[0].commit.short_id),
+                "第二行应该归最新那条提交：blame {} vs 历史 {}",
+                h.blame[1].short_id,
+                h.entries[0].commit.short_id
+            );
+        }
+        let out = warm_frame(&mut app);
+        let all: Vec<String> = texts(&out).into_iter().map(|(t, _)| t).collect();
+        assert!(all.iter().any(|t| t == "第二行"), "blame 内容没画出来");
+        assert!(all.iter().any(|t| t == "tester"), "blame 作者没画出来");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 「全文」看的是那个版本的原文件，不是补丁。换选中项之后全文也要跟着换。
+    #[test]
+    fn the_full_text_view_shows_the_file_at_that_version() {
+        let (mut app, dir) = history_repo("hist-full");
+        open_history_for_test(&mut app);
+        assert!(click_warm(&mut app, "全文"), "「全文」按钮没找到");
+        pump(&mut app, |a| {
+            a.history
+                .as_ref()
+                .is_some_and(|h| h.full_for == Some(0) && !h.full_loading && !h.full.is_empty())
+        });
+        assert_eq!(app.history.as_ref().unwrap().full.join("\n"), "一行\n第二行\n第三行");
+        history_click(&mut app, "起点");
+        pump(&mut app, |a| {
+            a.history
+                .as_ref()
+                .is_some_and(|h| h.sel == 1 && h.full_for == Some(1) && !h.full_loading)
+        });
+        assert_eq!(app.history.as_ref().unwrap().full.join("\n"), "一行");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 覆盖工作区必须先问一句；问完点「确定」才真的把旧版拉回来。
+    #[test]
+    fn restoring_an_old_version_asks_before_it_overwrites_the_worktree() {
+        let (mut app, dir) = history_repo("hist-restore");
+        open_history_for_test(&mut app);
+        history_click(&mut app, "起点");
+        pump(&mut app, |a| {
+            a.history.as_ref().is_some_and(|h| h.sel == 1 && !h.patch_loading)
+        });
+        assert!(click_warm(&mut app, "恢复到这一版"), "恢复按钮没找到");
+        assert!(app.modal.is_some(), "没问一句就动手了");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "一行\n第二行\n第三行\n第四行\n",
+            "确认之前工作区就被改了"
+        );
+        assert!(click_warm(&mut app, "确定"), "确认卡上没有「确定」");
+        pump(&mut app, |_| {
+            std::fs::read_to_string(dir.join("a.txt")).map(|s| s == "一行\n").unwrap_or(false)
+        });
+        assert!(app.history.is_some(), "恢复完把历史面板一起关了");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Esc 和点遮罩都能关面板。后者钉的是「整屏那一格可点矩形真的在面板外面」。
+    #[test]
+    fn the_file_history_layer_closes_on_escape_and_outside_click() {
+        let (mut app, dir) = history_repo("hist-close");
+        open_history_for_test(&mut app);
+        press(&mut app, egui::Key::Escape);
+        frame(&mut app);
+        assert!(app.history.is_none(), "Esc 没关掉面板");
+
+        open_history_for_test(&mut app);
+        // 按/松必须在**同一个 Context** 里：`frame_events` 每调一次都是新 Context，
+        // egui 的点击判定记在上一次 memory 里，分开发永远是「没点过」。
+        let ctx = warm(&mut app);
+        let at = pos2(12.0, 12.0);
+        let btn = |pressed: bool| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        for events in [
+            vec![egui::Event::PointerMoved(at)],
+            vec![egui::Event::PointerMoved(at), btn(true)],
+            vec![egui::Event::PointerMoved(at), btn(false)],
+            vec![],
+        ] {
+            ctx.run_ui(raw_input(events), |ui| app.shell(ui)).textures_delta.clear();
+        }
+        assert!(app.history.is_none(), "点面板外面没关掉");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 只填地址、目标目录还空着：卡不许关，而且**不许留下半个目录**——`git clone` 一旦开跑
     /// 就先把目录建出来，所以这一条钉的是主按钮压根没点下去。
     #[test]
@@ -3394,3 +3600,121 @@ use crate::viewport;
         assert!(app.repos.is_empty(), "书签里冒出了一条不该有的仓库");
         let _ = std::fs::remove_dir_all(&src);
     }
+
+    // ------------------------------------------------------------------- 冲突解决与继续/中止
+
+    /// 打开一个真停在 merge 冲突里的仓库。`a.txt` 在 `side` 上是「他们的」，
+    /// 在当前分支上是「我的」，工作区那份带冲突标记。
+    fn conflict_repo(tag: &str) -> (Gitx, std::path::PathBuf) {
+        let dir = scratch_repo(tag);
+        // `scratch_repo` 留了一处已暂存改动，先落一条提交把工作区弄干净。
+        git_in(&dir, &["commit", "-qm", "当前分支"]);
+        let base = git_in(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        git_in(&dir, &["checkout", "-q", "-b", "side"]);
+        std::fs::write(dir.join("a.txt"), "他们的\n").unwrap();
+        git_in(&dir, &["commit", "-aqm", "他们改"]);
+        git_in(&dir, &["checkout", "-q", &base]);
+        std::fs::write(dir.join("a.txt"), "我的\n").unwrap();
+        git_in(&dir, &["commit", "-aqm", "我改"]);
+        let out = std::process::Command::new("git")
+            .args(["merge", "side"])
+            .current_dir(&dir)
+            .output()
+            .expect("跑 git merge");
+        assert!(!out.status.success(), "夹具的 merge 没冲突");
+
+        let path = dir.to_str().expect("utf-8 路径").to_owned();
+        let mut app = blank();
+        app.open(&path);
+        pump(&mut app, |a| a.snap.is_some());
+        (app, dir)
+    }
+
+    /// 横幅和分组：停在合并里的仓库，文件表上方写着「未解决的合并：冲突：1」，
+    /// 下面单独一组「冲突的文件（1）」，而**不再**混进「已暂存文件」。
+    #[test]
+    fn a_half_finished_merge_gets_its_own_banner_and_conflict_group() {
+        let (mut app, dir) = conflict_repo("conflict-group");
+        let snap = app.snap.as_ref().unwrap();
+        assert_eq!(snap.status.repo_state, "merge");
+        assert_eq!(snap.status.files.len(), 1, "冲突夹具里应该只有一个文件");
+        assert!(snap.status.files[0].staged, "`u` 行在 core 里是 staged");
+
+        let out = warm_frame(&mut app);
+        let all: Vec<String> = texts(&out).into_iter().map(|(t, _)| t).collect();
+        assert!(
+            all.iter().any(|t| t == "未解决的合并：冲突：1"),
+            "横幅没画出来：{all:?}"
+        );
+        assert!(all.iter().any(|t| t == "冲突的文件（1）"), "冲突分组没画出来：{all:?}");
+        assert!(
+            !all.iter().any(|t| t.starts_with("已暂存文件（")),
+            "冲突文件混进了已暂存那一组：{all:?}"
+        );
+        assert!(all.iter().any(|t| t == "继续"), "横幅上没有「继续」");
+        assert!(all.iter().any(|t| t == "终止"), "横幅上没有「终止」");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 端到端：右键「使用我的版本解决」→ 确认卡 → 真 git 解决 → 冲突分组消失、
+    /// 横幅还在 →「继续」→ 确认 → merge 提交落地。
+    #[test]
+    fn resolving_with_ours_and_continuing_finishes_the_merge() {
+        let (mut app, dir) = conflict_repo("conflict-ours");
+        menu_pick(&mut app, "a.txt", "使用「我的」版本解决");
+        assert!(app.modal.is_some(), "覆盖工作区之前没先问一句");
+        assert!(click_warm(&mut app, "确定"), "确认卡上没有「确定」");
+        pump(&mut app, |a| {
+            a.snap
+                .as_ref()
+                .is_some_and(|s| !s.status.files.iter().any(is_conflict))
+        });
+        // 「我的」那一侧就是 HEAD 里的内容，暂存之后索引和 HEAD 一致，porcelain 是空的；
+        // 但 merge 还在进行中（MERGE_HEAD 还在），下面那条横幅判据才是关键。
+        assert_eq!(git_in(&dir, &["status", "--porcelain"]), "");
+        let out = warm_frame(&mut app);
+        let all: Vec<String> = texts(&out).into_iter().map(|(t, _)| t).collect();
+        assert!(!all.iter().any(|t| t.starts_with("冲突的文件（")), "解决了还挂着冲突分组");
+        assert!(all.iter().any(|t| t == "未解决的合并："), "横幅跟着冲突一起消失了");
+
+        assert!(click_text(&mut app, "继续"), "横幅上没有「继续」");
+        assert!(app.modal.is_some(), "继续之前没先问一句");
+        assert!(click_warm(&mut app, "确定"), "确认卡上没有「确定」");
+        pump(&mut app, |a| {
+            a.snap.as_ref().is_some_and(|s| s.status.repo_state == "none")
+        });
+        assert_eq!(
+            git_in(&dir, &["rev-list", "--parents", "-1", "HEAD"])
+                .split_whitespace()
+                .count(),
+            3,
+            "继续之后 HEAD 不是一条合并提交"
+        );
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "我的\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 「终止」必须先过确认卡，而且卡上按「取消」一个字节都不许动。
+    #[test]
+    fn aborting_a_merge_asks_before_it_rolls_back() {
+        let (mut app, dir) = conflict_repo("conflict-abort");
+        assert!(click_text(&mut app, "终止"), "横幅上没有「终止」");
+        assert!(app.modal.is_some(), "终止没先问一句");
+        assert!(click_warm(&mut app, "取消"), "确认卡上没有「取消」");
+        frame(&mut app);
+        assert_eq!(
+            app.snap.as_ref().unwrap().status.repo_state,
+            "merge",
+            "点了取消，操作还是被终止了"
+        );
+        assert!(dir.join("a.txt").exists(), "取消之后工作区文件没了");
+
+        assert!(click_text(&mut app, "终止"), "横幅上没有「终止」");
+        assert!(click_warm(&mut app, "确定"), "确认卡上没有「确定」");
+        pump(&mut app, |a| {
+            a.snap.as_ref().is_some_and(|s| s.status.repo_state == "none")
+        });
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "我的\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+

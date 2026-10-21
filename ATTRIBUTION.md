@@ -23,6 +23,7 @@ MIT/Apache 授权范围内（条款在 `NOTICE` 里）：分叉出去请改名�
 | 素材 | 作者 | 许可证 | 说明 |
 | --- | --- | --- | --- |
 | `NotoSansSC-Regular.otf`（8.3 MB 全量 CJK） | Google / Adobe（Noto 项目） | SIL Open Font License 1.1 | **故意不入库**（根 `.gitignore` 挡住），授权声明在 [`assets/fonts/OFL.txt`](assets/fonts/OFL.txt)。新克隆按 README 取一份，或用 `GITX_FONT_DIR` 指过去 |
+| `Inter-Regular/Medium/SemiBold.ttf`（各 ~400 KB） | Rasmus Andersson（Inter 项目） | SIL Open Font License 1.1 | **直接入库并嵌进二进制**（`src/ui/fonts.rs`），拉丁正文与真字重的来源，授权声明在 [`assets/fonts/OFL-Inter.txt`](assets/fonts/OFL-Inter.txt) |
 | `eframe` / `egui` / `epaint` 0.37 | Emil Ernerfeldh 与贡献者 | MIT OR Apache-2.0 | 界面层本体，彩色 emoji 走 `color_fonts` feature |
 | `serde` / `serde_json` / `thiserror` / `chrono` / `tempfile` | 各自作者 | MIT OR Apache-2.0 | 序列化、错误类型、时间戳、测试临时目录 |
 | `rusqlite` 0.31 | Ryan Olson | MIT | 本地状态存储 |

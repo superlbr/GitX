@@ -1,12 +1,13 @@
 //! （拆分自 main.rs；见 PROCESS.md「拆分 main.rs」。）
 
 use eframe::egui::{self, Align, Align2, Color32, FontId, Label, Pos2, Rect, RichText, Sense, Stroke, TextStyle, Vec2, pos2, vec2};
-use gitx::models::{ChangeStatus, FileStatus};
+use gitx::models::{BlameLine, ChangeStatus, FileLogEntry, FileStatus};
 
 use crate::ui::theme::*;
 use crate::ui::state::*;
 use crate::ui::data::*;
 use crate::ui::graph::*;
+use crate::ui::diffmodel::{DiffLine, Kind};
 
 /// 一行要画的东西。**带所有权**：绘制时只画视口里那几十行，从 `Commit` 拷出四段字符串
 /// 比把整份提交搬进闭包再处理生命周期便宜得多。
@@ -148,9 +149,8 @@ pub(crate) fn log_row(ui: &mut egui::Ui, width: f32, cells: &Cells, active: bool
         ring_cell(&p, rect, lane, cells.stem);
     }
     // 虚拟行整行加粗（参考图：`*`、「Uncommitted changes」、「今天 14:46」三处都是粗的）。
-    // 这里只能做到**颜色更深**：egui 0.37 的 `RichText::strong()` 改的是取色而不是字重，
-    // 而自带的那份 Noto Sans SC 只有 Regular 一个字面——真粗体要再带一份 Bold（OFL 允许，
-    // 但那是第二个 8MB）。
+    // 真字重来自 Inter SemiBold（fonts.rs 嵌入的那份）：subject 走命名字族。CJK 那半
+    // 没有真粗体（Noto 只带 Regular，第二份 8MB 不值），落 Regular 靠深色补层次。
     let strong = active || cells.ring.is_some();
     let fg = if active { Color32::WHITE } else { INK };
     let font = ui.style().text_styles[&TextStyle::Body].clone();
@@ -169,10 +169,10 @@ pub(crate) fn log_row(ui: &mut egui::Ui, width: f32, cells: &Cells, active: bool
     let w = (right - COL_DATE - COL_AUTHOR - x - 20.0).max(60.0);
     let mut rich = RichText::new(cells.subject.as_str()).size(12.5);
     if strong {
-        rich = rich.strong();
+        rich = rich.family(crate::ui::fonts::semibold_family());
     }
     // 参考图量的：普通行 (38,38,38)、虚拟行更深一档 (33,33,33)、选中行白字。
-    // `strong()` 只改取色不改字重（自带字体只有 Regular 一个字面），所以颜色在这儿自己钉住。
+    // `strong()` 只改取色不改字重，所以颜色在这儿自己钉住，不靠 strong()。
     rich = rich.color(if active {
         Color32::WHITE
     } else if strong {
@@ -449,7 +449,61 @@ impl Intent {
 /// 会丢东西的那几个动作不能点一下就跑，先摊一张确认卡（SourceTree 也是这么拦的）。
 /// 拦在**出口**而不是每一处菜单里：以后多加一个入口也不会漏。
 pub(crate) fn needs_confirm(a: &Action) -> bool {
-    matches!(a, Action::DeleteBranch(_) | Action::DeleteTag(_) | Action::StashPop(_) | Action::StashDrop(_))
+    matches!(
+        a,
+        Action::DeleteBranch(_)
+            | Action::DeleteTag(_)
+            | Action::StashPop(_)
+            | Action::StashDrop(_)
+            | Action::RestoreFile { .. }
+            // 「用我的/他们的解决」会用那一版覆盖工作区里正在编辑的冲突文件；
+            // 「标记为未解决」会把冲突标记重新盖回去。两件都能丢手工改动。
+            | Action::ResolveOurs(_)
+            | Action::ResolveTheirs(_)
+            | Action::MarkUnresolved(_)
+            // 继续/终止都会落一次提交或回滚整段操作，SourceTree 同样先问一句。
+            | Action::ContinueOp { .. }
+            | Action::AbortOp { .. }
+    )
+}
+
+/// 两种操作轨迹在横幅和确认卡上的叫法。SourceTree 的中文文案：合并叫「合并」，
+/// 遴选叫「遴选」，变基叫「变基」。
+pub(crate) fn op_noun(state: &str) -> &'static str {
+    match state {
+        "merge" => "合并",
+        "cherry-pick" => "遴选",
+        "rebase" => "变基",
+        _ => "操作",
+    }
+}
+
+/// 横幅标题：「未解决的合并：」「未解决的变基:」——后一个冒号 SourceTree 用的是半角，
+/// 照抄。没有进行中的操作时返回 `None`，调用方据此决定画不画横幅。
+pub(crate) fn op_title(state: &str) -> Option<&'static str> {
+    match state {
+        "merge" => Some("未解决的合并："),
+        "cherry-pick" => Some("未解决的遴选："),
+        "rebase" => Some("未解决的变基:"),
+        _ => None,
+    }
+}
+
+/// 「继续」那一枚按钮上的字。合并就是「继续」，另外两种带上操作名（SourceTree 同款）。
+pub(crate) fn continue_label(state: &str) -> String {
+    match state {
+        "merge" => "继续".to_owned(),
+        other => format!("继续{}", op_noun(other)),
+    }
+}
+
+/// 「终止」那一枚。变基在 SourceTree 里叫「放弃变基」，另外两种叫「终止…」。
+pub(crate) fn abort_label(state: &str) -> String {
+    match state {
+        "merge" => "终止".to_owned(),
+        "rebase" => "放弃变基".to_owned(),
+        other => format!("终止{}", op_noun(other)),
+    }
 }
 
 /// 确认卡的标题与那句说明。文案的重点是「丢的是哪一份、还能不能找回来」。
@@ -462,6 +516,40 @@ pub(crate) fn confirm_of(a: &Action) -> (&'static str, String) {
         Action::DeleteTag(name) => ("删除标签", format!("标签 {name} 从本地删掉；远端那份要另外推一次才会没。")),
         Action::StashPop(i) => ("弹出贮藏", format!("stash@{{{i}}} 回到工作区，同时从贮藏列表里删掉。")),
         Action::StashDrop(i) => ("丢弃贮藏", format!("stash@{{{i}}} 那份改动直接丢掉，找不回来。")),
+        Action::RestoreFile { oid, path } => (
+            "恢复到旧版本",
+            format!(
+                "{} 会被 {oid} 那一版覆盖，工作区和暂存区里它现在的改动都会没。",
+                path,
+                oid = &oid[..oid.len().min(8)]
+            ),
+        ),
+        Action::ResolveOurs(path) => (
+            "确认使用「我的版本」解决冲突",
+            format!("{path} 会被当前分支那一版覆盖，工作区里它现在的手工改动都会没。"),
+        ),
+        Action::ResolveTheirs(path) => (
+            "确认使用「他们的版本」解决冲突",
+            format!("{path} 会被传入那一版覆盖，工作区里它现在的手工改动都会没。"),
+        ),
+        Action::MarkUnresolved(path) => (
+            "确认标记为未解决",
+            format!("{path} 会被重新写上冲突标记，工作区里它现在的改动会被覆盖。"),
+        ),
+        Action::ContinueOp { state } => (
+            "继续操作？",
+            match state.as_str() {
+                "rebase" => "您确定要继续此变基操作吗？请确保您已经解决了所有待解决的冲突。".to_owned(),
+                other => format!("确认所有冲突都已解决，然后完成这次{}。", op_noun(other)),
+            },
+        ),
+        Action::AbortOp { state } => (
+            "中止操作？",
+            match state.as_str() {
+                "rebase" => "您确定要中止这次变基吗？".to_owned(),
+                other => format!("这次{}会整个撤销，已经解掉的那部分改动也会没。", op_noun(other)),
+            },
+        ),
         _ => ("确认", String::new()),
     }
 }
@@ -614,6 +702,7 @@ pub(crate) fn section(
     current: &Option<String>,
     act: &mut Option<Action>,
     pick: &mut Option<Target>,
+    hist: &mut Option<String>,
 ) {
     if files.is_empty() {
         return;
@@ -661,6 +750,285 @@ pub(crate) fn section(
         if resp.clicked() {
             *pick = Some(Target::Working { staged: is_staged, path: Some(path.clone()), untracked });
         }
-        resp.context_menu(|ui| file_menu(ui, &path, is_staged, untracked, act));
+        resp.context_menu(|ui| file_menu(ui, &path, is_staged, untracked, act, hist));
     }
+}
+
+/// 冲突文件那一组。**没有组复选框、没有「放弃整组」**：冲突不是「在/不在暂存区」那种
+/// 两态，得一个一个选边或标记已解决。行本身也不带方框（`file_row` 传 `check: None`），
+/// 否则用户会以为勾上就等于解决了。
+pub(crate) fn conflict_section(
+    ui: &mut egui::Ui,
+    files: &[&FileStatus],
+    current: &Option<String>,
+    act: &mut Option<Action>,
+    pick: &mut Option<Target>,
+    hist: &mut Option<String>,
+) {
+    if files.is_empty() {
+        return;
+    }
+    let (hrect, _) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::hover());
+    put_left(
+        ui,
+        Rect::from_min_max(
+            pos2(hrect.min.x + CHK_HEAD_X + CHK_S + 7.0, hrect.min.y),
+            pos2(hrect.max.x, hrect.max.y),
+        ),
+        |ui| {
+            ui.add(
+                Label::new(
+                    RichText::new(format!("冲突的文件（{}）", files.len()))
+                        .size(11.5)
+                        .strong()
+                        .color(WARN),
+                )
+                .selectable(false)
+                .sense(Sense::hover()),
+            );
+        },
+    );
+    fix_pitch(ui, hrect);
+    for f in files {
+        let path = f.path.clone();
+        let (resp, _) = file_row(
+            ui,
+            &f.path,
+            &ChangeStatus::Unmerged,
+            current.as_deref() == Some(f.path.as_str()),
+            "",
+            None,
+        );
+        if resp.clicked() {
+            // 冲突文件的差异要看**工作区那一份**：`git diff --cached` 对未合并路径不好读，
+            // 而带冲突标记的正文在 `git diff -- path` 里。
+            *pick = Some(Target::Working {
+                staged: false,
+                path: Some(path.clone()),
+                untracked: false,
+            });
+        }
+        resp.context_menu(|ui| conflict_menu(ui, &path, act, hist));
+    }
+}
+
+/// 进行中的合并/遴选/变基横幅。只在 `repo_state != "none"` 时画，正常仓库的几何一点不动。
+/// `continue` 与 `abort` 都走 `land` 那条路（由 `needs_confirm` 拦一道）。
+pub(crate) fn op_banner(ui: &mut egui::Ui, state: &str, conflicts: usize, act: &mut Option<Action>) {
+    let Some(title) = op_title(state) else { return };
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), CONFLICT_BANNER_H), Sense::hover());
+    ui.painter().rect_filled(rect.shrink2(vec2(0.0, 2.0)), 4.0, WARN_BG);
+    let text = if conflicts > 0 {
+        format!("{title}冲突：{conflicts}")
+    } else {
+        title.to_owned()
+    };
+    put_left(
+        ui,
+        Rect::from_min_max(pos2(rect.min.x + 10.0, rect.min.y + 4.0), pos2(rect.max.x - 150.0, rect.max.y - 4.0)),
+        |ui| {
+            ui.add(Label::new(RichText::new(text).size(11.5).color(WARN)).truncate().selectable(false));
+        },
+    );
+    let mut next: Option<Action> = None;
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(Rect::from_min_max(pos2(rect.max.x - 150.0, rect.min.y + 4.0), pos2(rect.max.x - 6.0, rect.max.y - 4.0)))
+            .layout(egui::Layout::right_to_left(Align::Center)),
+        |ui| {
+            if ui.small_button(abort_label(state)).clicked() {
+                next = Some(Action::AbortOp { state: state.to_owned() });
+            }
+            if ui.small_button(continue_label(state)).clicked() {
+                next = Some(Action::ContinueOp { state: state.to_owned() });
+            }
+        },
+    );
+    fix_pitch(ui, rect);
+    if next.is_some() {
+        *act = next;
+    }
+}
+
+/// 历史面板里的一句空态/加载提示。贴在给定区域左上角，不居中——列表空着的时候
+/// 一条居中的字会让人以为整个面板坏了。
+pub(crate) fn history_note(ui: &mut egui::Ui, area: Rect, text: &str) {
+    put_left(
+        ui,
+        Rect::from_min_max(pos2(area.min.x + 4.0, area.min.y + 6.0), pos2(area.max.x, area.min.y + 26.0)),
+        |ui| {
+            ui.add(Label::new(RichText::new(text).size(11.0).color(MUTED)).truncate().selectable(false));
+        },
+    );
+}
+
+/// 历史面板右侧的一行补丁。和差异区画法一致，但不带 hunk 按钮：
+/// 这里是**已落库的提交**，没有区块可暂存。
+pub(crate) fn history_diff_row(ui: &mut egui::Ui, width: f32, line: &DiffLine) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, DIFF_ROW_H), Sense::hover());
+    let p = ui.painter_at(rect);
+    let bg = match line.kind {
+        Kind::Add => ADD_BG,
+        Kind::Del => DEL_BG,
+        Kind::Hunk => HUNK_BG,
+        Kind::Ctx => Color32::TRANSPARENT,
+    };
+    if bg != Color32::TRANSPARENT {
+        p.rect_filled(rect, 0.0, bg);
+    }
+    let font = ui.style().text_styles[&TextStyle::Monospace].clone();
+    let th = ui.text_style_height(&TextStyle::Monospace);
+    let fg = ui.visuals().text_color();
+    for (i, n) in [(0, line.old), (1, line.new)] {
+        let text = n.map(|v| v.to_string()).unwrap_or_default();
+        let r = band(rect, rect.min.x + NO_W * i as f32, NO_W, th);
+        p.text(r.right_center(), Align2::RIGHT_CENTER, text, font.clone(), LINE_NO);
+    }
+    let x = rect.min.x + NO_W * 2.0 + 6.0;
+    let rich = match line.kind {
+        Kind::Hunk => RichText::new(&line.text).font(font).color(MUTED),
+        _ => RichText::new(&line.text).font(font).color(fg),
+    };
+    put_left(ui, band(rect, x, (rect.max.x - x).max(40.0), th), |ui| {
+        ui.add(Label::new(rich).truncate());
+    });
+}
+
+/// 历史面板右侧的全文行：左边一行号，右边原文。行号从 1 数。
+pub(crate) fn history_text_row(ui: &mut egui::Ui, width: f32, line_no: usize, text: &str) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, DIFF_ROW_H), Sense::hover());
+    let p = ui.painter_at(rect);
+    let font = ui.style().text_styles[&TextStyle::Monospace].clone();
+    let th = ui.text_style_height(&TextStyle::Monospace);
+    let fg = ui.visuals().text_color();
+    p.text(
+        pos2(rect.min.x + 36.0, rect.center().y),
+        Align2::RIGHT_CENTER,
+        line_no.to_string(),
+        font.clone(),
+        LINE_NO,
+    );
+    let x = rect.min.x + 44.0;
+    put_left(ui, band(rect, x, (rect.max.x - x).max(40.0), th), |ui| {
+        ui.add(Label::new(RichText::new(text).font(font).color(fg)).truncate());
+    });
+}
+
+/// 文件历史列表的一行：色块 + 提交说明 + 日期，第二行是提交号/作者/改动类型。
+/// 行高钉在 [`HIST_ROW_H`]，和日志一样由 `show_rows` 定周期，不交给布局系统。
+pub(crate) fn history_row(
+    ui: &mut egui::Ui,
+    width: f32,
+    entry: &FileLogEntry,
+    date: &str,
+    active: bool,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, HIST_ROW_H), Sense::click());
+    let p = ui.painter_at(rect);
+    if active {
+        p.rect_filled(rect, 0.0, SELECTED);
+    } else if resp.hovered() {
+        p.rect_filled(rect, 0.0, HOVER);
+    }
+    let (fill, glyph) = badge_of(&entry.change);
+    let badge = Rect::from_min_size(pos2(rect.min.x + HIST_PAD, rect.min.y + 7.0), Vec2::splat(BADGE_S));
+    p.rect_filled(badge, 4.0, fill);
+    p.text(badge.center(), Align2::CENTER_CENTER, glyph, FontId::proportional(10.5), Color32::WHITE);
+    let ink = if active { Color32::WHITE } else { INK };
+    let meta = if active { Color32::WHITE } else { MUTED };
+    let left = rect.min.x + HIST_PAD + BADGE_S + 7.0;
+    put_left(
+        ui,
+        Rect::from_min_max(pos2(left, rect.min.y + 3.0), pos2(rect.max.x - 76.0, rect.min.y + 22.0)),
+        |ui| {
+            ui.add(
+                Label::new(RichText::new(&entry.commit.subject).size(11.5).color(ink))
+                    .truncate()
+                    .selectable(false)
+                    .sense(Sense::hover()),
+            )
+        },
+    );
+    p.text(
+        pos2(rect.max.x - HIST_PAD, rect.min.y + 13.0),
+        Align2::RIGHT_CENTER,
+        date,
+        FontId::proportional(10.5),
+        meta,
+    );
+    let detail = format!(
+        "{} · {} · {}",
+        entry.commit.short_id,
+        entry.commit.author,
+        change_label(&entry.change)
+    );
+    put_left(
+        ui,
+        Rect::from_min_max(pos2(left, rect.min.y + 22.0), pos2(rect.max.x - HIST_PAD, rect.min.y + 41.0)),
+        |ui| {
+            ui.add(Label::new(RichText::new(detail).size(10.5).color(meta)).truncate().selectable(false).sense(Sense::hover()))
+        },
+    );
+    fix_pitch(ui, rect);
+    resp
+}
+
+/// `git blame` 的一行。列宽固定：行号 46、提交号 70、作者 84、日期 72，其余留给内容。
+/// 作者与内容都走 `Label::truncate`，不靠 `painter.text` 硬排——不然长名字会压到下一列上。
+pub(crate) fn blame_row(ui: &mut egui::Ui, width: f32, line: &BlameLine) {
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, HIST_BLAME_ROW_H), Sense::hover());
+    if resp.hovered() {
+        ui.painter_at(rect).rect_filled(rect, 0.0, HOVER);
+    }
+    let p = ui.painter_at(rect);
+    let cy = rect.center().y;
+    let x = rect.min.x + HIST_PAD;
+    p.text(
+        pos2(x + 36.0, cy),
+        Align2::RIGHT_CENTER,
+        line.line_no.to_string(),
+        FontId::monospace(10.0),
+        LINE_NO,
+    );
+    p.text(
+        pos2(x + 44.0, cy),
+        Align2::LEFT_CENTER,
+        line.short_id.chars().take(8).collect::<String>(),
+        FontId::monospace(10.0),
+        MUTED,
+    );
+    let author_x = x + 108.0;
+    put_left(
+        ui,
+        Rect::from_min_max(pos2(author_x, rect.min.y), pos2(author_x + 84.0, rect.max.y)),
+        |ui| {
+            ui.add(
+                Label::new(RichText::new(&line.author).size(10.5).color(MUTED))
+                    .truncate()
+                    .selectable(false)
+                    .sense(Sense::hover()),
+            )
+        },
+    );
+    p.text(
+        pos2(author_x + 88.0, cy),
+        Align2::LEFT_CENTER,
+        line.date.chars().take(10).collect::<String>(),
+        FontId::monospace(10.0),
+        MUTED,
+    );
+    let content_x = x + 200.0;
+    put_left(
+        ui,
+        Rect::from_min_max(pos2(content_x, rect.min.y), pos2(rect.max.x - 4.0, rect.max.y)),
+        |ui| {
+            ui.add(
+                Label::new(RichText::new(&line.content).monospace().size(10.5).color(INK))
+                    .truncate()
+                    .selectable(false)
+                    .sense(Sense::hover()),
+            )
+        },
+    );
+    fix_pitch(ui, rect);
 }

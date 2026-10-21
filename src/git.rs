@@ -366,7 +366,9 @@ pub fn status(repo: &str) -> Result<RepoStatus> {
 
 /// Detect an in-progress merge / cherry-pick / rebase via git-dir sentinel files.
 fn repo_state(repo: &str) -> Result<String> {
-    let gd = run_git(repo, &["rev-parse", "--git-dir"])?
+    // `--git-dir` 是**相对当前进程 cwd** 的一截路径（通常就是 `.git`），拿它去 `exists()`
+    // 查的是壳进程所在的目录，不是被打开的那个仓库。必须问绝对路径。
+    let gd = run_git(repo, &["rev-parse", "--absolute-git-dir"])?
         .trim()
         .to_string();
     let p = std::path::Path::new(&gd);
@@ -761,6 +763,19 @@ pub fn resolve_ours(repo: &str, path: &str) -> Result<()> {
 pub fn resolve_theirs(repo: &str, path: &str) -> Result<()> {
     run_git(repo, &["checkout", "--theirs", "--", path])?;
     run_git(repo, &["add", "--", path])?;
+    Ok(())
+}
+
+/// Mark a hand-edited file as resolved: stage whatever is in the work tree as-is.
+pub fn mark_resolved(repo: &str, path: &str) -> Result<()> {
+    run_git(repo, &["add", "--", path])?;
+    Ok(())
+}
+
+/// Put the conflict markers back: `checkout -m` rebuilds the merged file from the three
+/// stages, so the work tree carries both sides again and the path leaves the index.
+pub fn mark_unresolved(repo: &str, path: &str) -> Result<()> {
+    run_git(repo, &["checkout", "-m", "--", path])?;
     Ok(())
 }
 
@@ -1811,6 +1826,29 @@ mod tests {
         (dir, p)
     }
 
+    /// `a.txt` in a real merge conflict: base `hello`, `side` says `theirs`, current says `mine`.
+    fn merge_conflict() -> (tempfile::TempDir, String) {
+        let (dir, p) = init_repo();
+        let base = run_git(&p, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        git(&p, &["checkout", "-q", "-b", "side"]);
+        fs::write(format!("{}/a.txt", p), "theirs\n").unwrap();
+        git(&p, &["commit", "-q", "-am", "theirs"]);
+        git(&p, &["checkout", "-q", &base]);
+        fs::write(format!("{}/a.txt", p), "mine\n").unwrap();
+        git(&p, &["commit", "-q", "-am", "mine"]);
+        let out = Proc::new("git")
+            .arg("-C")
+            .arg(&p)
+            .args(["merge", "side"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "the merge was supposed to conflict");
+        (dir, p)
+    }
+
     /// `git lfs version` / `git lfs ls-files` as they actually print.
     #[test]
     fn parses_lfs_output() {
@@ -2697,6 +2735,62 @@ mod tests {
         // git checkout <oid> -- <path> also stages the restored content.
         let st = status(&p).unwrap();
         assert!(st.files.iter().any(|f| f.path == "a.txt" && f.staged));
+    }
+
+    #[test]
+    fn resolving_with_theirs_stages_that_side_and_continue_finishes_the_merge() {
+        let (_d, p) = merge_conflict();
+        let before = status(&p).unwrap();
+        assert_eq!(before.repo_state, "merge");
+        assert!(before
+            .files
+            .iter()
+            .any(|f| f.path == "a.txt" && f.index_status == ChangeStatus::Unmerged));
+
+        resolve_theirs(&p, "a.txt").unwrap();
+        assert_eq!(fs::read_to_string(format!("{}/a.txt", p)).unwrap(), "theirs\n");
+        let resolved = status(&p).unwrap();
+        assert_eq!(resolved.repo_state, "merge");
+        assert!(!resolved
+            .files
+            .iter()
+            .any(|f| f.index_status == ChangeStatus::Unmerged));
+
+        continue_op(&p).unwrap();
+        let after = status(&p).unwrap();
+        assert_eq!(after.repo_state, "none");
+        assert!(after.files.is_empty(), "{}", after.files.len());
+    }
+
+    #[test]
+    fn mark_resolved_stages_the_hand_edited_file_and_mark_unresolved_puts_it_back() {
+        let (_d, p) = merge_conflict();
+        // The user says "keep both": write a merged file by hand and stage it.
+        fs::write(format!("{}/a.txt", p), "mine\ntheirs\n").unwrap();
+        mark_resolved(&p, "a.txt").unwrap();
+        let resolved = status(&p).unwrap();
+        assert!(resolved.files.iter().any(|f| f.path == "a.txt" && f.staged));
+        assert!(!resolved
+            .files
+            .iter()
+            .any(|f| f.index_status == ChangeStatus::Unmerged));
+
+        mark_unresolved(&p, "a.txt").unwrap();
+        let back = status(&p).unwrap();
+        assert!(back
+            .files
+            .iter()
+            .any(|f| f.path == "a.txt" && f.index_status == ChangeStatus::Unmerged));
+        let text = fs::read_to_string(format!("{}/a.txt", p)).unwrap();
+        assert!(text.contains("<<<<<<<"), "{text}");
+    }
+
+    #[test]
+    fn abort_restores_the_pre_merge_worktree() {
+        let (_d, p) = merge_conflict();
+        abort_op(&p).unwrap();
+        assert_eq!(status(&p).unwrap().repo_state, "none");
+        assert_eq!(fs::read_to_string(format!("{}/a.txt", p)).unwrap(), "mine\n");
     }
 
     #[test]

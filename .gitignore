@@ -6,6 +6,9 @@
 # egui 版自带的 CJK 字体（8~15MB，从上游重新下载即可，见 src/ui/fonts.rs）
 assets/fonts/*.otf
 assets/fonts/*.ttf
+# Inter 三档各 ~400KB，直接进仓库、嵌进二进制（SIL OFL，登记在 ATTRIBUTION.md）
+!assets/fonts/Inter-*.ttf
+!assets/fonts/OFL-Inter.txt
 
 # Cargo lock: commit it for applications (reproducible builds).
 # Uncomment the line below only if you intend to treat this package as a published library.

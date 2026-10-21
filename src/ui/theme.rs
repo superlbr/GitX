@@ -31,10 +31,12 @@ pub(crate) const TAB_H: f32 = 24.0;
 pub(crate) const TOP_H: f32 = TOOLBAR_H + TAB_H;
 pub(crate) const SIDEBAR_W: f32 = 141.0;
 pub(crate) const STAGING_H: f32 = 245.0;
-/// 文件表底下那格提交框占的高度：摘要 22 + 描述 3 行 + 按钮行 22（行距 0，控件之间的
-/// `item_spacing.y` 也是 0）。**这是自己定的预算，不是参考图量来的**——参考图那张
-/// 提交框只露出摘要一行，量不到三行描述该多高。它的用处只有一个：文件表在上面滚，
+/// 文件表底下那格提交框占的高度：摘要 26 + 描述 3 行 45.6 + 按钮行 26（行距 0，控件之间的
+/// `item_spacing.y` 也是 0），合计 97.6，按 96 的预算放。**这是自己定的预算，不是参考图量来的**——
+/// 参考图那张提交框只露出摘要一行，量不到三行描述该多高。它的用处只有一个：文件表在上面滚，
 /// 提交框钉在带底（见 `the_commit_box_stays_inside_a_short_band`）。
+/// 这 1.6pt 的溢出是换上 Inter 之后多出来的（行盒比自带字体高）：不能靠抬预算解决，
+/// 抬了会把文件表最后一行顶到视口边缘、点不中；父面板的 clip 会把这点溢出切掉，看不见。
 pub(crate) const COMMIT_H: f32 = 96.0;
 pub(crate) const FILES_W: f32 = 435.0;
 /// 窗口能缩到多小。**870 是量出来的，不是拍的**：无头扫 600→1050（步长 10），
@@ -148,6 +150,11 @@ pub(crate) const INK: Color32 = Color32::from_rgb(38, 38, 38);
 pub(crate) const INK_STRONG: Color32 = Color32::from_rgb(33, 33, 33);
 pub(crate) const LINE_NO: Color32 = Color32::from_rgb(0xa8, 0xac, 0xb6);
 pub(crate) const WARN: Color32 = Color32::from_rgb(0xb0, 0x3a, 0x2e);
+/// 冲突/进行中操作那条横幅的底色。**没有参考图依据**：SourceTree 那张截图里没有冲突，
+/// 这是我们的增强，浅到不抢文件表的注意力。
+pub(crate) const WARN_BG: Color32 = Color32::from_rgb(0xfd, 0xf0, 0xee);
+/// 冲突横幅的行高。也没有参考图；和 `ROW_H` 差 4pt，塞得下 11.5 号字与两枚小按钮。
+pub(crate) const CONFLICT_BANNER_H: f32 = 30.0;
 // 描述列那几枚 ref 药丸。三个值都是在参考图上量的（`docs/reference/…-repo-window-2026-10-20.png`，
 // 第一行 `⑂ main` 的浅蓝底取 (213,229,253)、描边取 (170,170,170)、`超前3个版本` 的藏青底取 (0,57,121)）。
 pub(crate) const PILL_BG: Color32 = Color32::from_rgb(0xd5, 0xe5, 0xfd);
@@ -217,6 +224,17 @@ pub(crate) const HUNK_BTN_GAP: f32 = 9.0;
 pub(crate) const HUNK_BTN_EDGE: f32 = 9.0;
 pub(crate) const HUNK_BTN_STROKE: Color32 = Color32::from_rgb(228, 232, 229);
 pub(crate) const HUNK_BTN_FG: Color32 = Color32::from_rgb(109, 110, 109);
+
+/// 文件历史浮层。**没有参考图依据**：SourceTree 4.2.19 的文件历史是一个独立窗口，
+/// 两张截图都没拍到。这里按「能同时放下提交列表和差异」定档位，目视那一轮再调。
+pub(crate) const HIST_W: f32 = 860.0;
+pub(crate) const HIST_H: f32 = 500.0;
+pub(crate) const HIST_HEAD_H: f32 = 34.0;
+pub(crate) const HIST_TAB_H: f32 = 28.0;
+pub(crate) const HIST_LIST_W: f32 = 320.0;
+pub(crate) const HIST_ROW_H: f32 = 46.0;
+pub(crate) const HIST_BLAME_ROW_H: f32 = 18.0;
+pub(crate) const HIST_PAD: f32 = 10.0;
 
 /// 模态卡那一格的尺寸。**没有参考图依据**：两张 SourceTree 截图都没拍到弹窗，
 /// 这几个数是为了「卡片里的行全是我们手摆的，高度必须自己算才能居中」而定的固定档位，

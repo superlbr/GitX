@@ -10,6 +10,7 @@ use crate::ui::theme::*;
 use crate::ui::state::*;
 use crate::ui::widgets::*;
 use crate::ui::graph::*;
+use crate::ui::diffmodel::layout;
 
 // -------------------------------------------------------------------- 数据/线程
 /// 日志日期列的文案。参考图量到的只有「今天 12:27」这一种（那张截图里最老的一行就是当天的），
@@ -126,6 +127,51 @@ pub(crate) fn spawn_snapshot(tx: &Sender<Msg>, repo: &str, topo: bool, rev: Opti
     });
 }
 
+/// 文件历史一次取多少条。SourceTree 的文件历史是一张可滚动的长表，这里先钉 200：
+/// 再多就得上分页，而这一批的判据只需要「能列出改动过它的提交」。
+pub(crate) const FILE_LOG_MAX: u32 = 200;
+
+pub(crate) fn spawn_file_log(tx: &Sender<Msg>, repo: &str, path: &str, seq: u64) {
+    let (tx, repo, path) = (tx.clone(), repo.to_owned(), path.to_owned());
+    std::thread::spawn(move || {
+        // 未跟踪文件本来就没有历史，`git log --follow -- path` 会成功返回空列表。
+        let entries = git::file_log(&repo, &path, FILE_LOG_MAX).unwrap_or_default();
+        let _ = tx.send(Msg::FileLog { repo, seq, path, entries });
+    });
+}
+
+/// 历史面板里选中那条提交对该文件的补丁。路径必须带上：同一提交可能改了很多文件，
+/// 面板只认打开的这一条。
+pub(crate) fn spawn_history_patch(tx: &Sender<Msg>, repo: &str, oid: &str, path: &str, seq: u64, index: usize) {
+    let (tx, repo, path, oid) = (tx.clone(), repo.to_owned(), path.to_owned(), oid.to_owned());
+    std::thread::spawn(move || {
+        let lines = git::commit_patch(&repo, &oid, Some(&path)).map(|p| layout(&p)).unwrap_or_default();
+        let _ = tx.send(Msg::HistoryPatch { repo, seq, path, index, lines });
+    });
+}
+
+/// 文件在某个版本里的全文。和补丁分开走：看全文的人通常是在找「这行原来长什么样」。
+pub(crate) fn spawn_history_text(tx: &Sender<Msg>, repo: &str, oid: &str, path: &str, seq: u64, index: usize) {
+    let (tx, repo, path, oid) = (tx.clone(), repo.to_owned(), path.to_owned(), oid.to_owned());
+    std::thread::spawn(move || {
+        // 文件在那个版本可能不存在（比如这一条就是删掉它的提交）。不把错误当成空文件：
+        // 让面板显示原因，比显示一页空白诚实。
+        let text = git::rev_file_text(&repo, &oid, &path)
+            .unwrap_or_else(|e| format!("（读不出这个版本的文件：{e}）"));
+        let _ = tx.send(Msg::HistoryText { repo, seq, path, index, text });
+    });
+}
+
+/// 逐行归属。`oid = None` 走工作区那份：面板问的是「现在这些行是谁写的」，
+/// 不是「某条提交里的那份是谁写的」。
+pub(crate) fn spawn_history_blame(tx: &Sender<Msg>, repo: &str, path: &str, seq: u64) {
+    let (tx, repo, path) = (tx.clone(), repo.to_owned(), path.to_owned());
+    std::thread::spawn(move || {
+        let lines = git::blame(&repo, &path, None).unwrap_or_default();
+        let _ = tx.send(Msg::HistoryBlame { repo, seq, path, lines });
+    });
+}
+
 pub(crate) fn patch_of(repo: &str, target: &Target) -> gitx::Result<String> {
     match target {
         Target::Working { staged, path, untracked } => {
@@ -186,6 +232,12 @@ pub(crate) fn status_of(f: &FileStatus) -> &ChangeStatus {
     }
 }
 
+/// 这一行是不是一个未解决的冲突。`git status --porcelain=v2` 的 `u` 行两侧都是 `U`，
+/// 但只查一侧就够——另一侧真被改成别的状态时，它也就不再是冲突了。
+pub(crate) fn is_conflict(f: &FileStatus) -> bool {
+    f.index_status == ChangeStatus::Unmerged || f.worktree_status == ChangeStatus::Unmerged
+}
+
 pub(crate) fn mark(s: &ChangeStatus) -> &'static str {
     match s {
         ChangeStatus::Added => "A",
@@ -207,6 +259,21 @@ pub(crate) fn badge_of(s: &ChangeStatus) -> (Color32, &'static str) {
         ChangeStatus::Renamed => (BADGE_REN, "R"),
         ChangeStatus::Untracked => (BADGE_UNK, "?"),
         other => (BADGE_NONE, mark(other)),
+    }
+}
+
+/// 文件历史行上那半个字的状态说明。参考图没有文件历史面板可量，这里只用中文，
+/// 和文件表里的单字母色块区分开。
+pub(crate) fn change_label(s: &ChangeStatus) -> &'static str {
+    match s {
+        ChangeStatus::Added => "新增",
+        ChangeStatus::Modified => "修改",
+        ChangeStatus::Deleted => "删除",
+        ChangeStatus::Renamed => "改名",
+        ChangeStatus::Copied => "复制",
+        ChangeStatus::Untracked => "未跟踪",
+        ChangeStatus::Unmerged => "冲突",
+        ChangeStatus::Unknown => "未知",
     }
 }
 
@@ -280,7 +347,14 @@ pub(crate) fn file_row(ui: &mut egui::Ui, path: &str, st: &ChangeStatus, current
 
 /// 文件行的右键菜单。动作直接写进 `act`（和方框、和「放弃整组」那条按钮同一条路），
 /// 不绕 `Intent`：这一层本来就在收 out-param，绕一圈只会多一套出口。
-pub(crate) fn file_menu(ui: &mut egui::Ui, path: &str, staged: bool, untracked: bool, act: &mut Option<Action>) {
+pub(crate) fn file_menu(
+    ui: &mut egui::Ui,
+    path: &str,
+    staged: bool,
+    untracked: bool,
+    act: &mut Option<Action>,
+    hist: &mut Option<String>,
+) {
     if staged {
         menu_act(ui, "取消暂存这个文件", || Action::Unstage(vec![path.to_owned()]), act);
     } else {
@@ -294,6 +368,38 @@ pub(crate) fn file_menu(ui: &mut egui::Ui, path: &str, staged: bool, untracked: 
         act,
     );
     menu_act(ui, "忽略这个文件（写进 .gitignore）", || Action::Ignore(path.to_owned()), act);
+    if ui.button("查看文件历史").clicked() {
+        *hist = Some(path.to_owned());
+        ui.close();
+    }
+}
+
+/// 冲突文件行的右键菜单。菜单项按 SourceTree 的「Mark Resolved / Mark Unresolved /
+/// Resolve Using 'Mine' / Resolve Using 'Theirs'」排，文案用官方中文。
+/// 前四条都会改工作区，`needs_confirm` 在出口拦下会丢改动的那几条。
+pub(crate) fn conflict_menu(
+    ui: &mut egui::Ui,
+    path: &str,
+    act: &mut Option<Action>,
+    hist: &mut Option<String>,
+) {
+    menu_act(ui, "使用「我的」版本解决", || Action::ResolveOurs(path.to_owned()), act);
+    menu_act(ui, "使用「他们的」版本解决", || Action::ResolveTheirs(path.to_owned()), act);
+    menu_act(ui, "标记为已解决", || Action::MarkResolved(path.to_owned()), act);
+    menu_act(ui, "标记为未解决", || Action::MarkUnresolved(path.to_owned()), act);
+    if ui.button("查看文件历史").clicked() {
+        *hist = Some(path.to_owned());
+        ui.close();
+    }
+}
+
+/// 某条提交的改动列表里文件行的右键菜单。这一栏的文件**已经在库里**，没有暂存/放弃可言，
+/// 能做的只有溯源。
+pub(crate) fn commit_file_menu(ui: &mut egui::Ui, path: &str, hist: &mut Option<String>) {
+    if ui.button("查看文件历史").clicked() {
+        *hist = Some(path.to_owned());
+        ui.close();
+    }
 }
 
 pub(crate) fn db_path() -> Option<String> {

@@ -54,6 +54,8 @@ impl Gitx {
             add_path: String::new(),
             target: None,
             pending_discard: None,
+            history: None,
+            hist_seq: 0,
             modal: None,
             modal_focus: false,
             tx,
@@ -116,6 +118,9 @@ impl Gitx {
         self.log_seq += 1;
         self.log_more = true;
         self.log_more_busy = false;
+        // 历史面板跟着仓库走：上一个仓库的文件路径在这里没有意义，在途的回复也作废。
+        self.history = None;
+        self.hist_seq += 1;
         self.busy = true;
         spawn_snapshot(&self.tx, path, self.topo, self.log_rev.as_deref());
     }
@@ -268,6 +273,13 @@ impl Gitx {
                 Action::StashPop(i) => git::stash_pop(&repo, *i),
                 Action::StashDrop(i) => git::stash_drop(&repo, *i),
                 Action::Ignore(p) => git::ignore_path(&repo, p),
+                Action::RestoreFile { oid, path } => git::restore_file(&repo, oid, path),
+                Action::ResolveOurs(p) => git::resolve_ours(&repo, p),
+                Action::ResolveTheirs(p) => git::resolve_theirs(&repo, p),
+                Action::MarkResolved(p) => git::mark_resolved(&repo, p),
+                Action::MarkUnresolved(p) => git::mark_unresolved(&repo, p),
+                Action::ContinueOp { .. } => git::continue_op(&repo),
+                Action::AbortOp { .. } => git::abort_op(&repo),
                 // 走 `act` 而不是在帧里直接跑：`git remote get-url` 也是一次子进程，
                 // 在帧里等它就把整帧冻住了——和其余每一条 git 调用同一个理由。
                 Action::BrowseRemote(name) => git::remote_url(&repo, name).and_then(|url| {
@@ -481,6 +493,61 @@ impl Gitx {
                         self.busy = false;
                     }
                 }
+                Msg::FileLog { repo, seq, path, entries } => {
+                    if self.repo.as_deref() != Some(repo.as_str()) {
+                        continue;
+                    }
+                    // 先取第一条要画的补丁，借完 `history` 再起线程。
+                    let first = {
+                        let Some(h) = self.history.as_mut() else { continue };
+                        if h.seq != seq || h.path != path {
+                            continue;
+                        }
+                        h.log_loading = false;
+                        h.entries = entries;
+                        h.sel = 0;
+                        h.entries.first().map(|e| e.commit.id.clone())
+                    };
+                    if let Some(oid) = first {
+                        if let Some(h) = self.history.as_mut() {
+                            h.patch_loading = true;
+                        }
+                        spawn_history_patch(&self.tx, &repo, &oid, &path, seq, 0);
+                    }
+                }
+                Msg::HistoryPatch { repo, seq, path, index, lines } => {
+                    if self.repo.as_deref() != Some(repo.as_str()) {
+                        continue;
+                    }
+                    if let Some(h) = self.history.as_mut() {
+                        if h.seq == seq && h.path == path && h.sel == index {
+                            h.diff = lines;
+                            h.patch_loading = false;
+                        }
+                    }
+                }
+                Msg::HistoryText { repo, seq, path, index, text } => {
+                    if self.repo.as_deref() != Some(repo.as_str()) {
+                        continue;
+                    }
+                    if let Some(h) = self.history.as_mut() {
+                        if h.seq == seq && h.path == path && h.full_for == Some(index) {
+                            h.full = text.lines().map(str::to_owned).collect();
+                            h.full_loading = false;
+                        }
+                    }
+                }
+                Msg::HistoryBlame { repo, seq, path, lines } => {
+                    if self.repo.as_deref() != Some(repo.as_str()) {
+                        continue;
+                    }
+                    if let Some(h) = self.history.as_mut() {
+                        if h.seq == seq && h.path == path {
+                            h.blame = lines;
+                            h.blame_loading = false;
+                        }
+                    }
+                }
                 Msg::Cloned(r) => {
                     self.busy = false;
                     match r {
@@ -498,6 +565,13 @@ impl Gitx {
                     // （切仓库时的 `open`）——它删掉没有任何判据变红，是契约锁，不是判别门。
                     self.clear_msg_on_load = false;
                     self.busy = false;
+                    // 历史面板的三颗「读取中」也不能永远亮着：线程里失败时没有更细的回复。
+                    if let Some(h) = self.history.as_mut() {
+                        h.log_loading = false;
+                        h.patch_loading = false;
+                        h.blame_loading = false;
+                        h.full_loading = false;
+                    }
                 }
             }
         }
@@ -615,6 +689,280 @@ impl Gitx {
     pub(crate) fn show_modal(&mut self, m: Modal) {
         self.modal_focus = m.text.is_some();
         self.modal = Some(m);
+    }
+
+    /// 打开「文件历史」浮层。列表自己走线程，帧里不等 git。
+    pub(crate) fn open_history(&mut self, path: &str) {
+        let Some(repo) = self.repo.clone() else { return };
+        self.hist_seq += 1;
+        let seq = self.hist_seq;
+        self.history = Some(FileHistory::new(path.to_owned(), seq));
+        spawn_file_log(&self.tx, &repo, path, seq);
+    }
+
+    /// 文件历史浮层。和模态卡同一层、同一套遮罩；区别是它自己带页签与列表，
+    /// 而且关掉之后不留动作（里面唯一会动手的「恢复」走 `land` 的确认卡）。
+    pub(crate) fn history_layer(&mut self, ctx: &egui::Context) {
+        let Some(mut h) = self.history.take() else { return };
+        let repo = self.repo.clone();
+        let tx = self.tx.clone();
+        let screen = ctx.viewport_rect();
+        // 确认卡开着时 Esc 归它：面板别抢。
+        let esc = self.modal.is_none() && ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        let card = Rect::from_center_size(
+            screen.center(),
+            vec2(
+                (screen.width() - 80.0).clamp(520.0, HIST_W),
+                (screen.height() - 24.0).clamp(240.0, HIST_H),
+            ),
+        );
+        let mut close = false;
+        let mut want_tab: Option<HistTab> = None;
+        let mut want_view: Option<HistView> = None;
+        let mut pick: Option<usize> = None;
+        let mut restore = false;
+        egui::Area::new(egui::Id::unique("gitx-history"))
+            .fixed_pos(screen.min)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                // 和模态卡一样：这一格铺满整屏的可点矩形既当遮罩，也当「点外面关掉」。
+                let (bg, bg_resp) = ui.allocate_exact_size(screen.size(), Sense::click());
+                ui.painter().rect_filled(bg, 0.0, Color32::from_black_alpha(80));
+                let p = ui.painter();
+                p.rect_filled(card, 6.0, Color32::WHITE);
+                p.rect_stroke(card, 6.0, Stroke::new(1.0, RULE), egui::StrokeKind::Middle);
+
+                let head_cy = card.min.y + HIST_HEAD_H / 2.0;
+                put_left(
+                    ui,
+                    Rect::from_min_max(
+                        pos2(card.min.x + 12.0, card.min.y),
+                        pos2(card.max.x - 80.0, card.min.y + HIST_HEAD_H),
+                    ),
+                    |ui| {
+                        ui.add(
+                            Label::new(
+                                RichText::new(format!("文件历史 · {}", h.path))
+                                    .size(12.5)
+                                    .color(INK_STRONG)
+                                    .strong(),
+                            )
+                            .truncate()
+                            .selectable(false),
+                        );
+                    },
+                );
+                if hunk_button(ui, "关闭", card.max.x - HIST_PAD, head_cy).0 {
+                    close = true;
+                }
+
+                let tab_y = card.min.y + HIST_HEAD_H;
+                put_left(
+                    ui,
+                    Rect::from_min_max(
+                        pos2(card.min.x + HIST_PAD, tab_y),
+                        pos2(card.max.x - HIST_PAD, tab_y + HIST_TAB_H),
+                    ),
+                    |ui| {
+                        ui.horizontal(|ui| {
+                            if ui.selectable_label(h.tab == HistTab::History, "历史").clicked() {
+                                want_tab = Some(HistTab::History);
+                            }
+                            if ui.selectable_label(h.tab == HistTab::Blame, "逐行归属").clicked() {
+                                want_tab = Some(HistTab::Blame);
+                            }
+                            if h.tab == HistTab::History {
+                                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                    let can_restore = !h.entries.is_empty() && h.sel < h.entries.len();
+                                    let btn = egui::Button::new(RichText::new("恢复到这一版").size(11.0));
+                                    if ui.add_enabled(can_restore, btn).clicked() {
+                                        restore = true;
+                                    }
+                                    if ui.selectable_label(h.view == HistView::Full, "全文").clicked() {
+                                        want_view = Some(HistView::Full);
+                                    }
+                                    if ui.selectable_label(h.view == HistView::Diff, "改动").clicked() {
+                                        want_view = Some(HistView::Diff);
+                                    }
+                                });
+                            }
+                        });
+                    },
+                );
+
+                let body = Rect::from_min_max(
+                    pos2(card.min.x + HIST_PAD, tab_y + HIST_TAB_H),
+                    pos2(card.max.x - HIST_PAD, card.max.y - HIST_PAD),
+                );
+                match h.tab {
+                    HistTab::History => {
+                        let list_w = HIST_LIST_W.min(body.width() * 0.5);
+                        let list = Rect::from_min_max(body.min, pos2(body.min.x + list_w, body.max.y));
+                        let right = Rect::from_min_max(pos2(list.max.x + 8.0, body.min.y), body.max);
+                        ui.painter().line_segment(
+                            [pos2(list.max.x + 4.0, body.min.y), pos2(list.max.x + 4.0, body.max.y)],
+                            Stroke::new(1.0, RULE),
+                        );
+                        if h.entries.is_empty() {
+                            history_note(
+                                ui,
+                                list,
+                                if h.log_loading { "读取历史…" } else { "这个文件没有历史。" },
+                            );
+                        } else {
+                            let now = chrono::Local::now();
+                            ui.scope_builder(egui::UiBuilder::new().max_rect(list), |ui| {
+                                ui.set_clip_rect(list);
+                                let row_w = ui.available_width();
+                                ScrollArea::vertical().auto_shrink([false, false]).show_rows(
+                                    ui,
+                                    HIST_ROW_H,
+                                    h.entries.len(),
+                                    |ui, range| {
+                                        for i in range {
+                                            bump_rows_painted();
+                                            let e = &h.entries[i];
+                                            let date = date_label(&e.commit.date, now);
+                                            if history_row(ui, row_w, e, &date, i == h.sel).clicked() {
+                                                pick = Some(i);
+                                            }
+                                        }
+                                    },
+                                );
+                            });
+                        }
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(right), |ui| {
+                            ui.set_clip_rect(right);
+                            let row_w = ui.available_width();
+                            match h.view {
+                                HistView::Diff => {
+                                    if h.diff.is_empty() && h.patch_loading {
+                                        history_note(ui, right, "读取改动…");
+                                    } else if h.diff.is_empty() {
+                                        history_note(ui, right, "这个版本对这个文件没有可显示的改动。");
+                                    } else {
+                                        ScrollArea::vertical().auto_shrink([false, false]).show_rows(
+                                            ui,
+                                            DIFF_ROW_H,
+                                            h.diff.len(),
+                                            |ui, range| {
+                                                for i in range {
+                                                    bump_rows_painted();
+                                                    history_diff_row(ui, row_w, &h.diff[i]);
+                                                }
+                                            },
+                                        );
+                                    }
+                                }
+                                HistView::Full => {
+                                    if h.full.is_empty() && h.full_loading {
+                                        history_note(ui, right, "读取全文…");
+                                    } else if h.full.is_empty() {
+                                        history_note(ui, right, "这个版本里没有内容。");
+                                    } else {
+                                        ScrollArea::vertical().auto_shrink([false, false]).show_rows(
+                                            ui,
+                                            DIFF_ROW_H,
+                                            h.full.len(),
+                                            |ui, range| {
+                                                for i in range {
+                                                    bump_rows_painted();
+                                                    history_text_row(ui, row_w, i + 1, &h.full[i]);
+                                                }
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    HistTab::Blame => {
+                        if h.blame.is_empty() {
+                            history_note(
+                                ui,
+                                body,
+                                if h.blame_loading { "读取逐行归属…" } else { "这个文件没有可归属的行。" },
+                            );
+                        } else {
+                            ui.scope_builder(egui::UiBuilder::new().max_rect(body), |ui| {
+                                ui.set_clip_rect(body);
+                                let row_w = ui.available_width();
+                                ScrollArea::vertical().auto_shrink([false, false]).show_rows(
+                                    ui,
+                                    HIST_BLAME_ROW_H,
+                                    h.blame.len(),
+                                    |ui, range| {
+                                        for i in range {
+                                            bump_rows_painted();
+                                            blame_row(ui, row_w, &h.blame[i]);
+                                        }
+                                    },
+                                );
+                            });
+                        }
+                    }
+                }
+                // 点面板外面的遮罩才关；点面板里的空处不关（`bg_resp` 会漏到这一格）。
+                let inside = ctx
+                    .input(|i| i.pointer.interact_pos())
+                    .is_some_and(|at| card.contains(at));
+                if bg_resp.clicked() && !inside {
+                    close = true;
+                }
+            });
+        if esc {
+            close = true;
+        }
+        if close {
+            self.history = None;
+            return;
+        }
+
+        if let Some(t) = want_tab {
+            if h.tab != t {
+                h.tab = t;
+                if t == HistTab::Blame && h.blame.is_empty() && !h.blame_loading {
+                    if let Some(repo) = &repo {
+                        h.blame_loading = true;
+                        spawn_history_blame(&tx, repo, &h.path, h.seq);
+                    }
+                }
+            }
+        }
+        if let Some(v) = want_view {
+            h.view = v;
+            if v == HistView::Full && h.full_for != Some(h.sel) && !h.full_loading {
+                if let (Some(repo), Some(e)) = (&repo, h.entries.get(h.sel)) {
+                    h.full_loading = true;
+                    h.full_for = Some(h.sel);
+                    spawn_history_text(&tx, repo, &e.commit.id, &h.path, h.seq, h.sel);
+                }
+            }
+        }
+        if let Some(i) = pick {
+            if i != h.sel || h.diff.is_empty() {
+                h.sel = i;
+                h.diff.clear();
+                h.full.clear();
+                h.full_for = None;
+                if let (Some(repo), Some(e)) = (&repo, h.entries.get(i)) {
+                    h.patch_loading = true;
+                    spawn_history_patch(&tx, repo, &e.commit.id, &h.path, h.seq, i);
+                    if h.view == HistView::Full {
+                        h.full_loading = true;
+                        h.full_for = Some(i);
+                        spawn_history_text(&tx, repo, &e.commit.id, &h.path, h.seq, i);
+                    }
+                }
+            }
+        }
+        let restore_oid = restore.then(|| h.entries.get(h.sel).map(|e| e.commit.id.clone())).flatten();
+        let path = h.path.clone();
+        self.history = Some(h);
+        if let Some(oid) = restore_oid {
+            // 覆盖工作区必须过确认卡，所以走 `land` 而不是 `act`。
+            self.land(Intent { act: Some(Action::RestoreFile { oid, path }), ..Default::default() });
+        }
     }
 
     /// 把一帧里从各处收上来的意图落地。顺序是定死的：**先说话、再挪位置、最后才动手**。
@@ -888,6 +1236,7 @@ impl Gitx {
     pub(crate) fn file_list(&mut self, ui: &mut egui::Ui) {
         let mut act: Option<Action> = None;
         let mut pick: Option<Target> = None;
+        let mut hist: Option<String> = None;
         let sel = self.sel.clone();
 
         if sel == Sel::Uncommitted {
@@ -896,8 +1245,12 @@ impl Gitx {
                 Some(s) => &s.status.files,
                 None => &none_files,
             };
-            let staged: Vec<&FileStatus> = files.iter().filter(|f| f.staged).collect();
-            let unstaged: Vec<&FileStatus> = files.iter().filter(|f| !f.staged).collect();
+            let conflicts: Vec<&FileStatus> = files.iter().filter(|f| is_conflict(f)).collect();
+            // 冲突文件从这两组里**挑出去**：`parse_status` 把 `u` 行标成 `staged: true`，
+            // 不挑的话它们会混进「已暂存文件」，用户会以为已经解决好了。
+            let staged: Vec<&FileStatus> = files.iter().filter(|f| !is_conflict(f) && f.staged).collect();
+            let unstaged: Vec<&FileStatus> = files.iter().filter(|f| !is_conflict(f) && !f.staged).collect();
+            let repo_state = self.snap.as_ref().map(|s| s.status.repo_state.clone()).unwrap_or_default();
             // 参考图第 5 条：列表上方一条「待定的文件, 已依照路径排序」。这一行和下面的提交框
             // 都不跟着列表滚——SourceTree 的关系是「列表滚，两头钉」。
             ui.horizontal(|ui| {
@@ -913,14 +1266,17 @@ impl Gitx {
                     }
                 });
             });
+            // 有合并/遴选/变基停在半路时，文件表上方多一条横幅。正常仓库不画，几何不动。
+            op_banner(ui, &repo_state, conflicts.len(), &mut act);
             let current = self.file.clone();
             // 列表只在剩下的空间里滚，把 `COMMIT_H` 那一格留给下面的提交框。
             // 不这么做的话文件一多，提交框整格被顶出窗口（真窗口目视抓到过，判据见
             // `the_commit_box_stays_inside_a_short_band`）。
             let list_h = (ui.available_height() - COMMIT_H).max(40.0);
             ScrollArea::vertical().auto_shrink([false, false]).max_height(list_h).show(ui, |ui| {
-                section(ui, "已暂存文件", &staged, true, &current, &mut act, &mut pick);
-                section(ui, "未暂存文件", &unstaged, false, &current, &mut act, &mut pick);
+                conflict_section(ui, &conflicts, &current, &mut act, &mut pick, &mut hist);
+                section(ui, "已暂存文件", &staged, true, &current, &mut act, &mut pick, &mut hist);
+                section(ui, "未暂存文件", &unstaged, false, &current, &mut act, &mut pick, &mut hist);
                 if files.is_empty() {
                     ui.label(RichText::new("工作区是干净的。").color(MUTED).size(12.0));
                 }
@@ -998,19 +1354,26 @@ impl Gitx {
                     let (resp, _) = file_row(ui, &d.path, &d.status, current.as_deref() == Some(d.path.as_str()), &tail, None);
                     if resp.clicked() {
                         if let Some(o) = o {
-                            pick = Some(Target::Commit { oid: o, path: Some(p) });
+                            pick = Some(Target::Commit { oid: o, path: Some(p.clone()) });
                         }
                     }
+                    // 提交里那些文件同样可以溯源：按**当前路径**问历史，`--follow` 会跟过改名。
+                    resp.context_menu(|ui| commit_file_menu(ui, &p, &mut hist));
                 }
             });
         }
 
         if let Some(action) = act {
-            self.act(action);
+            // 文件表这一层的动作也要过 `land`：右键菜单里的「放弃」和冲突菜单里那几条
+            // 都会丢工作区改动，确认卡必须拦在出口上（`needs_confirm`），不能在入口逐个补。
+            self.land(Intent { act: Some(action), ..Default::default() });
         }
         if let Some(target) = pick {
             self.file = target_path(&target).map(str::to_owned);
             self.request(target);
+        }
+        if let Some(path) = hist {
+            self.open_history(&path);
         }
     }
 
@@ -1346,8 +1709,10 @@ impl Gitx {
         self.sidebar(ui);
         self.bottom_band(ui);
         self.log_band(ui);
-        // 卡片压在最上面一层（`Order::Foreground`），它自己那一格可点矩形铺满整屏，
+        // 卡片与历史浮层压在最上面一层（`Order::Foreground`），它们自己那一格可点矩形铺满整屏，
         // 所以底下的面板这帧只会收到 hover=false / clicked=false —— 不用在每个面板里各问一次。
+        // 顺序就是层序：确认卡最后画，压住历史面板。
+        self.history_layer(&ctx);
         self.modal_layer(&ctx);
     }
 }

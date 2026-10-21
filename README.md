@@ -20,8 +20,8 @@ GitX 与 Atlassian 无关，不含任何 SourceTree 的素材、商标或代码�
 
 | | 是什么 | 状态 |
 | --- | --- | --- |
-| `src/lib.rs`（lib target `gitx`） | 纯 Rust 的 git 与本地状态层，**零 UI 依赖**（83 例单测） | 稳，功能都在这层，改这里最划算 |
-| `src/ui/`（bin target `gitx`） | egui/eframe 的原生壳，**直连核心、没有 IPC 那一跳**（91 例无头判据） | 进行中：外壳几何、提交图、暂存/提交已通，其余见「壳里还缺的」 |
+| `src/lib.rs`（lib target `gitx`） | 纯 Rust 的 git 与本地状态层，**零 UI 依赖**（86 例单测） | 稳，功能都在这层，改这里最划算 |
+| `src/ui/`（bin target `gitx`） | egui/eframe 的原生壳，**直连核心、没有 IPC 那一跳**（103 例无头判据） | 进行中：外壳几何、提交图、暂存/提交已通，其余见「壳里还缺的」 |
 
 > **许可证**：GitX 按 **MIT 或 Apache-2.0 双许可**发布，由你二选一（[`LICENSE-MIT`](LICENSE-MIT)、
 > [`LICENSE-APACHE`](LICENSE-APACHE)、[`NOTICE`](NOTICE)）。选 Apache 那一半是为了它的**明示专利授权**，
@@ -47,7 +47,7 @@ gitx/
 │   ├── db.rs               # SQLite 持久化（仓库书签、设置、平台令牌）
 │   ├── models.rs           # 共享数据模型
 │   ├── error.rs
-│   ├── main.rs             # 壳的入口：viewport 配置 + eframe::run_native，以及 91 例无头判据的挂载点
+│   ├── main.rs             # 壳的入口：viewport 配置 + eframe::run_native，以及 103 例无头判据的挂载点
 │   ├── geometry.rs         # 无头门禁本体（bin 的 cfg(test) 模块，模块名 geometry_tests 不变）
 │   └── ui/                 # 界面模块（拆分自旧 main.rs，见 PROCESS.md「拆分 main.rs」）
 │       ├── app.rs          #   壳本体：面板布局、动作分发（stage/commit/fetch…全走 gitx::git）
@@ -71,7 +71,7 @@ gitx/
 设计要点：
 - **git 操作用 git CLI 封装**（而非 libgit2），避免额外 C 依赖，行为稳定、覆盖全面。
 - **分层可测**：核心层（lib target）不认识任何 UI——它看不见 `crate::ui::*`，`cargo test --lib` 直接跑；
-  壳也认识得很少——它的 91 例判据是**无头**的（不需要屏幕，自己 `git init` 临时仓库，不碰你手上的仓库）。
+  壳也认识得很少——它的 103 例判据是**无头**的（不需要屏幕，自己 `git init` 临时仓库，不碰你手上的仓库）。
 - 本地状态（仓库书签、设置）存于 SQLite，路径 `~/Library/Application Support/com.gitx.app/gitx.db`。
 - **界面态不再有任何 WebView 存储**：已删除那层的 localStorage 键（提交草稿、自定义键位、
   免确认白名单、分栏比例）随着那层一起没了，egui 壳目前只有 SQLite 一条持久化通路。
@@ -148,23 +148,27 @@ gitx/
   再断言 `git log` 真的多了一条；暂存、取消暂存同一条路
 - **添加仓库**：空书签列表也有一条入口（工具栏「添加仓库」→ 输路径 → 「打开」）；
   不是仓库的路径被拒且不动书签列表；接受的路径真的写进 SQLite
+- **文件溯源浮层**：文件行右键「查看文件历史」→ `git log --follow` 列表 + 该提交对这个文件的补丁；
+  另有「逐行归属」（真 `git blame`）与「全文」（该版本原文件）；「恢复到这一版」必须过确认卡
+- **冲突解决与继续/中止**：停在合并/遴选/变基里的仓库，文件表上方出一条横幅（未解决的合并 /
+  变基 / 遴选 + 冲突数），冲突文件单独一组、不再混进已暂存文件；右键菜单可用我的/他们的版本解决、
+  标记已解决/未解决；继续与终止都过确认卡。判据真的造一个冲突仓库、真的解决、真的继续出一条合并提交
 
 ### 壳里还缺的（这就是活干到哪了，也是好活的清单）
 
 已删除那层做过、egui 壳**还没接**的，按「补一条的独立程度」排：
 
-- **只读面板**：分支 / 标签 / 贮藏 / 远程 / 设置——核心层函数全在，缺的是界面
-- **fetch / pull / push**：壳里一个按钮都没有，也就**零判据**；领先落后数从哪来在
-  `git.rs` 里有测试，但壳没读过
-- **hunk 级暂存**：现在只有整文件暂存（SourceTree 是两块都能做）；需要先在核心层加一个
-  「按补丁段 add/restore」的函数，那是个真正的 git 语义活
-- **文件溯源弹窗**、**amend HEAD**、**右键菜单**、**多选（⌘/Shift 范围）**
+- **设置卡**：工具栏 11 枚里只剩 index 10「设置」没接（点了是显式提示）
+- **重命名分支 / `.gitignore` 编辑器 / rebase**：核心层函数齐全或已有 API，界面层**零调用**
+- **多选（⌘/Shift 范围）**、**amend HEAD**、**按行暂存**（`line.hunk` 已给每行留了值）
 - **键盘操作体系**：已删除那层有一整套可重绑键位 + chord（`g h`、`⌘↵`、`j/k`）和命令面板，
   壳里目前只有 ⌘/Ctrl+Enter 提交
-- **拖放开仓库**、**扫描文件夹**、**克隆**：核心层都有函数，缺 eframe 事件与目录选择器
+- **拖放开仓库**、**扫描文件夹**、**原生目录选择器**（要引 `rfd`）
 - **差异视图的补丁闸门**：核心层有 2 MiB 上限，壳里现在是一次画完整个补丁
 - **深色模式**、**语法高亮**、**状态栏**、**窗口标题跟仓库走**
-- **提交图超过 4 条车道**目前没有断言；`--max-count` 截断也没断言
+- **push / pull 端到端判据**：fetch 有真仓库判据，push/pull 仍缺真远端样本
+- **紧凑视图两态**、「所有分支」语义、部分文案与 SourceTree strings 对不上（任务 #31/#32）
+- **文件行末「⋯」弹层**、**提交图超过 4 条车道**、**`--max-count` 截断**目前没有断言
 
 ## 开发运行
 
@@ -173,7 +177,7 @@ gitx/
 ```bash
 cargo run --bin gitx              # 起真窗口
 cargo test --lib                  # 核心层单测
-cargo test --bin gitx             # 91 例无头判据（不需要屏幕）
+cargo test --bin gitx             # 103 例无头判据（不需要屏幕）
 ./scripts/gates.sh                # 四条门禁一次跑完（改动阶段只跑受影响的那一条）
 node gen-icon.mjs                 # 重新生成 assets/icon.png
 ```
@@ -185,7 +189,9 @@ node gen-icon.mjs                 # 重新生成 assets/icon.png
 `assets/fonts/NotoSansSC-Regular.otf`，要么用 `GITX_FONT_DIR` 指到已有的那份，
 否则只能够到退路 `~/Library/Fonts/msyh.ttf`；三者都没有就退回系统字体链，
 而 SourceTree 中文提交信息里最常见的「：」（U+FF1A）在那条链上是**豆腐块**
-（实测过程见 `PROCESS.md` 的「Spike 结果」）。
+（实测过程见 `PROCESS.md` 的「Spike 结果」）。拉丁一侧不依赖环境：Inter 三档
+字重（各 ~400KB，SIL OFL）直接进仓库、嵌进二进制，正文 400 与中文同字重，
+标题/虚拟行走命名字族拿真 SemiBold（`src/ui/fonts.rs`）。
 
 **字体也是测试数据**：egui 的默认字体集没有 CJK，缺字体时汉字落到 `.notdef`，
 而它的字宽正好是字号的一半（14pt 的中文字只有 7pt）。壳里几条关于**宽度与左缘**的无头判据量的就是字宽，
@@ -194,11 +200,13 @@ node gen-icon.mjs                 # 重新生成 assets/icon.png
 
 ## 测试
 
-- 核心层 83 例（`cargo test --lib`）：在临时 fixture 仓库上验证
+- 核心层 86 例（`cargo test --lib`）：在临时 fixture 仓库上验证
   status / stage / commit / diff / range / branch / tag / stash 全流程、
   `untracked_patch` 合成（文本 / 二进制）、`commits` 路径·作者筛选（路径是三条 pathspec 的并集）、
   `repo_files`（`git ls-files`，有数量上限）、SQLite 持久化、
   `file_log` 跟随改名并标注每次改动、删除记录、`rev_file_text` + `restore_file`、
+  真冲突仓库上的 ours/theirs、手工 `mark_resolved` / `mark_unresolved`、`continue_op` 落合并提交、
+  `abort_op` 回到合并前的工作区、
   `commit_message` 保留多行原文、`pushed_refs` 只在真的 push 过之后才列出远端分支、
   `unpushed_commits`（无远程回空、push 后为空、本地提交都在等待）、
   `remote_refs`（没配远程回空、只 `remote add` 不 fetch 仍回空、fetch 后恰好一条且指向 `head()`、
@@ -218,7 +226,7 @@ node gen-icon.mjs                 # 重新生成 assets/icon.png
   节点改写 2 例 + **离线端到端**（无节点 fetch 失败、带节点成功、`refs/remotes/origin/main` 落下、
   `origin` 的 URL 一字未改）、老数据库补 `last_fetched_at` 列、`release_api_url` 的镜像主机 /
   `{url}` 模板 / 非 https 拒绝 / 含空格拒绝。
-- 壳 91 例（egui 无头，`cargo test --bin gitx`，**不需要屏幕**）：
+- 壳 103 例（egui 无头，`cargo test --bin gitx`，**不需要屏幕**）：
   各面板的几何带、行距（日志 21pt / 差异 15pt 逐行断言）、长列表虚拟化、提交图车道、
   日志五列与差异正文的**齐左**（每格左缘贴住自己表头左缘，数字取自参考截图实测），
   以及**真的点击与键入**——临时 git 仓库、打提交信息、按提交按钮（或 ⌘/Ctrl+Enter）、

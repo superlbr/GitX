@@ -1,6 +1,8 @@
 //! （拆分自 main.rs；见 PROCESS.md「拆分 main.rs」。）
 
-use gitx::models::{Branch, Commit, DiffEntry, Remote, RemoteRef, Repo, RepoStatus, Stash, Tag};
+use gitx::models::{
+    BlameLine, Branch, Commit, DiffEntry, FileLogEntry, Remote, RemoteRef, Repo, RepoStatus, Stash, Tag,
+};
 use gitx::rusqlite::Connection;
 use std::sync::mpsc::{Receiver, Sender};
 
@@ -19,6 +21,63 @@ pub(crate) enum Sel {
 pub(crate) enum Target {
     Working { staged: bool, path: Option<String>, untracked: bool },
     Commit { oid: String, path: Option<String> },
+}
+
+/// 文件溯源面板的两个页签。
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum HistTab {
+    /// 这个文件被哪些提交改过；右侧看选中那条的改动或全文。
+    History,
+    /// 逐行归属，`git blame` 的直读。
+    Blame,
+}
+
+/// 历史页签右侧看什么：选中那条提交的差异，或文件在那个版本的全文。
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum HistView {
+    Diff,
+    Full,
+}
+
+/// 「文件历史」浮层。**打开那一刻的路径和序号钉在这里**：切仓库、重开面板之后，
+/// 路上回来的旧回复对不上 `seq`/`path` 就丢掉，不能落到新面板上。
+pub(crate) struct FileHistory {
+    pub(crate) path: String,
+    pub(crate) seq: u64,
+    pub(crate) entries: Vec<FileLogEntry>,
+    pub(crate) sel: usize,
+    pub(crate) diff: Vec<DiffLine>,
+    pub(crate) blame: Vec<BlameLine>,
+    pub(crate) full: Vec<String>,
+    /// `full` 是选中第几条的全文；换行之后旧全文不认。
+    pub(crate) full_for: Option<usize>,
+    pub(crate) tab: HistTab,
+    pub(crate) view: HistView,
+    pub(crate) log_loading: bool,
+    pub(crate) patch_loading: bool,
+    pub(crate) blame_loading: bool,
+    pub(crate) full_loading: bool,
+}
+
+impl FileHistory {
+    pub(crate) fn new(path: String, seq: u64) -> Self {
+        Self {
+            path,
+            seq,
+            entries: Vec::new(),
+            sel: 0,
+            diff: Vec::new(),
+            blame: Vec::new(),
+            full: Vec::new(),
+            full_for: None,
+            tab: HistTab::History,
+            view: HistView::Diff,
+            log_loading: true,
+            patch_loading: false,
+            blame_loading: false,
+            full_loading: false,
+        }
+    }
 }
 
 pub(crate) enum Action {
@@ -54,6 +113,21 @@ pub(crate) enum Action {
     StashPop(u32),
     StashDrop(u32),
     Ignore(String),
+    /// 把历史里的某一版拉回工作区。`git checkout <oid> -- <path>` 会连索引一起改，
+    /// 所以这条会覆盖工作区和暂存区里这个文件的现状——`land` 里要过确认。
+    RestoreFile { oid: String, path: String },
+    /// 冲突文件用「我的」那一侧解决（`git checkout --ours` + `git add`）。
+    ResolveOurs(String),
+    /// 冲突文件用「他们的」那一侧解决。
+    ResolveTheirs(String),
+    /// 手工改完之后说「这个文件解决了」：把工作区现状直接暂存。
+    MarkResolved(String),
+    /// 把冲突标记放回去（`git checkout -m`），文件重新回到未解决那一组。
+    MarkUnresolved(String),
+    /// 继续合并 / 遴选 / 变基。`state` 是打开这一刻的快照状态，只用来选文案。
+    ContinueOp { state: String },
+    /// 终止合并 / 遴选 / 变基。会丢东西，`land` 里要过确认。
+    AbortOp { state: String },
     /// 在浏览器里打开这个远端的仓库主页。`String` 是远端名（工具条那枚固定 `origin`，
     /// 侧栏「远端」的菜单带的是被右键那一条的名字）。
     BrowseRemote(String),
@@ -231,6 +305,12 @@ pub(crate) enum Msg {
     More { repo: String, seq: u64, commits: Vec<Commit> },
     CommitFiles { repo: String, index: usize, files: Vec<DiffEntry> },
     Patch { repo: String, seq: u64, label: String, lines: Vec<DiffLine> },
+    /// 文件历史列表（`git log --follow`）。空列表是合法结果：未跟踪文件就是没有历史。
+    FileLog { repo: String, seq: u64, path: String, entries: Vec<FileLogEntry> },
+    /// 历史面板里选中那条提交对这个文件的补丁。
+    HistoryPatch { repo: String, seq: u64, path: String, index: usize, lines: Vec<DiffLine> },
+    HistoryText { repo: String, seq: u64, path: String, index: usize, text: String },
+    HistoryBlame { repo: String, seq: u64, path: String, lines: Vec<BlameLine> },
     Failed(String),
     /// 克隆回来的只有「成了在哪」或者「为什么没成」，没有快照——成了之后由 `add_repo`
     /// 自己去开那个仓库（它会再发一次 `Msg::Loaded`）。
@@ -288,6 +368,11 @@ pub struct Gitx {
     /// 第一次只把按钮换成「确认放弃」，仓库一个字节都不动（判据见
     /// `a_discard_needs_two_clicks`）。换差异、换仓库、按 Esc 都会取消。
     pub(crate) pending_discard: Option<usize>,
+    /// 「文件历史」浮层（见 `FileHistory`）。和模态卡一样铺满整屏，但它不是一次性动作，
+    /// 所以单独一层、单独的状态。
+    pub(crate) history: Option<FileHistory>,
+    /// 历史面板的序号：每开一次加一，路上回来的旧回复对不上号就丢掉。
+    pub(crate) hist_seq: u64,
     /// 那张模态卡（见 `Modal`）。`None` = 没有卡，界面层照常可点。
     pub(crate) modal: Option<Modal>,
     /// 卡刚打开的那一帧要把光标送进文本框；之后再抢焦点就该由用户自己决定。
