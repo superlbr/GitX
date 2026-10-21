@@ -1,0 +1,22 @@
+[package]
+name = "gitcraft-app"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+# GitCraft 的界面层：egui/eframe，直接函数调用 `gitcraft-core`，**没有 IPC 那一跳**
+# （旧 Tauri 层才有）。它当初是用来验证「界面层可替换」的，现在它就是那一层。
+[dependencies]
+# 日期列要按「今天 / 昨天 / 今年内」出文案，这一层需要本地时区。核心层已经带着 chrono，
+# 这里只是把同一份依赖声明出来，不多拉一棵树。
+chrono = "0.4"
+eframe = "0.37"
+gitcraft-core = { path = "../gitcraft-core" }
+
+# 彩色 emoji（COLR/PNG 位图）需要 vello_cpu 的字形光栅化，默认不开。
+[dependencies.epaint]
+version = "0.37"
+features = ["color_fonts"]
+
+[profile.dev]
+opt-level = 1

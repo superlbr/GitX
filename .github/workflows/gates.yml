@@ -1,0 +1,58 @@
+name: 门禁
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支上后来的提交把前面那次跑掉的排队取消掉。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    # eframe 要系统框架：Linux 上要装一堆 GTK / X11 / Wayland 开发包，
+    # 而这个应用目前只在 macOS 上跑，所以整条门禁放在 mac runner 上，
+    # 和本机 `./scripts/gates.sh` 判的东西一致。
+    name: Rust（core + egui 无头门禁）
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            gitcraft-core -> target
+            gitcraft-app -> target
+      - name: git 是否可用（核心层全部走 git CLI）
+        run: git --version
+      # 第四条门禁与本机跑的是同一个文件（不是复制一份逻辑）。
+      - name: 许可证与素材审计
+        run: ./scripts/license-audit.sh
+      # 那 8.3MB 全量 CJK 被 .gitignore 挡在仓库外，所以 runner 上**没有**它：
+      # 无头帧会退回 egui 自带的字体链，那条链没有汉字，`.notdef` 的 advance 正好是 0.5×字号。
+      # 左缘类判据（每格贴住自己表头）不受影响，但凡是「这一列放得下」的判据，
+      # 在 CI 上量的都是一个产品里看不到的字体。要么把字体提交进仓库，要么给它一个下载地址——
+      # 这一步先让它显式存在，而不是假装门禁在测真宽度。
+      - name: CJK 字体在不在（不在的话宽度类判据测的是半宽的 .notdef）
+        run: |
+          if [ -f gitcraft-app/assets/fonts/NotoSansSC-Regular.otf ]; then
+            echo "字体在，宽度类判据量的是真宽度"
+          else
+            echo "::warning::缺 gitcraft-app/assets/fonts/NotoSansSC-Regular.otf：本机上文字体没进仓库，CI 上的宽度判据是半宽的"
+          fi
+      - run: cargo test
+        working-directory: gitcraft-core
+      - run: cargo test
+        working-directory: gitcraft-app
+      - name: egui 层构建必须零警告
+        working-directory: gitcraft-app
+        run: |
+          out=$(cargo build 2>&1)
+          printf '%s\n' "$out"
+          if printf '%s\n' "$out" | grep -qE "^(warning|error)"; then
+            echo "::error::gitcraft-app 构建有警告"
+            exit 1
+          fi
