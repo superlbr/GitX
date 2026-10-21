@@ -1,26 +1,29 @@
-# GitCraft
+# GitX
 
 一个 Git 桌面客户端，目标是让 **SourceTree 的用户原样迁过来，同时比它更快**。
 界面布局与交互语义照着 SourceTree 4.2.19 的实测截图做（`docs/reference/`），差别只有软件名；
 「更好」只押在两处：**性能**（大仓库里每帧做的活只跟窗口大小有关，不跟仓库大小有关）和
 **功能**（一律走 git CLI，中文/emoji 提交信息、文件溯源、补丁字节上限这些细节是按实际事故写出来的）。
 
-GitCraft 与 Atlassian 无关，不含任何 SourceTree 的素材、商标或代码。
+GitX 与 Atlassian 无关，不含任何 SourceTree 的素材、商标或代码。
 
-> **2026-10-20：删掉了 React + Tauri 那一层**（`src/`、`src-tauri/`、`package.json`、Vite 配置）。
+> **2026-10-21：合并为单 crate**——原 `gitcraft-core/`、`gitcraft-app/` 两个 crate 合成根目录一个包
+> （包名 `gitx`），同日项目由 GitCraft 更名 **GitX**；分层边界改由 lib / bin 两个编译单元保住。
+>
+> **2026-10-20：删掉了 React + Tauri 那一层**（当时的 `src/`、`src-tauri/`、`package.json`、Vite 配置）。
 > 它比 egui 壳功能多得多，但它每一帧都要跨一次 IPC 把 git 输出序列化成 JSON，
 > 而「每帧的活只跟窗口大小有关」这条目标正是被那一跳堵死的。
 > 完整代码留在最后一个提交 `9a3077c` 里，想捡哪块功能从那儿取。
 > **下面的「功能」清单里凡是只在已删除那层做过的，都归进了「壳里还缺的」——别按旧清单找活。**
 
-仓库里有**两层**：
+仓库是一个**单 crate 双 target** 的 Rust 包，核心层与壳的边界由 lib / bin 两个编译单元保住：
 
 | | 是什么 | 状态 |
 | --- | --- | --- |
-| `gitcraft-core/` | 纯 Rust 的 git 与本地状态层，**零 UI 依赖**（74 例单测） | 稳，功能都在这层，改这里最划算 |
-| `gitcraft-app/` | egui/eframe 的原生壳，**直连核心、没有 IPC 那一跳**（28 例无头判据） | 进行中：外壳几何、提交图、暂存/提交已通，其余见「壳里还缺的」 |
+| `src/lib.rs`（lib target `gitx`） | 纯 Rust 的 git 与本地状态层，**零 UI 依赖**（83 例单测） | 稳，功能都在这层，改这里最划算 |
+| `src/ui/`（bin target `gitx`） | egui/eframe 的原生壳，**直连核心、没有 IPC 那一跳**（91 例无头判据） | 进行中：外壳几何、提交图、暂存/提交已通，其余见「壳里还缺的」 |
 
-> **许可证**：GitCraft 按 **MIT 或 Apache-2.0 双许可**发布，由你二选一（[`LICENSE-MIT`](LICENSE-MIT)、
+> **许可证**：GitX 按 **MIT 或 Apache-2.0 双许可**发布，由你二选一（[`LICENSE-MIT`](LICENSE-MIT)、
 > [`LICENSE-APACHE`](LICENSE-APACHE)、[`NOTICE`](NOTICE)）。选 Apache 那一半是为了它的**明示专利授权**，
 > 保留 MIT 那一半是因为纯 Apache-2.0 的代码进不了 GPLv2 的项目。
 > 名字与图标是**商标**，不在授权范围内；第三方素材（含 `docs/reference/` 里那四张 SourceTree 截图）
@@ -30,25 +33,32 @@ GitCraft 与 Atlassian 无关，不含任何 SourceTree 的素材、商标或代
 ## 架构
 
 ```
-gitcraft/
-├── gitcraft-core/          # 纯 Rust 核心（零 UI 依赖，可单测）
-│   └── src/
-│       ├── git.rs      # git CLI 封装与解析（status/log/diff/branch/tag/stash/remote/文件溯源/
-│       │               #   拖拽找仓库根/扫描目录/git 与 git-lfs 版本/LFS 文件/未推送集合/
-│       │               #   加速节点改写/中文路径与 GBK 容错/explain_git_error 30 类中文说明）
-│       ├── provider/   # 代码托管平台插件（mod.rs 注册表 + github.rs / gitee.rs / codeup.rs）
-│       ├── preview.rs  # github1s 极速预览：把 remote 换成 GitHub 自己的 URL 语法
-│       ├── ssh.rs      # ~/.ssh 清点、ssh_config 解析、公钥读取守卫、`ssh -T` 试连措辞翻译
-│       ├── update.rs   # 应用更新检查：Release 解析 / 版本比较 / 按本机挑安装包
-│       ├── db.rs       # SQLite 持久化（仓库书签、设置、平台令牌）
-│       ├── models.rs   # 共享数据模型
-│       └── error.rs
-├── gitcraft-app/           # egui 壳：顶部那组常量就是从参考图量的几何
-│   ├── src/main.rs         # 工具栏 / 侧栏 / 日志五列 / 差异区 / 提交图车道，以及那 28 例无头判据
-│   ├── src/fonts.rs        # 字体装配：窗口与无头测试走同一条 `install(ctx)` 路径
-│   └── assets/fonts/       # CJK 字体（8.3MB 那份没进仓库，只留 OFL.txt，见「开发运行」）
-├── uiprobe/                # 一次性 spike：CJK/emoji 字体、macOS 拼音输入、参考截图逐像素量取，
-│                           #   结论进 PROCESS.md，不作产品代码
+gitx/
+├── Cargo.toml              # 单包双 target：[lib] 核心 + [[bin]] 壳（边界见上面那张表）
+├── src/
+│   ├── lib.rs              # 核心层入口：mod 声明 + 统一 re-export（GitxError / models / rusqlite）
+│   ├── git.rs              # git CLI 封装与解析（status/log/diff/branch/tag/stash/remote/文件溯源/
+│   │                       #   拖拽找仓库根/扫描目录/git 与 git-lfs 版本/LFS 文件/未推送集合/
+│   │                       #   加速节点改写/中文路径与 GBK 容错/explain_git_error 30 类中文说明）
+│   ├── provider/           # 代码托管平台插件（mod.rs 注册表 + github.rs / gitee.rs / codeup.rs）
+│   ├── preview.rs          # github1s 极速预览：把 remote 换成 GitHub 自己的 URL 语法
+│   ├── ssh.rs              # ~/.ssh 清点、ssh_config 解析、公钥读取守卫、`ssh -T` 试连措辞翻译
+│   ├── update.rs           # 应用更新检查：Release 解析 / 版本比较 / 按本机挑安装包
+│   ├── db.rs               # SQLite 持久化（仓库书签、设置、平台令牌）
+│   ├── models.rs           # 共享数据模型
+│   ├── error.rs
+│   ├── main.rs             # 壳的入口：viewport 配置 + eframe::run_native，以及 91 例无头判据的挂载点
+│   ├── geometry.rs         # 无头门禁本体（bin 的 cfg(test) 模块，模块名 geometry_tests 不变）
+│   └── ui/                 # 界面模块（拆分自旧 main.rs，见 PROCESS.md「拆分 main.rs」）
+│       ├── app.rs          #   壳本体：面板布局、动作分发（stage/commit/fetch…全走 gitx::git）
+│       ├── theme.rs        #   几何常量组：工具栏 / 侧栏 / 五列左缘 / 行距，每个数都从参考图量的
+│       ├── fonts.rs        #   字体装配：窗口与无头测试走同一条 `install(ctx)` 路径
+│       ├── state.rs        #   状态与帧间消息（worker → mpsc → 下一帧 poll）
+│       ├── data.rs         #   数据装配（snapshot_of / patch_of）与样式装配（style）
+│       ├── widgets.rs      #   绘制件
+│       ├── graph.rs        #   提交图车道（layout_graph 在取数据那一步跑，不在帧里）
+│       └── diffmodel.rs    #   差异渲染模型
+├── assets/fonts/           # CJK 字体（8.3MB 那份没进仓库，只留 OFL.txt，见「开发运行」）
 ├── docs/reference/         # SourceTree 4.2.19 实测截图——界面改动的唯一对照来源，别凭印象调像素
 ├── scripts/gates.sh        # 四条门禁一次跑完（改动阶段只跑受影响的那一条，见 CONTRIBUTING.md）
 ├── .github/                # CI（workflows/gates.yml）+ issue / PR 模板（PR 必须填「判据」和「反向变异」）
@@ -60,33 +70,33 @@ gitcraft/
 
 设计要点：
 - **git 操作用 git CLI 封装**（而非 libgit2），避免额外 C 依赖，行为稳定、覆盖全面。
-- **分层可测**：`gitcraft-core` 不认识任何 UI，`cargo test` 直接跑；壳也认识得很少——
-  它的 28 例判据是**无头**的（不需要屏幕，自己 `git init` 临时仓库，不碰你手上的仓库）。
-- 本地状态（仓库书签、设置）存于 SQLite，路径 `~/Library/Application Support/com.gitcraft.app/gitcraft.db`。
+- **分层可测**：核心层（lib target）不认识任何 UI——它看不见 `crate::ui::*`，`cargo test --lib` 直接跑；
+  壳也认识得很少——它的 91 例判据是**无头**的（不需要屏幕，自己 `git init` 临时仓库，不碰你手上的仓库）。
+- 本地状态（仓库书签、设置）存于 SQLite，路径 `~/Library/Application Support/com.gitx.app/gitx.db`。
 - **界面态不再有任何 WebView 存储**：已删除那层的 localStorage 键（提交草稿、自定义键位、
   免确认白名单、分栏比例）随着那层一起没了，egui 壳目前只有 SQLite 一条持久化通路。
 - **应用图标也是仓库里的代码**：`node gen-icon.mjs` 直接写 PNG（不装任何渲染依赖），
   图形是两条分支线交叉成 **X**、五个提交节点（中心那个是 merge），底板是品牌紫的对角渐变
-  圆角方块，输出在 `gitcraft-app/assets/icon.png`；改图标就是改这份文件里的几何与配色。
+  圆角方块，输出在 `assets/icon.png`；改图标就是改这份文件里的几何与配色。
 
 ## 代码地图（改动该去哪里）
 
 | 想改的东西 | 去哪里 |
 |---|---|
-| git 行为 / 输出解析 / 错误措辞 | `gitcraft-core/src/git.rs`（纯函数，加一条 `cargo test` 用例即可验证） |
-| **给壳加一条新的后端能力** | ① `gitcraft-core/src/git.rs`（或 `ssh.rs`/`update.rs`/`provider/`）写函数 + 单测 → ② `gitcraft-app/src/main.rs` 里调用它。**只有两步**，没有 IPC 注册、没有 api.ts 键名对齐 |
-| 界面几何（工具栏高、侧栏宽、五列左缘、行距） | `gitcraft-app/src/main.rs` 顶部的常量组，每个数都是从 `docs/reference/` 那张截图量出来的；改完跑 `cargo test`，`every_log_column_starts_at_its_own_header` 会告诉你四列还贴不贴得住表头 |
-| 提交图（车道、parent 线、ref 徽标） | `gitcraft-app/src/main.rs` 的 `layout_graph`；`COL_GRAPH` 是它唯一的宽度预算，超过 4 条车道目前**没有判据** |
-| 差异渲染 | `gitcraft-app/src/main.rs` 的差异绘制段（`DIFF_ROW_H` = 15pt、行号栏右对齐、正文齐左） |
-| 暂存 / 取消暂存 / 提交 | `gitcraft-app/src/main.rs` 的 `staging` 与 `commit`；端到端那几条判据真的点按钮、真的读 `git log` |
-| 仓库书签、上次同步时间、设置 | `gitcraft-core/src/db.rs`（SQLite，含老库补列的 `migrate`） |
-| 代码托管平台适配（新增一个平台） | `gitcraft-core/src/provider/<新平台>.rs` 实现 `Host`（只声明能力、拼 `ApiRequest`、解析 JSON），再在 `provider/mod.rs` 的 `HOSTS` 注册一行；插件**不发网络请求**，所以能离线单测 |
-| 更新检查（版本比较 / 挑安装包） | `gitcraft-core/src/update.rs`（`is_newer`/`pick_asset` 都有单测）；HTTP 那一跳随 Tauri 一起删了，壳里还没有入口 |
-| github1s 极速预览地址 | `gitcraft-core/src/preview.rs` 的 `github1s_url`（只有 github.com 支持，别的 host 明说）；壳里还没有按钮 |
-| SSH 密钥 / ssh_config / 试连 | `gitcraft-core/src/ssh.rs`（私钥按内容分类、权限检查只在 `#[cfg(unix)]`、`public_key_in` 只允许 `~/.ssh` 下的 `.pub`）；壳里还没有设置页 |
-| 拖进来一个路径该开哪个仓库 | `gitcraft-core/src/git.rs` 的 `find_repo_root`（向上找含 `.git` 的目录，`.git` 是文件也认）；壳里的「添加仓库」走的就是它，**拖放事件本身还没接** |
-| 扫描文件夹批量收仓库 | `gitcraft-core/src/git.rs` 的 `scan_repos(root, max_depth, limit)`（BFS，深度 4 / 上限 100，跳过隐藏目录、`node_modules`、符号链接）；壳里还没接 |
-| 字体（中文/全角标点在壳里长什么样） | `gitcraft-app/src/main.rs` 的 `fonts::install` + `GITCRAFT_FONT_DIR`。**字体是测试数据**：无头判据里 `.notdef` 的字宽正好是字号的一半，宽度断言会静默走偏，见「开发运行」 |
+| git 行为 / 输出解析 / 错误措辞 | `src/git.rs`（纯函数，加一条 `cargo test` 用例即可验证） |
+| **给壳加一条新的后端能力** | ① `src/git.rs`（或 `ssh.rs`/`update.rs`/`provider/`）写函数 + 单测 → ② `src/ui/` 里调用它。**只有两步**，没有 IPC 注册、没有 api.ts 键名对齐 |
+| 界面几何（工具栏高、侧栏宽、五列左缘、行距） | `src/ui/theme.rs` 的常量组，每个数都是从 `docs/reference/` 那张截图量出来的；改完跑 `cargo test`，`every_log_column_starts_at_its_own_header` 会告诉你四列还贴不贴得住表头 |
+| 提交图（车道、parent 线、ref 徽标） | `src/ui/graph.rs` 的 `layout_graph`；`COL_GRAPH` 是它唯一的宽度预算，超过 4 条车道目前**没有判据** |
+| 差异渲染 | `src/ui/diffmodel.rs` 的差异模型与 `src/ui/app.rs` 的差异绘制段（`DIFF_ROW_H` = 15pt、行号栏右对齐、正文齐左） |
+| 暂存 / 取消暂存 / 提交 | `src/ui/app.rs` 的 `Action` 分发（stage/commit 全走 `gitx::git`）；端到端那几条判据真的点按钮、真的读 `git log` |
+| 仓库书签、上次同步时间、设置 | `src/db.rs`（SQLite，含老库补列的 `migrate`） |
+| 代码托管平台适配（新增一个平台） | `src/provider/<新平台>.rs` 实现 `Host`（只声明能力、拼 `ApiRequest`、解析 JSON），再在 `provider/mod.rs` 的 `HOSTS` 注册一行；插件**不发网络请求**，所以能离线单测 |
+| 更新检查（版本比较 / 挑安装包） | `src/update.rs`（`is_newer`/`pick_asset` 都有单测）；HTTP 那一跳随 Tauri 一起删了，壳里还没有入口 |
+| github1s 极速预览地址 | `src/preview.rs` 的 `github1s_url`（只有 github.com 支持，别的 host 明说）；壳里还没有按钮 |
+| SSH 密钥 / ssh_config / 试连 | `src/ssh.rs`（私钥按内容分类、权限检查只在 `#[cfg(unix)]`、`public_key_in` 只允许 `~/.ssh` 下的 `.pub`）；壳里还没有设置页 |
+| 拖进来一个路径该开哪个仓库 | `src/git.rs` 的 `find_repo_root`（向上找含 `.git` 的目录，`.git` 是文件也认）；壳里的「添加仓库」走的就是它，**拖放事件本身还没接** |
+| 扫描文件夹批量收仓库 | `src/git.rs` 的 `scan_repos(root, max_depth, limit)`（BFS，深度 4 / 上限 100，跳过隐藏目录、`node_modules`、符号链接）；壳里还没接 |
+| 字体（中文/全角标点在壳里长什么样） | `src/ui/fonts.rs` 的 `install` + `GITX_FONT_DIR`。**字体是测试数据**：无头判据里 `.notdef` 的字宽正好是字号的一半，宽度断言会静默走偏，见「开发运行」 |
 
 ## 功能
 
@@ -129,9 +139,9 @@ gitcraft/
 
 - **从参考截图量出来的外壳几何**：工具栏 55pt、侧栏 141pt、暂存区 245pt、文件列 435pt、
   日志行 21pt、差异行 15pt，以及 sha/主题/作者/日期四列的绝对左缘
-- **五列与差异正文齐左**：每格左缘贴住自己表头的左缘，行号栏右对齐——这五个数是
-  `uiprobe/pngprobe.py` 在 4.2.19 截图上逐像素量的（图表 242 / 提交 284.5 / 描述 361.5 /
-  作者 825 / 日期 1017），不是估的
+- **五列与差异正文齐左**：每格左缘贴住自己表头的左缘，行号栏右对齐——这五个数是用
+  一次性工具 pngprobe.py（stdlib 解 PNG；跑完即删，见 git 历史）在 4.2.19 截图上逐像素量的
+  （图表 242 / 提交 284.5 / 描述 361.5 / 作者 825 / 日期 1017），不是估的
 - **提交图车道**：parent 线一定画在子节点下方，`--graph` 的拓扑解析有独立判据
 - **长列表虚拟化**：一屏之外的行不产生任何绘制指令（这是「每帧只跟窗口大小有关」的第一块证据）
 - **真的点击与键入**：造临时 git 仓库，在壳里打提交信息、按下提交按钮（或 ⌘/Ctrl+Enter），
@@ -161,18 +171,18 @@ gitcraft/
 前置：**Rust 1.96+**、git 2.x、Xcode Command Line Tools（macOS）。Node 只在重新生成图标时用到。
 
 ```bash
-(cd gitcraft-app && cargo run)   # 起真窗口
-(cd gitcraft-core && cargo test) # 核心层单测
-(cd gitcraft-app && cargo test)  # 28 例无头判据（不需要屏幕）
-./scripts/gates.sh               # 四条门禁一次跑完（改动阶段只跑受影响的那一条）
-node gen-icon.mjs                # 重新生成 gitcraft-app/assets/icon.png
+cargo run --bin gitx              # 起真窗口
+cargo test --lib                  # 核心层单测
+cargo test --bin gitx             # 91 例无头判据（不需要屏幕）
+./scripts/gates.sh                # 四条门禁一次跑完（改动阶段只跑受影响的那一条）
+node gen-icon.mjs                 # 重新生成 assets/icon.png
 ```
 
-改 `gitcraft-core` 的函数签名后请跑 `cargo check --tests`（默认 `cargo check` **不**编译测试代码）。
+改核心层（`src/` 下）的函数签名后请跑 `cargo check --tests`（默认 `cargo check` **不**编译测试代码）。
 
-那一份 8.3MB 的全量 CJK 字体**没进仓库**（`.gitignore` 挡掉了 `gitcraft-app/assets/fonts/*.otf`，
+那一份 8.3MB 的全量 CJK 字体**没进仓库**（`.gitignore` 挡掉了 `assets/fonts/*.otf`，
 仓库里只留 `OFL.txt`）。新克隆要么把一份 Noto Sans SC（SIL OFL）放成
-`gitcraft-app/assets/fonts/NotoSansSC-Regular.otf`，要么用 `GITCRAFT_FONT_DIR` 指到已有的那份，
+`assets/fonts/NotoSansSC-Regular.otf`，要么用 `GITX_FONT_DIR` 指到已有的那份，
 否则只能够到退路 `~/Library/Fonts/msyh.ttf`；三者都没有就退回系统字体链，
 而 SourceTree 中文提交信息里最常见的「：」（U+FF1A）在那条链上是**豆腐块**
 （实测过程见 `PROCESS.md` 的「Spike 结果」）。
@@ -184,7 +194,7 @@ node gen-icon.mjs                # 重新生成 gitcraft-app/assets/icon.png
 
 ## 测试
 
-- `gitcraft-core` 74 例（`cd gitcraft-core && cargo test`）：在临时 fixture 仓库上验证
+- 核心层 83 例（`cargo test --lib`）：在临时 fixture 仓库上验证
   status / stage / commit / diff / range / branch / tag / stash 全流程、
   `untracked_patch` 合成（文本 / 二进制）、`commits` 路径·作者筛选（路径是三条 pathspec 的并集）、
   `repo_files`（`git ls-files`，有数量上限）、SQLite 持久化、
@@ -208,7 +218,7 @@ node gen-icon.mjs                # 重新生成 gitcraft-app/assets/icon.png
   节点改写 2 例 + **离线端到端**（无节点 fetch 失败、带节点成功、`refs/remotes/origin/main` 落下、
   `origin` 的 URL 一字未改）、老数据库补 `last_fetched_at` 列、`release_api_url` 的镜像主机 /
   `{url}` 模板 / 非 https 拒绝 / 含空格拒绝。
-- `gitcraft-app` 28 例（egui 无头，`cd gitcraft-app && cargo test`，**不需要屏幕**）：
+- 壳 91 例（egui 无头，`cargo test --bin gitx`，**不需要屏幕**）：
   各面板的几何带、行距（日志 21pt / 差异 15pt 逐行断言）、长列表虚拟化、提交图车道、
   日志五列与差异正文的**齐左**（每格左缘贴住自己表头左缘，数字取自参考截图实测），
   以及**真的点击与键入**——临时 git 仓库、打提交信息、按提交按钮（或 ⌘/Ctrl+Enter）、
@@ -224,7 +234,7 @@ node gen-icon.mjs                # 重新生成 gitcraft-app/assets/icon.png
 emoji 不能进 UI（跨系统渲染不一致）、提交行高度只能有一个来源（改一处会让图和文字错位）、
 **没有上游时绝不显示 `↑0 ↓0`**、push 的实参里不得出现加速节点串。
 只有两条还在核心层成立：「内容通路 2 MiB 上限」有测试，「push 拿不到加速节点」是签名级的
-（`git::push` 的参数里根本没有 `node` 这一位，见 `gitcraft-core/src/git.rs:1464`）。
+（`git::push` 的参数里根本没有 `node` 这一位，见 `src/git.rs:1464`）。
 其余四条**如今没有判据守着**，它们只是下面「壳里还缺的」里的文档。
 
 ## 贡献
@@ -242,7 +252,7 @@ emoji 不能进 UI（跨系统渲染不一致）、提交行高度只能有一�
 - **把壳补到能日常用**：分支 / 贮藏 / 远程面板 → fetch / pull / push（含领先落后数与「未设置上游」
   的措辞）→ 键盘操作体系 → 右键菜单与多选 → 文件溯源弹窗 → 补丁闸门
 - **拖放开仓库**（`find_repo_root` 已就位，缺 eframe 事件）与**扫描文件夹**、**克隆**
-- 更新检查的 HTTP 那一跳随 Tauri 一起删了；要恢复就用 `gitcraft-core/src/update.rs` 的纯函数
+- 更新检查的 HTTP 那一跳随 Tauri 一起删了；要恢复就用 `src/update.rs` 的纯函数
   加一层薄客户端，签名发布（`tauri-plugin-updater` 那条路已随 Tauri 作废）
 - Provider 插件往「常用操作」长：CI 状态 → 触发 CI → 创建 PR（能力位已预留，界面按 `capabilities`
   渲染，所以加一个能力不会牵动别处）；Codeup 接阿里云 AK/SK 签名；再加 GitLab / 自建 Gitea

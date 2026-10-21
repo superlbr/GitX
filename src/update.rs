@@ -6,7 +6,7 @@ use std::cmp::Ordering;
 
 use serde_json::Value;
 
-use crate::error::{GitcraftError, Result};
+use crate::error::{GitxError, Result};
 use crate::models::{Asset, Release};
 
 /// A release repo is exactly `owner/repo`; anything else can only be a typo, and
@@ -15,7 +15,7 @@ pub fn check_slug(slug: &str) -> Result<()> {
     let slug = slug.trim();
     let parts: Vec<&str> = slug.split('/').collect();
     if parts.len() != 2 || parts.iter().any(|p| p.is_empty()) {
-        return Err(GitcraftError::Other(
+        return Err(GitxError::Other(
             "发布仓库要写成 owner/repo，例如 t8y2/dbx。".into(),
         ));
     }
@@ -24,7 +24,7 @@ pub fn check_slug(slug: &str) -> Result<()> {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
         if !ok {
-            return Err(GitcraftError::Other(format!(
+            return Err(GitxError::Other(format!(
                 "仓库名「{}」里有不支持的字符，只能用字母、数字、-、_、.。",
                 p
             )));
@@ -51,13 +51,13 @@ pub fn release_api_url(slug: &str, base: &str) -> Result<String> {
         return Ok(official);
     }
     if !b.starts_with("https://") && !b.starts_with("http://") {
-        return Err(GitcraftError::Other(format!(
+        return Err(GitxError::Other(format!(
             "更新检查地址「{}」要以 https:// 或 http:// 开头。",
             b
         )));
     }
     if b.chars().any(char::is_whitespace) {
-        return Err(GitcraftError::Other("更新检查地址不能含空格。".into()));
+        return Err(GitxError::Other("更新检查地址不能含空格。".into()));
     }
     if b.contains("{url}") {
         return Ok(crate::git::apply_node_template(b, &official));
@@ -72,9 +72,9 @@ pub fn release_api_url(slug: &str, base: &str) -> Result<String> {
 /// Parse GitHub's `/releases/latest` response.
 pub fn parse_release(text: &str) -> Result<Release> {
     let v: Value = serde_json::from_str(text)
-        .map_err(|e| GitcraftError::Other(format!("发布信息的 JSON 解析失败: {}", e)))?;
+        .map_err(|e| GitxError::Other(format!("发布信息的 JSON 解析失败: {}", e)))?;
     if let Some(msg) = v.get("message").and_then(|m| m.as_str()) {
-        return Err(GitcraftError::Other(format!("GitHub 返回：{}", msg)));
+        return Err(GitxError::Other(format!("GitHub 返回：{}", msg)));
     }
     let get = |k: &str| -> String {
         v.get(k)
@@ -84,7 +84,7 @@ pub fn parse_release(text: &str) -> Result<Release> {
     };
     let version = get("tag_name");
     if version.is_empty() {
-        return Err(GitcraftError::Other(
+        return Err(GitxError::Other(
             "发布信息里没有 tag_name，无法判断版本。".into(),
         ));
     }
@@ -299,13 +299,13 @@ mod tests {
     fn parses_a_release_and_surfaces_api_errors() {
         let json = r#"{
             "tag_name": "v0.2.0",
-            "name": "gitcraft 0.2.0",
+            "name": "gitx 0.2.0",
             "body": "- 新增更新检查",
             "html_url": "https://github.com/t8y2/dbx/releases/tag/v0.2.0",
             "published_at": "2026-10-10T08:00:00Z",
             "assets": [
-              {"name":"gitcraft_0.2.0_arm64.dmg","size":39,"browser_download_url":"https://github.com/x/y/d"},
-              {"name":"gitcraft_0.2.0_arm64.dmg.sig","size":4,"browser_download_url":"https://github.com/x/y/s"}
+              {"name":"gitx_0.2.0_arm64.dmg","size":39,"browser_download_url":"https://github.com/x/y/d"},
+              {"name":"gitx_0.2.0_arm64.dmg.sig","size":4,"browser_download_url":"https://github.com/x/y/s"}
             ]
         }"#;
         let r = parse_release(json).unwrap();
@@ -314,7 +314,7 @@ mod tests {
         assert_eq!(r.url, "https://github.com/t8y2/dbx/releases/tag/v0.2.0");
         assert_eq!(r.date, "2026-10-10T08:00:00Z");
         assert_eq!(r.assets.len(), 2);
-        assert_eq!(r.assets[0].name, "gitcraft_0.2.0_arm64.dmg");
+        assert_eq!(r.assets[0].name, "gitx_0.2.0_arm64.dmg");
         assert_eq!(r.assets[0].size, 39);
 
         let err = parse_release(r#"{"message":"Not Found"}"#)
@@ -335,32 +335,32 @@ mod tests {
     fn picks_the_installer_for_this_platform() {
         // Asset names in the shape a real desktop release publishes.
         let r = release(&[
-            "gitcraft_0.6.38_amd64.AppImage",
-            "gitcraft_0.6.38_amd64.deb",
-            "gitcraft_0.6.38_arm64.AppImage",
-            "gitcraft_0.6.38_arm64.dmg",
-            "gitcraft_0.6.38_x64.dmg",
-            "gitcraft_0.6.38_arm64-setup.exe",
-            "gitcraft_0.6.38_x64-offline-setup.exe",
-            "gitcraft_0.6.38_x64-setup.exe",
-            "gitcraft_0.6.38_x64_en-US.msi",
-            "gitcraft_0.6.38_x64-portable.zip",
+            "gitx_0.6.38_amd64.AppImage",
+            "gitx_0.6.38_amd64.deb",
+            "gitx_0.6.38_arm64.AppImage",
+            "gitx_0.6.38_arm64.dmg",
+            "gitx_0.6.38_x64.dmg",
+            "gitx_0.6.38_arm64-setup.exe",
+            "gitx_0.6.38_x64-offline-setup.exe",
+            "gitx_0.6.38_x64-setup.exe",
+            "gitx_0.6.38_x64_en-US.msi",
+            "gitx_0.6.38_x64-portable.zip",
         ]);
         assert_eq!(
             pick_asset(&r, "macos", "aarch64").unwrap().name,
-            "gitcraft_0.6.38_arm64.dmg"
+            "gitx_0.6.38_arm64.dmg"
         );
         assert_eq!(
             pick_asset(&r, "macos", "x86_64").unwrap().name,
-            "gitcraft_0.6.38_x64.dmg"
+            "gitx_0.6.38_x64.dmg"
         );
         assert_eq!(
             pick_asset(&r, "windows", "x86_64").unwrap().name,
-            "gitcraft_0.6.38_x64-setup.exe"
+            "gitx_0.6.38_x64-setup.exe"
         );
         assert_eq!(
             pick_asset(&r, "linux", "x86_64").unwrap().name,
-            "gitcraft_0.6.38_amd64.AppImage"
+            "gitx_0.6.38_amd64.AppImage"
         );
         // Nothing matched: the caller falls back to the release page.
         assert!(pick_asset(&r, "freebsd", "x86_64").is_none());
@@ -370,20 +370,20 @@ mod tests {
     #[test]
     fn skips_checksum_sidecars_and_wrong_arch_builds() {
         let r = release(&[
-            "gitcraft_0.6.38_arm64-portable.zip.sig",
-            "gitcraft_0.6.38_arm64-portable.zip",
-            "gitcraft_0.6.38_x64.dmg",
+            "gitx_0.6.38_arm64-portable.zip.sig",
+            "gitx_0.6.38_arm64-portable.zip",
+            "gitx_0.6.38_x64.dmg",
         ]);
         // Only the zip remains once the .sig and the x64 dmg are out.
         assert_eq!(
             pick_asset(&r, "macos", "aarch64").unwrap().name,
-            "gitcraft_0.6.38_arm64-portable.zip"
+            "gitx_0.6.38_arm64-portable.zip"
         );
         // A build with no arch in its name still beats downloading nothing.
-        let plain = release(&["gitcraft-latest.dmg", "gitcraft_0.6.38_x64.dmg"]);
+        let plain = release(&["gitx-latest.dmg", "gitx_0.6.38_x64.dmg"]);
         assert_eq!(
             pick_asset(&plain, "macos", "aarch64").unwrap().name,
-            "gitcraft-latest.dmg"
+            "gitx-latest.dmg"
         );
     }
 

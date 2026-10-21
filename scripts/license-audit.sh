@@ -25,17 +25,16 @@ audit "NOTICE 要同时点名两个许可证" NOTICE "MIT License"
 audit "NOTICE 要同时点名两个许可证" NOTICE "Apache License, Version 2.0"
 audit "NOTICE 要把商标划出授权范围" NOTICE "trademarks"
 audit "再分发时必须知道截图不是我们的" ATTRIBUTION.md "docs/reference"
-audit "核心层要声明双许可" gitcraft-core/Cargo.toml 'license = "MIT OR Apache-2.0"'
-audit "界面层要声明双许可" gitcraft-app/Cargo.toml 'license = "MIT OR Apache-2.0"'
+audit "包要声明双许可" Cargo.toml 'license = "MIT OR Apache-2.0"'
 
 # 字体不许混进仓库：8.3 MB，而且它带着 OFL 的署名义务，只该由 README 指路去取。
-if git ls-files --error-unmatch gitcraft-app/assets/fonts/NotoSansSC-Regular.otf >/dev/null 2>&1; then
+if git ls-files --error-unmatch assets/fonts/NotoSansSC-Regular.otf >/dev/null 2>&1; then
   printf '\033[31m✗ 那份 CJK 字体被提交进仓库了（见 .gitignore 与 README）\033[0m\n'
   failed=1
 fi
 
 # 反过来：字体不在仓库里，就必须留一份能证明它是何种授权的声明文件。
-audit "缺字体时要能说出它的许可证" gitcraft-app/assets/fonts/OFL.txt "SIL Open Font License"
+audit "缺字体时要能说出它的许可证" assets/fonts/OFL.txt "SIL Open Font License"
 
 if [ "$failed" -ne 0 ]; then
   printf '\033[31m素材审计没过\033[0m\n'

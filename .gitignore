@@ -1,14 +1,14 @@
-# Rust build output (all crates, including gitcraft-core)
+# Rust build output (all crates)
 /target
 **/target
 **/*.rs.bk
 
-# egui 版自带的 CJK 字体（8~15MB，从上游重新下载即可，见 gitcraft-app/src/fonts.rs）
-gitcraft-app/assets/fonts/*.otf
-gitcraft-app/assets/fonts/*.ttf
+# egui 版自带的 CJK 字体（8~15MB，从上游重新下载即可，见 src/ui/fonts.rs）
+assets/fonts/*.otf
+assets/fonts/*.ttf
 
 # Cargo lock: commit it for applications (reproducible builds).
-# Uncomment the line below only if you intend to treat gitcraft-core as a published library.
+# Uncomment the line below only if you intend to treat this package as a published library.
 # Cargo.lock
 
 # Logs

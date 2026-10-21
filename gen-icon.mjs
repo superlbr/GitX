@@ -154,6 +154,6 @@ const png = Buffer.concat([
   chunk("IEND", Buffer.alloc(0)),
 ]);
 
-mkdirSync("gitcraft-app/assets", { recursive: true });
-writeFileSync("gitcraft-app/assets/icon.png", png);
-console.log("wrote gitcraft-app/assets/icon.png", png.length, "bytes");
+mkdirSync("assets", { recursive: true });
+writeFileSync("assets/icon.png", png);
+console.log("wrote assets/icon.png", png.length, "bytes");

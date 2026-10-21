@@ -7,7 +7,7 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{GitcraftError, Result};
+use crate::error::{GitxError, Result};
 
 /// The private-key names `ssh-keygen` creates by default, most preferred first.
 pub const DEFAULT_KEY_NAMES: &[&str] = &["id_ed25519", "id_ecdsa", "id_rsa", "id_dsa"];
@@ -242,18 +242,18 @@ pub fn public_key_in(dir: &str, path: &str) -> Result<String> {
     let base = std::path::Path::new(dir);
     let p = std::path::Path::new(path);
     if !base.as_os_str().is_empty() && p.parent() != Some(base) {
-        return Err(GitcraftError::Other("只能复制 ~/.ssh 里的公钥。".into()));
+        return Err(GitxError::Other("只能复制 ~/.ssh 里的公钥。".into()));
     }
     if !p
         .file_name()
         .map(|n| n.to_string_lossy().ends_with(".pub"))
         .unwrap_or(false)
     {
-        return Err(GitcraftError::Other(
+        return Err(GitxError::Other(
             "只有 .pub 公钥可以复制，私钥不会离开磁盘。".into(),
         ));
     }
-    std::fs::read_to_string(p).map_err(|e| GitcraftError::Other(format!("读取公钥失败: {}", e)))
+    std::fs::read_to_string(p).map_err(|e| GitxError::Other(format!("读取公钥失败: {}", e)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -367,7 +367,7 @@ pub fn interpret_auth(text: &str) -> AuthReport {
 pub fn probe(host: &str, user: Option<&str>) -> Result<AuthReport> {
     let host = host.trim();
     if host.is_empty() || host.split_whitespace().count() != 1 {
-        return Err(GitcraftError::Other("主机名不能为空，也不能包含空格。".into()));
+        return Err(GitxError::Other("主机名不能为空，也不能包含空格。".into()));
     }
     let user = user
         .map(str::trim)

@@ -6,7 +6,7 @@ labels: 增强
 
 **这一条要在哪一层**
 
-`gitcraft-core`（git 与本地状态） / `gitcraft-app`（egui 壳，现在唯一的界面） / 两层都要
+核心层 `src/`（git 与本地状态） / 壳 `src/ui/`（egui，现在唯一的界面） / 两层都要
 
 **现在是什么样、想要什么样**
 

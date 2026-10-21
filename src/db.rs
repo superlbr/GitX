@@ -118,7 +118,7 @@ mod tests {
 
     fn tmp_db() -> (tempfile::TempDir, Connection) {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("gitcraft.db");
+        let path = dir.path().join("gitx.db");
         let conn = open(path.to_str().unwrap()).unwrap();
         (dir, conn)
     }
@@ -151,7 +151,7 @@ mod tests {
     #[test]
     fn an_old_database_gains_the_freshness_column() {
         let dir = tempfile::tempdir().unwrap();
-        let conn = Connection::open(dir.path().join("gitcraft.db")).unwrap();
+        let conn = Connection::open(dir.path().join("gitx.db")).unwrap();
         conn.execute(
             "CREATE TABLE repos (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

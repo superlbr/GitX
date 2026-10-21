@@ -16,7 +16,7 @@ jobs:
     # eframe 要系统框架：Linux 上要装一堆 GTK / X11 / Wayland 开发包，
     # 而这个应用目前只在 macOS 上跑，所以整条门禁放在 mac runner 上，
     # 和本机 `./scripts/gates.sh` 判的东西一致。
-    name: Rust（core + egui 无头门禁）
+    name: Rust（核心层 + egui 无头门禁）
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -24,8 +24,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
-            gitcraft-core -> target
-            gitcraft-app -> target
+            . -> target
       - name: git 是否可用（核心层全部走 git CLI）
         run: git --version
       # 第四条门禁与本机跑的是同一个文件（不是复制一份逻辑）。
@@ -38,21 +37,18 @@ jobs:
       # 这一步先让它显式存在，而不是假装门禁在测真宽度。
       - name: CJK 字体在不在（不在的话宽度类判据测的是半宽的 .notdef）
         run: |
-          if [ -f gitcraft-app/assets/fonts/NotoSansSC-Regular.otf ]; then
+          if [ -f assets/fonts/NotoSansSC-Regular.otf ]; then
             echo "字体在，宽度类判据量的是真宽度"
           else
-            echo "::warning::缺 gitcraft-app/assets/fonts/NotoSansSC-Regular.otf：本机上文字体没进仓库，CI 上的宽度判据是半宽的"
+            echo "::warning::缺 assets/fonts/NotoSansSC-Regular.otf：这份 CJK 字体没进仓库，CI 上的宽度判据是半宽的"
           fi
-      - run: cargo test
-        working-directory: gitcraft-core
-      - run: cargo test
-        working-directory: gitcraft-app
-      - name: egui 层构建必须零警告
-        working-directory: gitcraft-app
+      - run: cargo test --lib
+      - run: cargo test --bin gitx
+      - name: 构建必须零警告
         run: |
           out=$(cargo build 2>&1)
           printf '%s\n' "$out"
           if printf '%s\n' "$out" | grep -qE "^(warning|error)"; then
-            echo "::error::gitcraft-app 构建有警告"
+            echo "::error::构建有警告"
             exit 1
           fi

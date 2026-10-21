@@ -1,0 +1,39 @@
+[package]
+name = "gitx"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+# 单 crate 双 target：`src/lib.rs` 是核心层（git 与本地状态，零 UI 依赖），
+# `src/main.rs` 是 egui/eframe 的壳，直接函数调用核心层，**没有 IPC 那一跳**
+# （旧 Tauri 层才有）。「界面层可替换」的边界由 lib/bin 两个编译单元保住：
+# core 模块看不见 `crate::ui::*`，UI 模块经 `gitx::` 反向取核心。
+[lib]
+name = "gitx"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gitx"
+path = "src/main.rs"
+
+[dependencies]
+# 核心层
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+thiserror = "1"
+# 日期列要按「今天 / 昨天 / 今年内」出文案，核心层带 serde、界面层要本地时区。
+chrono = { version = "0.4", features = ["serde"] }
+# 界面层
+eframe = "0.37"
+
+# 彩色 emoji（COLR/PNG 位图）需要 vello_cpu 的字形光栅化，默认不开。
+[dependencies.epaint]
+version = "0.37"
+features = ["color_fonts"]
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.dev]
+opt-level = 1

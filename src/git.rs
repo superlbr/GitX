@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::process::Command;
 
-use crate::error::{GitcraftError, Result};
+use crate::error::{GitxError, Result};
 use crate::models::*;
 
 /// Without this, git escapes every non-ASCII path into `"\344\270\255..."`,
@@ -17,7 +17,7 @@ fn run_git(repo: &str, args: &[&str]) -> Result<String> {
         .args(args)
         .output()?;
     if !output.status.success() {
-        return Err(GitcraftError::Git(explain_git_error(&String::from_utf8_lossy(
+        return Err(GitxError::Git(explain_git_error(&String::from_utf8_lossy(
             &output.stderr,
         ))));
     }
@@ -34,7 +34,7 @@ fn run_git_env(repo: &str, args: &[&str], envs: &[(&str, &str)]) -> Result<Strin
         .envs(envs.iter().map(|(k, v)| (*k, *v)))
         .output()?;
     if !output.status.success() {
-        return Err(GitcraftError::Git(explain_git_error(&String::from_utf8_lossy(
+        return Err(GitxError::Git(explain_git_error(&String::from_utf8_lossy(
             &output.stderr,
         ))));
     }
@@ -113,7 +113,7 @@ pub fn clone_repo(clone_url: &str, remote_url: &str, dest: &str) -> Result<Strin
         .arg(&dest)
         .output()?;
     if !output.status.success() {
-        return Err(GitcraftError::Git(explain_git_error(&String::from_utf8_lossy(
+        return Err(GitxError::Git(explain_git_error(&String::from_utf8_lossy(
             &output.stderr,
         ))));
     }
@@ -255,7 +255,7 @@ pub fn head(repo: &str) -> Result<String> {
 pub fn scan_repos(root: &str, max_depth: usize, limit: usize) -> Result<Vec<String>> {
     let start = std::path::Path::new(root);
     if !start.is_dir() {
-        return Err(GitcraftError::Other(format!("文件夹不存在: {}", root)));
+        return Err(GitxError::Other(format!("文件夹不存在: {}", root)));
     }
     let mut found: Vec<String> = Vec::new();
     let mut queue = std::collections::VecDeque::from([(start.to_path_buf(), 0usize)]);
@@ -770,10 +770,10 @@ pub fn conflict_content(repo: &str, path: &str) -> Result<String> {
         .trim()
         .to_string();
     if root.is_empty() {
-        return Err(GitcraftError::Other("无法确定仓库根目录".into()));
+        return Err(GitxError::Other("无法确定仓库根目录".into()));
     }
     let full = std::path::Path::new(&root).join(path);
-    std::fs::read_to_string(&full).map_err(GitcraftError::Io)
+    std::fs::read_to_string(&full).map_err(GitxError::Io)
 }
 
 /// Write user-edited content for a conflicted file and stage it as resolved.
@@ -782,7 +782,7 @@ pub fn resolve_manual(repo: &str, path: &str, content: &str) -> Result<()> {
         .trim()
         .to_string();
     if root.is_empty() {
-        return Err(GitcraftError::Other("无法确定仓库根目录".into()));
+        return Err(GitxError::Other("无法确定仓库根目录".into()));
     }
     let full = std::path::Path::new(&root).join(path);
     std::fs::write(&full, content)?;
@@ -1127,7 +1127,7 @@ fn run_git_stdin(repo: &str, args: &[&str], input: &str) -> Result<String> {
         .write_all(input.as_bytes())?;
     let out = child.wait_with_output()?;
     if !out.status.success() {
-        return Err(GitcraftError::Git(explain_git_error(&String::from_utf8_lossy(
+        return Err(GitxError::Git(explain_git_error(&String::from_utf8_lossy(
             &out.stderr,
         ))));
     }
@@ -1139,7 +1139,7 @@ fn run_git_stdin(repo: &str, args: &[&str], input: &str) -> Result<String> {
 pub fn stage_hunk(repo: &str, path: &str, index: usize) -> Result<()> {
     let patch = working_patch(repo, false, Some(path))?;
     let one = hunk_patch(&patch, index).ok_or_else(|| {
-        GitcraftError::Other(format!("{path} 没有第 {index} 块改动，可能列表刚刷新过"))
+        GitxError::Other(format!("{path} 没有第 {index} 块改动，可能列表刚刷新过"))
     })?;
     run_git_stdin(repo, &["apply", "--cached", "--whitespace=nowarn", "-"], &one)?;
     Ok(())
@@ -1150,7 +1150,7 @@ pub fn stage_hunk(repo: &str, path: &str, index: usize) -> Result<()> {
 pub fn unstage_hunk(repo: &str, path: &str, index: usize) -> Result<()> {
     let patch = working_patch(repo, true, Some(path))?;
     let one = hunk_patch(&patch, index).ok_or_else(|| {
-        GitcraftError::Other(format!("{path} 的暂存区里没有第 {index} 块改动，可能列表刚刷新过"))
+        GitxError::Other(format!("{path} 的暂存区里没有第 {index} 块改动，可能列表刚刷新过"))
     })?;
     run_git_stdin(
         repo,
@@ -1166,7 +1166,7 @@ pub fn unstage_hunk(repo: &str, path: &str, index: usize) -> Result<()> {
 pub fn discard_hunk(repo: &str, path: &str, index: usize) -> Result<()> {
     let patch = working_patch(repo, false, Some(path))?;
     let one = hunk_patch(&patch, index).ok_or_else(|| {
-        GitcraftError::Other(format!("{path} 没有第 {index} 块改动，可能列表刚刷新过"))
+        GitxError::Other(format!("{path} 没有第 {index} 块改动，可能列表刚刷新过"))
     })?;
     // 不带 `--cached`：反打的落点就是工作区那个文件。
     run_git_stdin(repo, &["apply", "-R", "--whitespace=nowarn", "-"], &one)?;
@@ -1211,7 +1211,7 @@ pub fn ignore_path(repo: &str, path: &str) -> Result<()> {
         .trim()
         .to_string();
     if root.is_empty() {
-        return Err(GitcraftError::Other("无法确定仓库根目录".into()));
+        return Err(GitxError::Other("无法确定仓库根目录".into()));
     }
     let ignore_file = std::path::Path::new(&root).join(".gitignore");
     let mut content = std::fs::read_to_string(&ignore_file).unwrap_or_default();
@@ -1234,7 +1234,7 @@ pub fn read_gitignore(repo: &str) -> Result<String> {
         .trim()
         .to_string();
     if root.is_empty() {
-        return Err(GitcraftError::Other("无法确定仓库根目录".into()));
+        return Err(GitxError::Other("无法确定仓库根目录".into()));
     }
     let ignore_file = std::path::Path::new(&root).join(".gitignore");
     Ok(std::fs::read_to_string(&ignore_file).unwrap_or_default())
@@ -1246,7 +1246,7 @@ pub fn write_gitignore(repo: &str, content: &str) -> Result<()> {
         .trim()
         .to_string();
     if root.is_empty() {
-        return Err(GitcraftError::Other("无法确定仓库根目录".into()));
+        return Err(GitxError::Other("无法确定仓库根目录".into()));
     }
     let ignore_file = std::path::Path::new(&root).join(".gitignore");
     std::fs::write(&ignore_file, content)?;
@@ -1435,7 +1435,7 @@ pub fn interactive_rebase(repo: &str, base: &str, plan: &[(String, String)]) -> 
     for (oid, action) in plan {
         let a = action.as_str();
         if !valid.contains(&a) {
-            return Err(GitcraftError::Other(format!("不支持的变基操作: {}", a)));
+            return Err(GitxError::Other(format!("不支持的变基操作: {}", a)));
         }
         let subject = run_git(repo, &["log", "--format=%s", "-n", "1", oid])
             .unwrap_or_default()
@@ -1444,12 +1444,12 @@ pub fn interactive_rebase(repo: &str, base: &str, plan: &[(String, String)]) -> 
         todo.push_str(&format!("{} {} {}\n", a, oid, subject));
     }
     if todo.trim().is_empty() {
-        return Err(GitcraftError::Other("变基计划为空".into()));
+        return Err(GitxError::Other("变基计划为空".into()));
     }
 
     // Write the todo list to a temp file and replay it via GIT_SEQUENCE_EDITOR.
     let dir = std::env::temp_dir();
-    let path = dir.join(format!("gitcraft-rebase-{}.todo", std::process::id()));
+    let path = dir.join(format!("gitx-rebase-{}.todo", std::process::id()));
     std::fs::write(&path, todo)?;
     let path_str = path.to_string_lossy().to_string();
     let seq_editor = format!("sh -c 'cp {} \"$1\"'", path_str);
@@ -1567,11 +1567,11 @@ pub fn apply_node_template(tpl: &str, url: &str) -> String {
 /// break git's `key=value` parse are refused instead of escaped.
 pub fn node_rewrite_args(node_tpl: &str, remote_url: &str) -> Result<Vec<String>> {
     if node_tpl.trim().is_empty() {
-        return Err(GitcraftError::Other("请先填写一个加速节点地址。".into()));
+        return Err(GitxError::Other("请先填写一个加速节点地址。".into()));
     }
     let url = remote_url.trim();
     if !url.starts_with("https://") && !url.starts_with("http://") {
-        return Err(GitcraftError::Other(format!(
+        return Err(GitxError::Other(format!(
             "加速节点只能改写 https 形式的远程，「{}」走不了节点。SSH 地址请配置代理，或在「设置 → SSH」里试连。",
             url
         )));
@@ -1581,7 +1581,7 @@ pub fn node_rewrite_args(node_tpl: &str, remote_url: &str) -> Result<Vec<String>
         || section.contains(['=', '"', '\''])
         || section.chars().any(char::is_whitespace);
     if unusable {
-        return Err(GitcraftError::Other(format!(
+        return Err(GitxError::Other(format!(
             "加速节点「{}」不是 git 能接受的地址。请填写完整 https 地址，例如 https://node.example/{{url}}。",
             node_tpl.trim()
         )));
@@ -1598,7 +1598,7 @@ pub fn remote_url(repo: &str, remote: &str) -> Result<String> {
     let url = run_git(repo, &["remote", "get-url", remote])?;
     let url = url.trim().to_string();
     if url.is_empty() {
-        return Err(GitcraftError::Other(format!(
+        return Err(GitxError::Other(format!(
             "这个仓库没有名为「{}」的远程。",
             remote
         )));
@@ -1667,7 +1667,7 @@ pub fn push(
         // letting either default is how the tracking branch silently never gets
         // set, and the user retries the push a second time to no visible effect.
         if remote.is_none() || branch.is_none() {
-            return Err(GitcraftError::Other(
+            return Err(GitxError::Other(
                 "设置上游分支必须同时指定远程与分支名。".into(),
             ));
         }
@@ -1748,7 +1748,7 @@ pub fn draft_pr_context(repo: &str) -> Result<(String, String, String)> {
     let current = branches
         .iter()
         .find(|b| b.is_current)
-        .ok_or_else(|| GitcraftError::Other("未找到当前分支".into()))?;
+        .ok_or_else(|| GitxError::Other("未找到当前分支".into()))?;
 
     let base = if let Some(up) = &current.upstream {
         up.clone()
@@ -1759,7 +1759,7 @@ pub fn draft_pr_context(repo: &str) -> Result<(String, String, String)> {
             .find(|c| run_git(repo, &["rev-parse", "--verify", "--quiet", c]).is_ok())
             .map(|c| c.to_string())
             .ok_or_else(|| {
-                GitcraftError::Other(
+                GitxError::Other(
                     "无法确定基准分支：当前分支无 upstream，且未发现 main/master".into(),
                 )
             })?
@@ -1768,7 +1768,7 @@ pub fn draft_pr_context(repo: &str) -> Result<(String, String, String)> {
     let range = format!("{}..HEAD", base);
     let log = run_git(repo, &["log", &range, "--format=%h %s"])?;
     if log.trim().is_empty() {
-        return Err(GitcraftError::Other(format!(
+        return Err(GitxError::Other(format!(
             "当前分支相对基准 {} 没有新的提交",
             base
         )));
@@ -2916,7 +2916,7 @@ mod tests {
         // Clone is where domestic users hit the network hardest, and it runs
         // through the same layer as everything else.
         let timeout = explain_git_error(
-            "Cloning into 'gitcraft'....\nfatal: unable to access 'https://github.com/a/b/': \
+            "Cloning into 'gitx'....\nfatal: unable to access 'https://github.com/a/b/': \
              Failed to connect to github.com port 443 after 75000 ms: Operation timed out",
         );
         assert!(timeout.contains("连接超时"), "{}", timeout);

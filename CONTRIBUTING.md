@@ -6,11 +6,13 @@
 它功能最全，但每帧要跨一次 IPC，与「每帧的活只跟窗口大小有关」直接冲突。
 代码都在提交 `9a3077c` 里，要捡哪块交互语义就从那儿看。
 
-| 目录 | 是什么 | 改它之前 |
+仓库是一个**单 crate 双 target** 的 Rust 包（2026-10-21 由 `gitcraft-core`、`gitcraft-app` 两个 crate
+合并而来，项目同期更名 GitX），改前先确认自己在哪一层：
+
+| 位置 | 是什么 | 改它之前 |
 | --- | --- | --- |
-| `gitcraft-core/` | 纯 Rust 的 git 与本地状态层。**零 UI 依赖**，壳直接调它。 | 优先在这里修。核心函数一旦定型，判据最好写（不需要屏幕，也不需要造 UI）。 |
-| `gitcraft-app/` | 唯一的界面：egui/eframe，直接 `use gitcraft_core::git`，**没有 IPC 那一跳**。 | 每改一块都要问「帧里多花了多少」。见下「性能是这一层的全部理由」。 |
-| `uiprobe/` | 一次性 spike（字体、输入法），不当产品代码维护。 | 结论要写进 `PROCESS.md`，代码本身可以脏。 |
+| `src/`（lib target） | 纯 Rust 的 git 与本地状态层。**零 UI 依赖**——它看不见 `crate::ui::*`，壳经 `gitx::` 调它。 | 优先在这里修。核心函数一旦定型，判据最好写（不需要屏幕，也不需要造 UI）。 |
+| `src/ui/`（bin target） | 唯一的界面：egui/eframe，直接调 `gitx::git`，**没有 IPC 那一跳**。 | 每改一块都要问「帧里多花了多少」。见下「性能是这一层的全部理由」。 |
 | `docs/reference/` | SourceTree 4.2.19 的实测截图。几何常量是从这些图上量出来的。 | 改界面=改这张对照表，别凭印象。 |
 | `PROCESS.md` | 台账：每一批改了什么、判据是什么、反向变异红了哪几条、以及**仍然没看到过的**。 | 新开一批之前先读最后三节。 |
 
@@ -31,9 +33,9 @@
 然后用一份事先存好的快照恢复，不要用 `git checkout --`（那会把同一文件里其它未提交的改动一起带走）：
 
 ```bash
-cp gitcraft-app/src/main.rs /tmp/green_main.rs      # 改之前
+cp src/ui/app.rs /tmp/green_app.rs      # 改之前
 # ……做变异、跑测试……
-cp /tmp/green_main.rs gitcraft-app/src/main.rs && cmp /tmp/green_main.rs gitcraft-app/src/main.rs   # 恢复并逐字节确认
+cp /tmp/green_app.rs src/ui/app.rs && cmp /tmp/green_app.rs src/ui/app.rs   # 恢复并逐字节确认
 ```
 
 已经有两条判据是靠这个方法发现自己是假的：
@@ -56,7 +58,7 @@ cp /tmp/green_main.rs gitcraft-app/src/main.rs && cmp /tmp/green_main.rs gitcraf
 - **脚手架只喂 mac 那一半**：`press_mod_enter` 一开始只会发 `ModifiersChanged(COMMAND)`，
   所以产品代码里 `|| i.modifiers.ctrl` 那一半删掉也没人看见。补了 CTRL 那条判据之后才杀得死它。
 
-## 无头键盘与鼠标怎么喂（`gitcraft-app`）
+## 无头键盘与鼠标怎么喂（界面层）
 
 - `i.modifiers` **只由 `Event::ModifiersChanged` 更新**（`egui-0.37.0/src/data/input/input_state/mod.rs:434`），
   `Event::Key` 自带的那份 `modifiers` 它不看。真窗口里 winit 是「先修饰键、再按键」，
@@ -64,7 +66,7 @@ cp /tmp/green_main.rs gitcraft-app/src/main.rs && cmp /tmp/green_main.rs gitcraf
 - 焦点在 `Context` 的 memory 里，**点击和敲字必须共用同一个 `Context`**；按下与抬起要分两帧。
 - 文本走 `Event::Text`（macOS 输入法上屏那一刻交给控件的就是它），别直接改字段。
 
-## 性能是 `gitcraft-app` 这一层的全部理由
+## 性能是界面这一层的全部理由
 
 复刻 SourceTree 的界面不是目的，做到它不该更慢才是。所以这一层的判据几乎都在问同一个问题：
 **这帧做了多少本来不必做的活**。
@@ -82,8 +84,8 @@ cp /tmp/green_main.rs gitcraft-app/src/main.rs && cmp /tmp/green_main.rs gitcraf
 
 | 你改了 | 跑这个 |
 | --- | --- |
-| `gitcraft-core/**` | `cd gitcraft-core && cargo test`（改了函数签名再加 `cargo check --tests`，默认 `cargo check` 不编译测试代码） |
-| `gitcraft-app/**` | `cd gitcraft-app && cargo test`，再 `cargo build` 看有没有警告（这一步单独查，因为 `cargo test` 的输出里混着测试代码的诊断） |
+| `src/`（核心层，不动 `src/ui/`） | `cargo test --lib`（改了函数签名再加 `cargo check --tests`，默认 `cargo check` 不编译测试代码） |
+| `src/ui/**`（壳） | `cargo test --bin gitx`，再 `cargo build` 看有没有警告（这一步单独查，因为 `cargo test` 的输出里混着测试代码的诊断） |
 | 新引进素材／依赖，或动了 `LICENSE*`/`NOTICE`/`ATTRIBUTION.md`/`Cargo.toml` 的 `license` | `./scripts/license-audit.sh`（只读文本，一秒都不到） |
 
 全套四条一起：
@@ -100,15 +102,15 @@ CI 在 macos-14 上跑同一条路（eframe 要系统框架，Linux runner 上�
 
 **不要连真远端**，也不要假设某台机器上有某个仓库。
 
-- 核心层用 `gitcraft-core/src/git.rs` 测试里的 `init_repo()`：`tempfile::tempdir()` 起一个真 git 仓库。
-- egui 层用 `gitcraft-app/src/main.rs` 测试里的 `scratch_repo(tag)`：真 `git init` + 一次提交 +
+- 核心层用 `src/git.rs` 测试里的 `init_repo()`：`tempfile::tempdir()` 起一个真 git 仓库。
+- egui 层用 `src/geometry.rs` 测试里的 `scratch_repo(tag)`：真 `git init` + 一次提交 +
   一处已暂存的改动；断言挂了临时目录会留着，方便你去看。
 - 界面无头测试**不需要屏幕**：`Context::run_ui` 喂 `RawInput` 就能拿到整帧的形状和文字落点。
   点击的坐标是从「这一帧真的画出来的文字」反推的，控件挪了位置判据跟着挪。
 - **字体也是测试数据**：那 8.3MB 全量 CJK 没进仓库，缺它时无头帧会用系统链，而 `.notdef` 的 advance
   正好是 0.5×字号——所有按宽度/左缘下的判据量的都是一个产品里永远看不到的字体。
-  `style()` 第一行 `fonts::install(ctx)` 把窗口与测试走同一条装配路径，所以跑 `gitcraft-app` 的判据之前
-  先按 README 那段把字体放到位（或 `GITCRAFT_FONT_DIR` 指过去）。
+  `style()` 第一行 `fonts::install(ctx)` 把窗口与测试走同一条装配路径，所以跑壳的判据之前
+  先按 README 那段把字体放到位（或 `GITX_FONT_DIR` 指过去）。
 
 ## 许可证与素材
 
@@ -119,7 +121,7 @@ CI 在 macos-14 上跑同一条路（eframe 要系统框架，Linux runner 上�
   所以我们刻意不写贡献者协议。**不要提交你无权这样授权的东西。**
 - 这个仓库里有四种条款完全不同的东西，改任何一个都要清楚自己在动哪一种：
   我们原创的代码 / **Atlassian 的截图**（`docs/reference/`，专有，只作为测量来源，不受本仓库许可约束）/
-  **一份 OFL 字体**（故意不入库，`OFL.txt` 入库）/ **「GitCraft」这个名字和图标**（商标，不在授权范围内，
+  **一份 OFL 字体**（故意不入库，`OFL.txt` 入库）/ **「GitX」这个名字和图标**（商标，不在授权范围内，
   分叉必须改名换图标）。逐条登记在 [`ATTRIBUTION.md`](ATTRIBUTION.md)。
 - 新引进字体、图标、图片、样本文件：在 `ATTRIBUTION.md` 补一行（作者 / 来源 / 许可证），
   并把它的许可证原文放进仓库。素材审计那条门禁读的就是这些文件，缺一条就红。
@@ -132,7 +134,7 @@ CI 在 macos-14 上跑同一条路（eframe 要系统框架，Linux runner 上�
 这些是台账里明确写着「还没做」的，边界清楚，不需要读完全部 2500 多行台账。
 前三条**只动核心层**（判据最好写，不用造 UI），后几条只动壳：
 
-- **按 hunk 应用补丁**：`gitcraft-core` 还没有「按 hunk stage / restore」的函数。
+- **按 hunk 应用补丁**：核心层还没有「按 hunk stage / restore」的函数。
   这是一条真正的 git 语义活（`git apply --cached` 喂单段补丁、上下文对不上时要报清楚），
   核心层先加函数 + 单测，壳里再接控件。
 - **fetch / pull / push 的领先落后数**：`unpushed_commits`、`pushed_refs`、
@@ -141,7 +143,7 @@ CI 在 macos-14 上跑同一条路（eframe 要系统框架，Linux runner 上�
   是很划算的第一 PR。
 - **`--max-count` 截断的显示契约**：日志分页在核心层，但「列表被截断了」这件事目前对用户不可见，
   也没有判据。
-- **筛选条另外三枚开关**：`gitcraft-app` 里四枚只接了「层级顺序」一枚，其余三枚点了会显式提示
+- **筛选条另外三枚开关**：壳里四枚只接了「层级顺序」一枚，其余三枚点了会显式提示
   「egui 版还没接」。接法是现成的（`set_topo` → `open` 重取列表）。
 - **侧栏四条未接动作**（标签 / 远端展开 / 贮藏应用 / 搜索面板）与工具栏剩余按钮（分支 / 合并 /
   贮藏 / 远程服务器 / 设置）。核心函数**都已经存在**，缺的只是壳里那一步调用。
@@ -150,7 +152,7 @@ CI 在 macos-14 上跑同一条路（eframe 要系统框架，Linux runner 上�
   和「失败时那格信息不能丢」那类判据（现成通路：`a_rejected_commit_keeps_the_message`）。
 - **拖放与扫描文件夹**：`find_repo_root` 与 `scan_repos` 带着各自的判据，缺的是 eframe 的拖放事件
   和目录选择器。
-- **深色模式**：`gitcraft-app` 现在整份调色板硬编码亮色 + `set_theme(Light)`。
+- **深色模式**：壳现在整份调色板硬编码亮色 + `set_theme(Light)`。
 - **车道超过 4 条**：现在是 `assert` 报错（宁可红也不压扁）。做成列宽自适应或横向滚动，
   并给「超过四条道时用户看到什么」补判据。
 
@@ -162,6 +164,6 @@ CI 在 macos-14 上跑同一条路（eframe 要系统框架，Linux runner 上�
   不写「这行在干什么」——名字已经说清楚了。
 - 加依赖先在 issue 里说一句，尤其是会带进 C 依赖或改变安装体积的。git 操作一律走 **git CLI**
   而不是 libgit2，这是刻意的，别「顺手优化」。
-- 不要为了跑过门禁而放宽已有的数：字节上限（`gitcraft-core` 的 `rev_file_text` / `untracked_patch`
+- 不要为了跑过门禁而放宽已有的数：字节上限（核心层的 `rev_file_text` / `untracked_patch`
   都是 2 MiB）、扫描深度与数量上限、日志 `--max-count` 这类棘轮是历史事故换来的。
 - 界面文案统一中文；控件挪位置要回到 `docs/reference/` 重新量，不要按像素感觉调。

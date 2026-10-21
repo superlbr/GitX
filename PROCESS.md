@@ -324,7 +324,8 @@ UI 不许出现 emoji、提交行高度只有一个来源、没有上游时绝�
 - 视觉打磨第一~四批（真截图驱动）、历史页改版 + 仓库标签页、「点提交 → 整屏空白」缺陷、按路径筛选没反应、
   push 报 `missing required key setUpstream`、应用图标、P0 三刀、默认亮色 + 双左栏合一（**已被 10-20 复刻拍板作废**）
 - 框架评估（egui/eframe 那条：结论「不换」，理由后来被 spike 换掉一半）+ **Spike 结果：两条判据实测**
-  （`gitcraft-app/src/fonts.rs:5` 与 `uiprobe/` 的注释仍指向这一节）
+  （`src/ui/fonts.rs:5` 的注释仍指向这一节；`uiprobe/` 已于 2026-10-21 按本台账「跑完就删」
+  的惯例删除，结论都在这一节里）
 - 项目更名 GitX → gitCraft：显示层 `GitCraft`、标识符小写 `gitcraft`、工作区目录 `~/Developer/superlbr/gitx` 不动；
   顺带量到两条存储事实（SQLite 按 bundle id 分家、WKWebView 的 localStorage 按**可执行文件名**分家）
 - 命令层 `src/commands.ts`（76 条、`runCommand` 单一入口、破坏性确认收进这一层、覆盖率闸门）+ 命令面板 UI（⌘K，两阶段选目标）

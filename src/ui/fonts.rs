@@ -13,7 +13,7 @@ const SYSTEM: &[&str] = &["Library/Fonts/msyh.ttf"];
 
 pub fn install(ctx: &egui::Context) {
     let Some((path, bytes)) = load() else {
-        eprintln!("gitcraft-app: 没找到可用的 CJK 字体，退回 system_fonts（含「：」的中文会出豆腐块）");
+        eprintln!("gitx-app: 没找到可用的 CJK 字体，退回 system_fonts（含「：」的中文会出豆腐块）");
         return;
     };
     let mut fonts = FontDefinitions::default();
@@ -29,17 +29,17 @@ pub fn install(ctx: &egui::Context) {
             .push("noto-cjk".to_owned());
     }
     ctx.set_fonts(fonts);
-    eprintln!("gitcraft-app: CJK 字体用了 {}", path.display());
+    eprintln!("gitx-app: CJK 字体用了 {}", path.display());
 }
 
-/// 依次试 `GITCRAFT_FONT_DIR`、仓库里的 `assets/fonts`、用户机器上的候选，返回第一个**完整**的。
+/// 依次试 `GITX_FONT_DIR`、仓库里的 `assets/fonts`、用户机器上的候选，返回第一个**完整**的。
 fn load() -> Option<(PathBuf, Vec<u8>)> {
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(dir) = std::env::var("GITCRAFT_FONT_DIR") {
+    if let Ok(dir) = std::env::var("GITX_FONT_DIR") {
         candidates.push(PathBuf::from(dir).join(BUNDLED));
     }
-    // 从仓库根跑和从 gitcraft-app/ 跑都能命中，开发时不必先 build 资源。
-    for root in ["assets/fonts", "gitcraft-app/assets/fonts"] {
+    // 从仓库根跑和从 gitx-app/ 跑都能命中，开发时不必先 build 资源。
+    for root in ["assets/fonts", "gitx-app/assets/fonts"] {
         candidates.push(PathBuf::from(root).join(BUNDLED));
     }
     if let Ok(home) = std::env::var("HOME") {
@@ -56,11 +56,11 @@ fn load() -> Option<(PathBuf, Vec<u8>)> {
         match std::fs::read(&path) {
             Ok(bytes) if complete(&bytes) => return Some((path, bytes)),
             Ok(bytes) => eprintln!(
-                "gitcraft-app: {} 有 {} 字节但表结构不完整（下载被截断？），跳过",
+                "gitx-app: {} 有 {} 字节但表结构不完整（下载被截断？），跳过",
                 path.display(),
                 bytes.len()
             ),
-            Err(error) => eprintln!("gitcraft-app: 读 {} 失败：{error}", path.display()),
+            Err(error) => eprintln!("gitx-app: 读 {} 失败：{error}", path.display()),
         }
     }
     None

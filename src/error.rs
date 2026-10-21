@@ -1,7 +1,7 @@
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-pub enum GitcraftError {
+pub enum GitxError {
     #[error("git command failed: {0}")]
     Git(String),
     #[error("not a git repository: {0}")]
@@ -16,4 +16,4 @@ pub enum GitcraftError {
     Other(String),
 }
 
-pub type Result<T> = std::result::Result<T, GitcraftError>;
+pub type Result<T> = std::result::Result<T, GitxError>;

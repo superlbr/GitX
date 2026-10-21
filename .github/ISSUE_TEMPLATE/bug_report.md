@@ -16,7 +16,7 @@ labels: bug
 
 - 仓库：私有可以只贴 `git log --graph --max-count=20 --pretty=%h%d%s` 的输出
 - 提交数 / 工作区文件数 / 最大那份补丁的行数（虚拟化和补丁上限都吃这三个数）
-- 界面：只有 egui 版（`cd gitcraft-app && cargo run`）。2026-10-20 起 React + Tauri 那版已删除，
+- 界面：只有 egui 版（`cargo run --bin gitx`）。2026-10-20 起 React + Tauri 那版已删除，
   报「那版有、这版没有」请先看 README 的「壳里还缺的」
 
 **环境**

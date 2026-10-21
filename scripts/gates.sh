@@ -1,32 +1,32 @@
 #!/usr/bin/env bash
 # 四条门禁一次跑完。**改代码时不要跑它**：本仓库的惯例是改动阶段只跑受影响的那一条窄门禁
-# （见 CONTRIBUTING.md），一批做完再跑这个。慢的那一条是 eframe 的链接。
+# （见 CONTRIBUTING.md），一批做完再跑这个。慢的那一步是 eframe 的链接。
 set -uo pipefail
 cd "$(dirname "$0")/.."
 failed=0
 
 step() { printf '\n\033[1m== %s ==\033[0m\n' "$1"; }
-run() { # run <标签> <目录> <命令...>
-  local label=$1 dir=$2
-  shift 2
+run() { # run <标签> <命令...>
+  local label=$1
+  shift
   step "$label"
-  if ! (cd "$dir" && "$@"); then
+  if ! "$@"; then
     printf '\033[31m✗ %s\033[0m\n' "$label"
     failed=1
   fi
 }
 
-run "gitcraft-core" gitcraft-core cargo test
-run "gitcraft-app（egui 无头门禁）" gitcraft-app cargo test
+run "核心层（lib 单测）" cargo test --lib
+run "egui 无头门禁" cargo test --bin gitx
 
-# egui 那一步单独再查一次警告：`cargo test` 的输出里混着测试代码的诊断，
+# 界面层单独再查一次警告：`cargo test` 的输出里混着测试代码的诊断，
 # 「产品代码零警告」要按 `cargo build` 的输出来判。（`cargo build` 无事可做时也会打一行
 # "Finished"，所以只认以 warning/error 开头的那些行。）
-step "gitcraft-app 零警告构建"
-diagnostics=$(cd gitcraft-app && cargo build 2>&1 | grep -E "^(warning|error)" || true)
+step "零警告构建"
+diagnostics=$(cargo build 2>&1 | grep -E "^(warning|error)" || true)
 if [ -n "$diagnostics" ]; then
   printf '%s\n' "$diagnostics"
-  printf '\033[31m✗ gitcraft-app 构建有警告\033[0m\n'
+  printf '\033[31m✗ 构建有警告\033[0m\n'
   failed=1
 fi
 

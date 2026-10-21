@@ -51,7 +51,7 @@ impl Host for GitHub {
         Ok(ApiRequest::get(url)
             .with_header("authorization", format!("Bearer {}", token.trim()))
             .with_header("accept", "application/vnd.github+json")
-            .with_header("user-agent", "gitcraft"))
+            .with_header("user-agent", "gitx"))
     }
 
     fn parse_pull_requests(&self, body: &str) -> Result<Vec<PullRequest>> {

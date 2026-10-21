@@ -12,17 +12,17 @@
 | SourceTree 4.2.19 的界面截图 | Atlassian | **专有**，不受本仓库许可证约束 | `docs/reference/*.png` |
 | 微软雅黑（`msyh.ttf`）——只在运行时作为退路去读 | Microsoft | **专有**，从不打包、从不入库 | 本机 `~/Library/Fonts/`，不在仓库里 |
 
-那四张截图留着的唯一理由是：它们是本层几何常量的**测量来源**（`uiprobe/pngprobe.py`
-在图上量出的八个数字写进了 `gitcraft-app/src/main.rs` 的常量）。本项目不含任何 Atlassian
+那四张截图留着的唯一理由是：它们是本层几何常量的**测量来源**（一次性工具 `pngprobe.py`——
+跑完即删，见 git 历史——在图上量出的八个数字写进了 `src/ui/theme.rs` 的常量）。本项目不含任何 Atlassian
 的代码、素材或商标；再分发这个仓库时，**要么把 `docs/reference/` 去掉，要么换成你自己拍的对照图**。
-「GitCraft」这个名字和 `gen-icon.mjs` 生成的那个图标是我们的，但它们是**商标**，同样不在
+「GitX」这个名字和 `gen-icon.mjs` 生成的那个图标是我们的，但它们是**商标**，同样不在
 MIT/Apache 授权范围内（条款在 `NOTICE` 里）：分叉出去请改名、改图标。
 
 ## 是开源的、但保留自己条款的
 
 | 素材 | 作者 | 许可证 | 说明 |
 | --- | --- | --- | --- |
-| `NotoSansSC-Regular.otf`（8.3 MB 全量 CJK） | Google / Adobe（Noto 项目） | SIL Open Font License 1.1 | **故意不入库**（根 `.gitignore` 挡住），授权声明在 [`gitcraft-app/assets/fonts/OFL.txt`](gitcraft-app/assets/fonts/OFL.txt)。新克隆按 README 取一份，或用 `GITCRAFT_FONT_DIR` 指过去 |
+| `NotoSansSC-Regular.otf`（8.3 MB 全量 CJK） | Google / Adobe（Noto 项目） | SIL Open Font License 1.1 | **故意不入库**（根 `.gitignore` 挡住），授权声明在 [`assets/fonts/OFL.txt`](assets/fonts/OFL.txt)。新克隆按 README 取一份，或用 `GITX_FONT_DIR` 指过去 |
 | `eframe` / `egui` / `epaint` 0.37 | Emil Ernerfeldh 与贡献者 | MIT OR Apache-2.0 | 界面层本体，彩色 emoji 走 `color_fonts` feature |
 | `serde` / `serde_json` / `thiserror` / `chrono` / `tempfile` | 各自作者 | MIT OR Apache-2.0 | 序列化、错误类型、时间戳、测试临时目录 |
 | `rusqlite` 0.31 | Ryan Olson | MIT | 本地状态存储 |
@@ -35,9 +35,9 @@ MIT/Apache 授权范围内（条款在 `NOTICE` 里）：分叉出去请改名�
 
 ## 我们自己的东西
 
-- `gitcraft-core/`、`gitcraft-app/`、`uiprobe/`、`scripts/`、`.github/`：全部为本仓库贡献者原创，
+- `src/`、`scripts/`、`.github/`：全部为本仓库贡献者原创，
   按 MIT OR Apache-2.0 授权。
 - `gen-icon.mjs` **这个程序**是代码（同许可）；它**画出来的那个图标**是商标，见上面。
   图标里没有第三方素材：不加载任何渲染依赖，图形是 SDF 自己算的。
-- GitCraft 与 Atlassian 无关，不含任何 SourceTree 的代码或素材。界面布局的对照来源是
+- GitX 与 Atlassian 无关，不含任何 SourceTree 的代码或素材。界面布局的对照来源是
   公开可得的软件外观，所有实现均为原创。

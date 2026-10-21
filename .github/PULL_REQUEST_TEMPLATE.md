@@ -28,9 +28,9 @@ cp /tmp/green_x.rs 那个文件 && cmp /tmp/green_x.rs 那个文件
 
 `./scripts/gates.sh` 的结果（四条，全绿）：
 
-- [ ] `gitcraft-core` `cargo test`
-- [ ] `gitcraft-app` `cargo test`（egui 无头判据）
-- [ ] `gitcraft-app` 构建零警告
+- [ ] 核心层 `cargo test --lib`
+- [ ] 壳 `cargo test --bin gitx`（egui 无头判据）
+- [ ] 构建零警告（`cargo build`）
 - [ ] `./scripts/license-audit.sh`（动了素材 / 依赖 / 许可证文件时必须过）
 
 ## 仍然没看到过的

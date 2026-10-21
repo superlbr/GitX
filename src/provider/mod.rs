@@ -11,7 +11,7 @@ mod github;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::GitcraftError;
+use crate::error::GitxError;
 pub use crate::error::Result;
 use crate::models::PullRequest;
 
@@ -139,8 +139,8 @@ pub fn repo_ref_for(host: &dyn Host, remote_urls: &[String]) -> Option<RepoRef> 
         .and_then(|u| parse_remote(u))
 }
 
-pub(crate) fn err(msg: impl Into<String>) -> GitcraftError {
-    GitcraftError::Other(msg.into())
+pub(crate) fn err(msg: impl Into<String>) -> GitxError {
+    GitxError::Other(msg.into())
 }
 
 /// Most provider list endpoints wrap arrays; accept both shapes so a slightly

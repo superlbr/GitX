@@ -38,7 +38,7 @@ impl Host for Gitee {
             repo.path,
             urlencode(token.trim())
         );
-        Ok(ApiRequest::get(url).with_header("user-agent", "gitcraft"))
+        Ok(ApiRequest::get(url).with_header("user-agent", "gitx"))
     }
 
     fn parse_pull_requests(&self, body: &str) -> Result<Vec<PullRequest>> {
