@@ -895,9 +895,11 @@ M2 顺带抓到一条**探针口径**：`visible_texts` 里 hunk 那一行的两
   continue/abort 语义（尤其 rebase 的 `--continue` 与 `--abort`）没有真仓库判据。
 - **手动编辑冲突文件**没有内置编辑器：用户得在外部改完再点「标记为已解决」。
   `conflict_content` / `resolve_manual` 仍是零调用（那需要文本编辑器，不在这一批）。
-- **继续合并不会帮用户填提交信息**：`git merge --continue` 会开编辑器，无头/无 TTY 下
-  行为依赖 `GIT_EDITOR`；核心层测试能过是仓库里已有默认信息。真窗口若卡住，要先设
-  `GIT_EDITOR=true`——这一条没有判据。
+- ~~**继续合并不会帮用户填提交信息**~~ **已在 CI 报错后修掉（2026-10-22）**：`--continue`
+  三兄弟默认开 $EDITOR，CI 的 dumb 终端和从 Finder 启动的 GUI（连 TERM 都没有）都会吃到
+  "Terminal is dumb, but EDITOR unset"。`continue_op` 改为 `-c core.editor=true` 跑三条
+  `--continue`，直接采纳 git 备在 MERGE_MSG 里的默认信息；`resolving_with_theirs_stages_…`
+  那条判据就是回归闸（它在本机过是碰巧有 EDITOR，CI 挂了才暴露）。
 
 ---
 ## 重命名分支（任务 #42，2026-10-22 上午）

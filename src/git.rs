@@ -806,15 +806,18 @@ pub fn resolve_manual(repo: &str, path: &str, content: &str) -> Result<()> {
 }
 
 pub fn continue_op(repo: &str) -> Result<()> {
+    // `--continue` 的三兄弟默认都要开 $EDITOR。GUI 里没有终端（从 Finder 启动的 app 连
+    // TERM 都没有），只会得到 "Terminal is dumb, but EDITOR unset" —— CI 上同一报错。
+    // git 早已把默认信息备在 MERGE_MSG 里，`core.editor=true` 让它直接采纳、不问编辑器。
     match repo_state(repo)?.as_str() {
         "merge" => {
-            run_git(repo, &["merge", "--continue"])?;
+            run_git(repo, &["-c", "core.editor=true", "merge", "--continue"])?;
         }
         "cherry-pick" => {
-            run_git(repo, &["cherry-pick", "--continue"])?;
+            run_git(repo, &["-c", "core.editor=true", "cherry-pick", "--continue"])?;
         }
         "rebase" => {
-            run_git(repo, &["rebase", "--continue"])?;
+            run_git(repo, &["-c", "core.editor=true", "rebase", "--continue"])?;
         }
         _ => {}
     }
