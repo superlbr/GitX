@@ -273,6 +273,8 @@ pub(crate) fn primary_action(m: &mut Modal) -> Option<Action> {
         }),
         Form::NewTag { oid } => (!raw.is_empty())
             .then(|| Action::CreateTag { name: raw.clone(), target: oid.clone() }),
+        Form::RenameBranch { from } => (!raw.is_empty())
+            .then(|| Action::RenameBranch { from: from.clone(), to: raw.clone() }),
         Form::StashSave { include_untracked } => Some(Action::StashSave {
             message: if raw.is_empty() { "没有说明的贮藏".to_owned() } else { raw.clone() },
             include_untracked: *include_untracked,

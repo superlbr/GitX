@@ -30,6 +30,7 @@ use crate::viewport;
             seq: 0,
             busy: false,
             note: None,
+            note_at: None,
             log_filter: String::new(),
             side_filter: String::new(),
             topo: false,
@@ -335,7 +336,7 @@ use crate::viewport;
     fn scroll_log(dy: f32) -> (Vec<(String, f32)>, Vec<(String, f32)>) {
         let ctx = egui::Context::default();
         style(&ctx);
-        let over_log = pos2((SIDEBAR_W + WIN_W) / 2.0, (TOP_H + (WIN_H - STAGING_H)) / 2.0);
+        let over_log = pos2((SIDEBAR_W + WIN_W) / 2.0, (TOP_H + (WIN_H - STATUS_H - STAGING_H)) / 2.0);
         let hover = vec![egui::Event::PointerMoved(over_log)];
         let raw = |time: f64, events: Vec<egui::Event>| egui::RawInput {
             screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(WIN_W, WIN_H))),
@@ -378,20 +379,35 @@ use crate::viewport;
         (before, after)
     }
 
+    /// 把嵌在 `Shape::Vec` 组里的矩形**拆出来**（带上整组的 clip）。egui 有时把几笔折成
+    /// 一组发出——toast 卡片（底色+阴影一笔一笔算）就是这么画的，不拆组的话整张卡
+    /// 对 `rects()`/`rounded()` 隐形（toast 两判据全红就是它）。
+    fn collect_rects<'a>(shape: &'a egui::Shape, clip: Rect, into: &mut Vec<(&'a egui::epaint::RectShape, Rect)>) {
+        match shape {
+            egui::Shape::Rect(r) => into.push((r, clip)),
+            egui::Shape::Vec(v) => {
+                for s in v {
+                    collect_rects(s, clip, into);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// 这一帧画出的**所有有底色的矩形**：四块带的底色、增删行的底色都是纯色矩形。
     fn rects(out: &egui::FullOutput) -> Vec<(Color32, Rect)> {
-        out.shapes
-            .iter()
-            .filter_map(|c| match &c.shape {
-                egui::Shape::Rect(r) if r.fill != Color32::TRANSPARENT => {
-                    // 和 clip_rect 求交后再比：Frame 底色按「内容+边距」画，内容比面板高一丝时
-                    // （换字体行高会变），多出来的那条**被面板裁掉、屏幕上根本不出现**——
-                    // 判据只对看得见的部分负责。
-                    let visible = c.clip_rect.intersect(r.rect);
-                    visible.is_positive().then_some((r.fill, visible))
-                }
-                _ => None,
-            })
+        let mut found = Vec::new();
+        for c in &out.shapes {
+            collect_rects(&c.shape, c.clip_rect, &mut found);
+        }
+        found
+            .into_iter()
+            .filter(|(r, _)| r.fill != Color32::TRANSPARENT)
+            // 和 clip_rect 求交后再比：Frame 底色按「内容+边距」画，内容比面板高一丝时
+            // （换字体行高会变），多出来的那条**被面板裁掉、屏幕上根本不出现**——
+            // 判据只对看得见的部分负责。
+            .map(|(r, clip)| (r.fill, clip.intersect(r.rect)))
+            .filter(|(_, v)| v.is_positive())
             .collect()
     }
 
@@ -399,17 +415,14 @@ use crate::viewport;
     /// 带圆角的矩形在 egui 里仍是 `Shape::Rect`，只是 `corner_radius` 非 0——
     /// 分成两份问是因为 `rects()` 那份要把四块带的**方角**底色认出来，混进药丸就没法数了。
     fn rounded(out: &egui::FullOutput) -> Vec<(Color32, Rect, egui::CornerRadius)> {
-        out.shapes
-            .iter()
-            .filter_map(|c| match &c.shape {
-                egui::Shape::Rect(r)
-                    if r.fill != Color32::TRANSPARENT
-                        && r.corner_radius != egui::CornerRadius::ZERO =>
-                {
-                    Some((r.fill, r.rect, r.corner_radius))
-                }
-                _ => None,
-            })
+        let mut found = Vec::new();
+        for c in &out.shapes {
+            collect_rects(&c.shape, c.clip_rect, &mut found);
+        }
+        found
+            .into_iter()
+            .filter(|(r, _)| r.fill != Color32::TRANSPARENT && r.corner_radius != egui::CornerRadius::ZERO)
+            .map(|(r, _)| (r.fill, r.rect, r.corner_radius))
             .collect()
     }
 
@@ -476,13 +489,13 @@ use crate::viewport;
     /// 表头那一行的 y 带。按「图表」定位——它是表头独有的词，行高一改它自己跟着走。
     /// 判据里别再抄 78/95/96 这种数字：这一批把行距从 21 改成 26，抄过数字的三条全红了。
     fn head_band(out: &egui::FullOutput) -> std::ops::RangeInclusive<f32> {
-        let r = text_rect(out, "图表", 55.0..=(WIN_H - STAGING_H));
+        let r = text_rect(out, "图表", 55.0..=(WIN_H - STATUS_H - STAGING_H));
         (r.center().y - HEADER_H / 2.0)..=(r.center().y + HEADER_H / 2.0)
     }
 
     /// 日志数据区的 y 带：表头下沿一直到暂存带上沿。
     fn rows_band(out: &egui::FullOutput) -> std::ops::RangeInclusive<f32> {
-        *head_band(out).end()..=(WIN_H - STAGING_H)
+        *head_band(out).end()..=(WIN_H - STATUS_H - STAGING_H)
     }
 
     /// 日志数据区四列的**左缘**。`COL_INSET` 只有一个来源，判据不再各抄一份 `+8.0`——
@@ -504,6 +517,16 @@ use crate::viewport;
             .next()
             .map(|(_, r)| r)
             .unwrap_or_else(|| panic!("y {y:?} 这条带子里没有以「{label}」开头的文字"))
+    }
+
+    /// 同 [`text_rect`]，但找不到返回 `None` 而不是 panic——「不许出现」类的判据
+    /// 要的正是不存在的证据。
+    fn text_rect_or_none(
+        out: &egui::FullOutput,
+        label: &str,
+        y: std::ops::RangeInclusive<f32>,
+    ) -> Option<Rect> {
+        all_text_rects(out, y, &[label]).into_iter().next().map(|(_, r)| r)
     }
 
     /// 某条 y 带子里所有以 `prefixes` 之一开头的文字，按绘制顺序返回（文字, 绝对矩形）。
@@ -564,12 +587,11 @@ use crate::viewport;
             .count()
     }
 
-    /// 找一块四边都落在 `want` ±2pt 内的矩形，返回它的底色。
+    /// 找一块四边都落在 `want` ±1.5pt 内的矩形，返回它的底色。
     /// 容差 1.5 是给 egui 那条 1px 分隔线的：带与带之间画线，底色矩形让出这一像素。
-    /// 另外 0.5 是给字体的：Inter 的 12pt 行盒比旧的 Ubuntu-Light 高，提交框那一格
-    /// 比 96 的预算多 1.6pt，父面板的 clip 会把它切掉——带的**位置**仍然只认 1.5。
+    /// 失败时把整帧的矩形打出来——第一次跑挂的时候这就是现场。
     fn band(rects: &[(Color32, Rect)], want: Rect) -> Color32 {
-        let near = |a: f32, b: f32| (a - b).abs() < 2.0;
+        let near = |a: f32, b: f32| (a - b).abs() < 1.5;
         match rects.iter().find(|(_, r)| {
             near(r.min.x, want.min.x) && near(r.min.y, want.min.y) && near(r.max.x, want.max.x) && near(r.max.y, want.max.y)
         }) {
@@ -581,26 +603,29 @@ use crate::viewport;
     #[test]
     fn bands_match_the_measured_reference() {
         let r = rects(&frame(&mut blank()));
-        let staging_top = WIN_H - STAGING_H;
+        let bottom = WIN_H - STATUS_H;
+        let staging_top = bottom - STAGING_H;
         // 工具栏：横贯顶部的一条 55pt。
         assert_eq!(band(&r, Rect::from_min_max(pos2(0.0, 0.0), pos2(WIN_W, TOOLBAR_H))), TOOLBAR_BG, "工具栏带");
         // tab 条：紧贴工具栏下面那条 24pt，把书签摊成一排。
         assert_eq!(band(&r, Rect::from_min_max(pos2(0.0, TOOLBAR_H), pos2(WIN_W, TOP_H))), TOOLBAR_BG, "tab 条带");
-        // 侧栏：从两条顶带下沿一直贯穿到窗口底。SourceTree 的左栏是全高的，
+        // 侧栏：从两条顶带下沿一直贯穿到状态栏顶。SourceTree 的左栏是全高的，
         // 这一条也正是 2026-10-15「双左栏合一」被推翻的落点。
-        assert_eq!(band(&r, Rect::from_min_max(pos2(0.0, TOP_H), pos2(SIDEBAR_W, WIN_H))), SIDEBAR_BG, "侧栏带");
-        // 暂存带：侧栏右边、贴着底的一条 245pt；带内再切 435pt 文件表 + 差异区。
-        assert_eq!(band(&r, Rect::from_min_max(pos2(SIDEBAR_W, staging_top), pos2(WIN_W, WIN_H))), Color32::WHITE, "暂存带");
+        assert_eq!(band(&r, Rect::from_min_max(pos2(0.0, TOP_H), pos2(SIDEBAR_W, bottom))), SIDEBAR_BG, "侧栏带");
+        // 暂存带：侧栏右边、贴着状态栏上沿的一条 245pt；带内再切 435pt 文件表 + 差异区。
+        assert_eq!(band(&r, Rect::from_min_max(pos2(SIDEBAR_W, staging_top), pos2(WIN_W, bottom))), Color32::WHITE, "暂存带");
         assert_eq!(
-            band(&r, Rect::from_min_max(pos2(SIDEBAR_W, staging_top), pos2(SIDEBAR_W + FILES_W, WIN_H))),
+            band(&r, Rect::from_min_max(pos2(SIDEBAR_W, staging_top), pos2(SIDEBAR_W + FILES_W, bottom))),
             Color32::WHITE,
             "文件表"
         );
         assert_eq!(
-            band(&r, Rect::from_min_max(pos2(SIDEBAR_W + FILES_W, staging_top), pos2(WIN_W, WIN_H))),
+            band(&r, Rect::from_min_max(pos2(SIDEBAR_W + FILES_W, staging_top), pos2(WIN_W, bottom))),
             Color32::WHITE,
             "差异区"
         );
+        // 状态栏：贴着窗底的 26pt 灰条，暂存带和侧栏都为它让了位。
+        assert_eq!(band(&r, Rect::from_min_max(pos2(0.0, bottom), pos2(WIN_W, WIN_H))), TOOLBAR_BG, "状态栏带");
         // 日志带 = 谁都没要走的那块。
         assert_eq!(
             band(&r, Rect::from_min_max(pos2(SIDEBAR_W, TOP_H), pos2(WIN_W, staging_top))),
@@ -619,7 +644,9 @@ use crate::viewport;
     /// 侧栏里的一块文字。`text_rect` 只按 y 带筛，而「工作区」「搜索」「main」这些词
     /// 在工具栏和暂存带里也有，所以这里两维都筛：工具栏下面、左缘落在侧栏里的才算。
     fn side_text(out: &egui::FullOutput, label: &str) -> Rect {
-        all_text_rects(out, TOP_H..=WIN_H, &[label])
+        // 上界让到状态栏顶：状态栏左边也写着「main ↑2」，按绘制顺序排在侧栏**之前**，
+        // 不卡 y 就会先撞上它（那行贴着窗底，不属于侧栏）。
+        all_text_rects(out, TOP_H..=(WIN_H - STATUS_H), &[label])
             .into_iter()
             .filter(|(_, r)| r.min.x < SIDEBAR_W)
             .map(|(_, r)| r)
@@ -754,27 +781,111 @@ use crate::viewport;
         );
     }
 
-    /// 提示条只能占自己那一格，而且**靠右摆**。给它固定宽度之前 `truncate()` 把整行吃掉，
-    /// 后面的控件被画在它上面（2026-10-20 目视核对撞见的）。
-    /// 现在它住在 tab 条右端：判据是「右缘贴着窗口」+「宽度不超预算」+「不压住左边的 tab」。
+    /// 提示（`note`）现在是底部 toast：悬在状态栏上方、水平居中、8 秒自己消失。
+    /// 以前它挤在 tab 条右端的 240pt 定格里，长提示被截断（判据随之改写）。
     #[test]
-    fn the_note_keeps_its_own_cell_at_the_right_of_the_tab_bar() {
+    fn the_note_shows_as_a_toast_above_the_status_bar() {
         let mut app = loaded();
-        // tab 只在 `repos` 非空时才画，测试夹具里那份是空的。
-        app.repos.push(Repo {
-            id: None,
-            path: "/fixture".to_owned(),
-            name: "fixture".to_owned(),
-            added_at: None,
-            last_fetched_at: None,
-        });
         app.note = Some("egui 版还没接：搜索面板（SourceTree 是带作用域条的独立面板）".to_owned());
-        let out = frame(&mut app);
-        let n = text_rect(&out, "egui 版还没接", TOOLBAR_H..=TOP_H);
-        assert!(n.width() <= NOTE_W + 0.01, "提示条吃了整行：宽 {}，上限 {NOTE_W}", n.width());
-        assert!(n.max.x >= WIN_W - 12.0, "提示条没靠右：右缘 {}", n.max.x);
-        let tab = text_rect(&out, "fixture", TOOLBAR_H..=TOP_H);
-        assert!(tab.max.x <= n.min.x + 0.01, "提示条压住了 tab：{} > {}", n.min.x, tab.max.x);
+        // toast 挂在 `Order::Foreground`，而全新 Context 的第一遍不画那一层（见 `warm`）；
+        // 另外 Area 要几帧才把尺寸/位置收敛（第一遍只量尺寸，落位在下一帧），无头里时间
+        // 不走，收敛只能靠多跑几遍。
+        let ctx = warm(&mut app);
+        for _ in 0..3 {
+            let _ = ctx.run_ui(raw_input(Vec::new()), |ui| app.shell(ui));
+        }
+        let mut out = ctx.run_ui(raw_input(Vec::new()), |ui| app.shell(ui));
+        out.textures_delta.clear();
+        // 卡片底缘贴着「状态栏顶 - 8pt」那条线，水平居中。找圆角矩形：内容区那些白带
+        // 底缘都不到这里，只有 toast 悬在这个高度。（底色带 Area 的淡入透明度，
+        // 无头时间停在 0 永远到不了纯白，所以只认位置和宽度。）
+        let want_bottom = WIN_H - STATUS_H - 8.0;
+        let all = rounded(&out);
+        let card = all
+            .iter()
+            .find(|(_, r, _)| {
+                (r.max.y - want_bottom).abs() < 1.5
+                    && (r.center().x - WIN_W / 2.0).abs() < 2.0
+                    && r.width() > 100.0
+            })
+            .unwrap_or_else(|| panic!("状态栏上方没有 toast 卡片：{all:#?}"));
+        assert!(card.1.width() <= 544.0, "toast 卡片超宽：{}", card.1.width());
+        // 文字真的在卡片里。
+        let t = text_rect(&out, "egui 版还没接", (want_bottom - 40.0)..=want_bottom);
+        assert!(card.1.contains(t.center()), "toast 文字跑出了卡片 {t:?}");
+    }
+
+    /// toast 的三段生命周期：出现 → 点 × 立刻关 → 不点也活不过 8 秒。
+    #[test]
+    fn the_toast_closes_on_click_and_fades_after_eight_seconds() {
+        let mut app = loaded();
+        app.note = Some("egui 版还没接：搜索面板".to_owned());
+        // 点击 × 的位置：卡片右端那枚 20×20。先量出来再按下抬起。
+        // 量卡片和点卡片必须共用同一个 Context：toast 在 Foreground 层，换 Context 就等于
+        // 那一层从没画过（见 `warm`），点击会落到空气里。Area 还要几帧才落位。
+        let ctx = warm(&mut app);
+        for _ in 0..3 {
+            let _ = ctx.run_ui(raw_input(Vec::new()), |ui| app.shell(ui));
+        }
+        let mut out = ctx.run_ui(raw_input(Vec::new()), |ui| app.shell(ui));
+        out.textures_delta.clear();
+        let want_bottom = WIN_H - STATUS_H - 8.0;
+        let card = rounded(&out)
+            .iter()
+            .find(|(_, r, _)| {
+                (r.max.y - want_bottom).abs() < 1.5
+                    && r.center().x > WIN_W / 2.0 - 200.0
+                    && r.width() > 100.0
+            })
+            .expect("toast 没出现")
+            .1;
+        let close_at = pos2(card.max.x - 16.0, card.center().y);
+        click_at(&ctx, &mut app, close_at);
+        assert!(app.note.is_none(), "点了 × 提示还在");
+        // 再来一条，不点它：8 秒后必须自己消失。
+        app.note = Some("第二条提示".to_owned());
+        app.note_at = None;
+        let _ = frame_at_time(&mut app, 0.0);
+        assert!(app.note.is_some(), "toast 没出现");
+        let _ = frame_at_time(&mut app, 8.5);
+        assert!(app.note.is_none(), "8 秒了 toast 还赖着");
+    }
+
+    /// 状态栏贴着窗底横贯整窗；暂存带、文件表、日志带的整体底边都因为让出这 26pt
+    /// 而上移。这条把「谁在窗底」钉死。
+    #[test]
+    fn the_status_bar_bands_the_bottom_edge() {
+        // 常量自己先钉住：26 是行节奏（= ROW_H）挑的、不是量出来的，哪天有了带状态栏的
+        // 参考图，改这里 + theme 注释，别让「量不到」滑成「随手改」。
+        assert_eq!(STATUS_H, 26.0, "状态栏高度：参考图裁掉了，按行节奏定的 26");
+        let out = frame(&mut blank());
+        let bottom = WIN_H - STATUS_H;
+        assert_eq!(
+            band(&rects(&out), Rect::from_min_max(pos2(0.0, bottom), pos2(WIN_W, WIN_H))),
+            TOOLBAR_BG,
+            "状态栏带"
+        );
+        let staging_top = bottom - STAGING_H;
+        assert_eq!(
+            band(&rects(&out), Rect::from_min_max(pos2(SIDEBAR_W, staging_top), pos2(WIN_W, bottom))),
+            Color32::WHITE,
+            "暂存带底边让出了状态栏"
+        );
+    }
+
+    /// 状态栏的内容：分支名 + 有上游才有的 ↑↓ + 仓库路径。
+    /// 契约第②条变体：**没有上游时绝不出现 ↑0 ↓0**——比「不显示全零」更严，
+    /// 连个位数都不许冒出来骗人。
+    #[test]
+    fn the_status_bar_names_the_branch_and_counts() {
+        let out = frame(&mut loaded());
+        let band = (WIN_H - STATUS_H)..=WIN_H;
+        let branch = text_rect(&out, "main", band.clone());
+        assert!(branch.min.x < SIDEBAR_W + 20.0, "分支名没贴左：{}", branch.min.x);
+        let up = text_rect(&out, "↑2", band.clone());
+        assert!(up.min.x > branch.max.x, "↑2 没跟在分支名后面");
+        assert!(text_rect_or_none(&out, "↓0", band.clone()).is_none(), "落后 0 不许显示 ↓0");
+        assert!(text_rect_or_none(&out, "↑0", band).is_none(), "超前 0 不许显示 ↑0");
     }
 
     /// 差异区顶上那格：参考图是一条 `(236,236,236)` 的灰带，里面「状态色块 + 加粗、靠左的文件名」。
@@ -787,7 +898,7 @@ use crate::viewport;
         app.patch_label = "未暂存 · src/loose.rs".to_owned();
         let out = frame(&mut app);
         let near = |a: f32, b: f32| (a - b).abs() < 1.5;
-        let (left, top) = (SIDEBAR_W + FILES_W, WIN_H - STAGING_H);
+        let (left, top) = (SIDEBAR_W + FILES_W, WIN_H - STATUS_H - STAGING_H);
         let head = rects(&out)
             .into_iter()
             .filter(|(c, _)| *c == DIFF_HEAD_BG)
@@ -849,7 +960,7 @@ use crate::viewport;
     #[test]
     fn the_diff_pane_starts_at_the_first_hunk() {
         let out = frame(&mut loaded());
-        let top = WIN_H - STAGING_H + DIFF_HEAD_H;
+        let top = WIN_H - STATUS_H - STAGING_H + DIFF_HEAD_H;
         let mut rows: Vec<(String, Rect)> = visible_texts(&out)
             .into_iter()
             // 空串是**行号那两格**为 hunk 行画的（那一行没有旧/新行号，画的是空文本），
@@ -996,7 +1107,7 @@ use crate::viewport;
         let band = bands[0];
         assert_eq!(band.height(), ROW_H, "灰带不是整整一行高");
         assert!(band.min.x >= SIDEBAR_W && band.max.x <= SIDEBAR_W + FILES_W, "灰带不在文件表那一栏里：{band:?}");
-        let label = text_rect(&out, "src/loose.rs", (WIN_H - STAGING_H)..=WIN_H);
+        let label = text_rect(&out, "src/loose.rs", (WIN_H - STATUS_H - STAGING_H)..=(WIN_H - STATUS_H));
         assert!((label.center().y - band.center().y).abs() < 1.0, "灰带没套在文件名那一行上：带 {:.1}、字 {:.1}", band.center().y, label.center().y);
         assert!(label.min.x >= band.min.x, "文件名跑到灰带左边去了");
     }
@@ -1025,7 +1136,7 @@ use crate::viewport;
             .collect();
         let mut blanks = 0usize;
         for path in ["src/staged.rs", "src/loose.rs", "notes.md"] {
-            let name = text_rect(&out, path, (WIN_H - STAGING_H)..=WIN_H);
+            let name = text_rect(&out, path, (WIN_H - STATUS_H - STAGING_H)..=(WIN_H - STATUS_H));
             let row: Vec<&(Color32, Rect)> = squares
                 .iter()
                 .filter(|(_, r)| (r.center().y - name.center().y).abs() < 1.0)
@@ -1066,7 +1177,7 @@ use crate::viewport;
             .filter(|r| near(r.width(), 13.5) && near(r.height(), 13.5) && r.min.x > SIDEBAR_W && r.min.x < SIDEBAR_W + FILES_W)
             .collect();
         for title in ["已暂存文件", "未暂存文件"] {
-            let t = text_rect(&out, title, (WIN_H - STAGING_H)..=WIN_H);
+            let t = text_rect(&out, title, (WIN_H - STATUS_H - STAGING_H)..=(WIN_H - STATUS_H));
             let row: Vec<&Rect> = squares.iter().filter(|r| (r.center().y - t.center().y).abs() < 1.0).collect();
             assert_eq!(row.len(), 1, "「{title}」这一行找到 {} 枚方框，分类标题只该有一枚全选框", row.len());
             assert!(near(row[0].min.x - SIDEBAR_W, 8.0), "「{title}」的方框离面板左缘 {}，要的是 8（和文件行齐平）", row[0].min.x - SIDEBAR_W);
@@ -1136,7 +1247,7 @@ use crate::viewport;
         let mut app = commit_list();
         let out = frame(&mut app);
         let near = |a: f32, b: f32| (a - b).abs() < 1.5;
-        let band = (WIN_H - STAGING_H)..=WIN_H;
+        let band = (WIN_H - STATUS_H - STAGING_H)..=(WIN_H - STATUS_H);
         for path in ["src/changed.rs", "docs/added.md"] {
             let name = text_rect(&out, path, band.clone());
             assert!(
@@ -1307,7 +1418,7 @@ use crate::viewport;
     fn diff_rows_are_painted_row_by_row() {
         let out = frame(&mut loaded());
         let r = rects(&out);
-        let top = WIN_H - STAGING_H;
+        let top = WIN_H - STATUS_H - STAGING_H;
         let rows = |bg: Color32| {
             let mut ys: Vec<(f32, f32)> = r
                 .iter()
@@ -1361,7 +1472,7 @@ use crate::viewport;
     #[test]
     fn file_list_shows_every_working_change_once() {
         let t = texts(&frame(&mut loaded()));
-        let top = WIN_H - STAGING_H;
+        let top = WIN_H - STATUS_H - STAGING_H;
         // 只看文件表那一格：差异区的补丁头「+++ b/src/loose.rs」也以同样的路径结尾。
         let listed = |path: &str| {
             t.iter()
@@ -1717,7 +1828,8 @@ use crate::viewport;
     /// 整列都得待在那 49pt 里。圆点、竖线、弯线的端点一个都不许越界——越出去就是压到提交号那一列。
     #[test]
     fn the_graph_never_escapes_its_column() {
-        let out = frame(&mut branched());
+        // 窗口临时加高一格状态栏的高度：这条判的是图元越不越出列，不是一屏塞得下几条。
+        let out = frame_at(&mut branched(), WIN_W, WIN_H + STATUS_H);
         let (dots, lines, arms) = graph_marks(&out);
         assert_eq!(dots.len(), 7, "七条提交该有七个点");
         assert_eq!(arms.len(), 2, "两次合并该有两条弯线");
@@ -1791,6 +1903,18 @@ use crate::viewport;
         let ctx = egui::Context::default();
         style(&ctx);
         let mut out = ctx.run_ui(raw_input(events), |ui| app.shell(ui));
+        out.textures_delta.clear();
+        out
+    }
+
+    /// 同 `frame`，但把 egui 时钟拨到 `secs`——toast 的 8 秒超时判据靠它造「时间已经过去」。
+    /// 每帧都是新 `Context`，时钟只来自 `RawInput::time`，state 里的 `note_at` 跨帧留存。
+    fn frame_at_time(app: &mut Gitx, secs: f64) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        style(&ctx);
+        let mut input = raw_input(Vec::new());
+        input.time = Some(secs);
+        let mut out = ctx.run_ui(input, |ui| app.shell(ui));
         out.textures_delta.clear();
         out
     }
@@ -2677,7 +2801,12 @@ use crate::viewport;
                 let (a, b) = (points[0], points[1]);
                 if (a.x - b.x).abs() < 0.01 && a.y >= top && b.y <= bottom {
                     vertical.push((a.x, b.y - a.y));
-                } else if (a.y - b.y).abs() < 0.01 && a.x <= SIDEBAR_W + 1.5 && b.x >= WIN_W - 1.5 {
+                } else if (a.y - b.y).abs() < 0.01
+                    && a.y >= top
+                    && a.y <= bottom
+                    && a.x <= SIDEBAR_W + 1.5
+                    && b.x >= WIN_W - 1.5
+                {
                     horizontal.push(a.y);
                 }
             }
@@ -2938,7 +3067,7 @@ use crate::viewport;
     fn diff_lines_share_one_left_edge() {
         let mut app = loaded();
         let out = frame(&mut app);
-        let band = (WIN_H - STAGING_H)..=WIN_H;
+        let band = (WIN_H - STATUS_H - STAGING_H)..=(WIN_H - STATUS_H);
         let found = all_text_rects(&out, band, &["块", " 上下文", "-删掉", "+加上", "+又加"]);
         assert_eq!(found.len(), 6, "差异区该有六行文字（一条 hunk 头、两条上下文、一删两加）：{found:?}");
         let first = found[0].1.min.x;
@@ -3277,6 +3406,32 @@ use crate::viewport;
             !git_in(&dir, &["branch", "--format=%(refname:short)"]).contains("可以删的那条"),
             "点了确定，仓库里那条分支还在"
         );
+    }
+
+    /// 重命名分支：右键 → 卡 → 输入新名字 → 「重命名」，ref 真的换了名字，
+    /// 旧名字从 `git branch` 里消失。
+    #[test]
+    fn renaming_a_branch_lands_a_real_rename() {
+        let dir = scratch_repo("menu-rename");
+        git_in(&dir, &["branch", "旧名字"]);
+        let mut app = blank();
+        app.open(dir.to_str().unwrap());
+        pump(&mut app, |a| {
+            a.snap.as_ref().map(|s| s.branches.len()).unwrap_or(0) >= 2
+        });
+        menu_pick(&mut app, "旧名字", "重命名分支…");
+        assert!(app.modal.is_some(), "点了重命名，卡没摊开");
+        assert!(type_into(&mut app, "新分支名", "新名字"), "卡里没有「新分支名」那一格");
+        // 主按钮文案「重命名」和卡标题「重命名分支」同前缀，按字定位会先撞上标题，
+        // 所以这里走 Enter —— 它和点主按钮是同一条 `primary_action` 出口。
+        press(&mut app, egui::Key::Enter);
+        pump(&mut app, |a| {
+            a.snap.as_ref().unwrap().branches.iter().any(|b| b.name == "新名字")
+        });
+        let names = git_in(&dir, &["branch", "--format=%(refname:short)"]);
+        assert!(names.contains("新名字"), "仓库里没有新名字：{names:?}");
+        assert!(!names.contains("旧名字"), "旧名字还在：{names:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 「在这条提交上打标签」：标签落点必须是**打开那一刻**那条提交，不是 HEAD。

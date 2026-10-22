@@ -38,6 +38,7 @@ impl Gitx {
             seq: 0,
             busy: false,
             note: None,
+            note_at: None,
             log_filter: String::new(),
             side_filter: String::new(),
             topo: false,
@@ -263,6 +264,7 @@ impl Gitx {
                     git::create_branch(&repo, name, start.as_deref(), *checkout)
                 }
                 Action::DeleteBranch(name) => git::delete_branch(&repo, name, false),
+                Action::RenameBranch { from, to } => git::rename_branch(&repo, from, to),
                 Action::Merge(name) => git::merge_branch(&repo, name),
                 Action::CreateTag { name, target } => git::create_tag(&repo, name, target, None),
                 Action::DeleteTag(name) => git::delete_tag(&repo, name),
@@ -1007,11 +1009,9 @@ impl Gitx {
     // ------------------------------------------------------------- 仓库 tab 条
     /// 第二行：书签列表摊成一排 tab，点一枚就是把那个仓库开起来。
     /// SourceTree 把这些放在**另一个窗口**（书签窗），这个壳只有一个窗口，所以列表常驻在这一行。
-    /// 行尾那格是给开发期提示（`note`）的固定预算——它以前挤在标题带里，把工具按钮压住了。
+    /// 开发期提示（`note`）以前挤在这一行右端，现在是底部 toast（`toast::show`）。
     pub(crate) fn tab_bar(&mut self, ui: &mut egui::Ui) {
         let mut pick: Option<String> = None;
-        let mut note = self.note.take();
-        let mut clear = false;
         let mut add_open = self.add_open;
         let mut add_path = std::mem::take(&mut self.add_path);
         let mut try_add = false;
@@ -1058,26 +1058,7 @@ impl Gitx {
                         }
                     },
                 );
-                // tab 再多也不能把提示挤出这一行：它单独占一格**固定**宽度，靠右摆。
-                // 不走布局流（`ui.horizontal` 里塞进去就得跟 tab 抢宽度），直接按面板矩形
-                // 右下角算绝对位置——`truncate()` 在横向布局里会吃掉整行剩余宽度，
-                // 那正是上一批重叠的成因。
-                if let Some(n) = &note {
-                    let r = ui.max_rect();
-                    let rect = Rect::from_min_max(
-                        pos2(r.max.x - NOTE_W, r.min.y + 2.0),
-                        pos2(r.max.x, r.max.y - 2.0),
-                    );
-                    let hit = put_left(ui, rect, |ui| {
-                        ui.add(Label::new(RichText::new(n).size(10.5).color(WARN)).truncate().selectable(false))
-                    });
-                    clear = hit.clicked();
-                }
             });
-        if clear {
-            note = None;
-        }
-        self.note = note;
         self.add_open = add_open;
         self.add_path = add_path;
         if try_add {
@@ -1140,6 +1121,12 @@ impl Gitx {
                                 intent,
                             );
                             menu_item(ui, "合并到当前分支", || Action::Merge(b.name.clone()), intent);
+                            menu_card(
+                                ui,
+                                "重命名分支…",
+                                || Modal::rename_branch(b.name.clone()),
+                                intent,
+                            );
                             menu_item(ui, "删除这个分支", || Action::DeleteBranch(b.name.clone()), intent);
                         },
                         &mut intent,
@@ -1697,8 +1684,67 @@ impl Gitx {
         self.land(intent);
     }
 
-    /// 四块面板的装配顺序 = 参考图的分块顺序：先工具栏（横贯顶）与侧栏（贯穿到底），
-    /// 再声明底部带，最后 CentralPanel 才拿到剩下的日志区。
+    /// 底部状态栏：左边当前分支与领先落后，右边仓库路径。
+    /// SourceTree 的四张参考图都把窗口底裁掉了，这 26pt 的内容没有对照依据——
+    /// 挑了没有争议的三样：分支名、有上游才出现的 ↑↓ 计数（契约：没有上游绝不显示 ↑0 ↓0）、
+    /// 正在进行的操作。等拿到一张带状态栏的参考图或真窗口对照再修。
+    pub(crate) fn status_bar(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::bottom("status")
+            .exact_size(STATUS_H)
+            .frame(egui::Frame::NONE.fill(TOOLBAR_BG))
+            .show(ui, |ui| {
+                let rect = ui.max_rect();
+                // 顶上那条 1px 分隔线：状态栏是 chrome（灰底），和上面白底的内容区要有边界。
+                ui.painter().line_segment(
+                    [pos2(rect.min.x, rect.min.y + 0.5), pos2(rect.max.x, rect.min.y + 0.5)],
+                    Stroke::new(1.0, RULE),
+                );
+                let mut left: Vec<String> = Vec::new();
+                if let Some(snap) = &self.snap {
+                    let st = &snap.status;
+                    left.push(st.branch.clone());
+                    // ↑↓ 各自只在有数的时候出现：`↑0 ↓0` 是噪音，没上游时更是谎言。
+                    if st.upstream.is_some() {
+                        if st.ahead > 0 {
+                            left.push(format!("↑{}", st.ahead));
+                        }
+                        if st.behind > 0 {
+                            left.push(format!("↓{}", st.behind));
+                        }
+                    }
+                    if !st.repo_state.is_empty() && st.repo_state != "none" {
+                        left.push(format!("· {}进行中", op_noun(&st.repo_state)));
+                    }
+                }
+                // 一段一段画而不是拼成一条：段与段之间要能被判据单独认出来
+                // （「↑2 跟没跟在分支名后面」按文字起点比，拼成一串就无从比）。
+                let mut x = rect.min.x + 8.0;
+                for part in left {
+                    let r = ui.painter().text(
+                        pos2(x, rect.center().y),
+                        Align2::LEFT_CENTER,
+                        part,
+                        FontId::proportional(12.0),
+                        INK,
+                    );
+                    x = r.max.x + 4.0;
+                }
+                if let Some(path) = &self.repo {
+                    ui.painter().text(
+                        pos2(rect.max.x - 8.0, rect.center().y),
+                        Align2::RIGHT_CENTER,
+                        path,
+                        FontId::proportional(11.5),
+                        MUTED,
+                    );
+                }
+            });
+    }
+
+    /// 面板装配顺序。egui 的规矩是**后声明的避让先声明的**，所以从窗底往外排：
+    /// 状态栏最贴底（横贯整窗）→ 侧栏（让出状态栏，到 519 为止）→ 暂存带（再让出侧栏，
+    /// 从 141 起步）→ CentralPanel 拿剩下的日志区。中间哪个顺序颠倒，底色带就会
+    /// 多出一条斜茬（无头判据 `bands_match_the_measured_reference` 量得出来）。
     /// 单独抽出来是为了让无头测试能拿到同一份 `Ui`，不必伪造 `eframe::Frame`。
     pub(crate) fn shell(&mut self, ui: &mut egui::Ui) {
         reset_rows_painted();
@@ -1706,6 +1752,8 @@ impl Gitx {
         self.poll(&ctx);
         self.toolbar(ui);
         self.tab_bar(ui);
+        // 底部面板从窗底往上叠：先声明的贴着窗底。状态栏要贴底，所以排在暂存带前面。
+        self.status_bar(ui);
         self.sidebar(ui);
         self.bottom_band(ui);
         self.log_band(ui);
@@ -1714,6 +1762,8 @@ impl Gitx {
         // 顺序就是层序：确认卡最后画，压住历史面板。
         self.history_layer(&ctx);
         self.modal_layer(&ctx);
+        // toast 也压在最上层，但要盖过确认卡（提示比还没确认的动作更急）。
+        crate::ui::toast::show(&ctx, &mut self.note, &mut self.note_at);
     }
 }
 

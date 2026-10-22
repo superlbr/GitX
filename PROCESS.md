@@ -899,3 +899,110 @@ M2 顺带抓到一条**探针口径**：`visible_texts` 里 hunk 那一行的两
   行为依赖 `GIT_EDITOR`；核心层测试能过是仓库里已有默认信息。真窗口若卡住，要先设
   `GIT_EDITOR=true`——这一条没有判据。
 
+---
+## 重命名分支（任务 #42，2026-10-22 上午）
+
+**这批也是接线**：核心层 `git::rename_branch` 早就存在（`git branch -m old new`），界面层
+零调用。判据同样走端到端：真建一条分支 → 右键菜单 → 填卡 → Enter → 回仓库用 `git branch` 复核。
+
+**决定与依据**
+
+- 卡上**不预填旧名字**：预填后用户会在末尾接着打，得到 `main-new` 这种串。旧名字写在
+  说明行（「旧名字 改名为」），输入框空着等新名字；空名字时主按钮不产出动作。
+- 主按钮文案「重命名」与卡标题「重命名分支」同前缀，判据里按文字定位会先撞上标题。
+  所以判据走 **Enter**——它和点主按钮是同一条 `primary_action` 出口，不另开一条路径。
+- 菜单顺序按危险程度排：合并 → 重命名 → 删除。改名不动提交、不动工作区，落在删除之前。
+
+**改了什么**
+
+- `src/git.rs`：核心判据 `renaming_the_current_branch_keeps_its_commits_and_head`
+  （旧名字从 refs 消失、新名字是当前分支、HEAD 不变）。
+- `src/ui/state.rs`：`Action::RenameBranch { from, to }`、`Form::RenameBranch { from }`、
+  `Modal::rename_branch`、hint「新分支名」、primary「重命名」。
+- `src/ui/widgets.rs`：`primary_action` 里 `raw` 非空才产出 `RenameBranch`。
+- `src/ui/app.rs`：`act()` 映射到 `git::rename_branch`；分支右键菜单加「重命名分支…」。
+- `src/geometry.rs`：`renaming_a_branch_lands_a_real_rename`。
+
+**判据 + 反向变异表**
+
+| 判据 | 钉的是 |
+|---|---|
+| `renaming_the_current_branch_keeps_its_commits_and_head` | 改名后旧 ref 消失、新 ref 是 HEAD、提交号原样（核心层） |
+| `renaming_a_branch_lands_a_real_rename` | 右键 → 卡 → 键入 → Enter 之后，仓库里 `git branch` 只剩新名字、旧名字没了 |
+
+| # | 变异 | 期望 | 实际 |
+|---|---|---|---|
+| M1 | `act()` 不调 `rename_branch`，直接 `Ok(())` | 判据红 | 红：快照里等不到「新名字」 |
+| M2 | `primary_action` 对 `RenameBranch` 返回 `None` | 判据红 | 红：卡不关、仓库不动 |
+| M3 | 菜单里删掉「重命名分支…」这一项 | 判据红 | 红：`menu_pick` 在菜单里找不到这一项 |
+
+**顺带收拾的两处判据（状态栏 / toast 接线后的红）**
+
+- 状态栏左边也写着「main ↑2」，按绘制顺序排在侧栏**之前**，`side_text` 不卡 y 会先撞上它；
+  上界收到 `WIN_H - STATUS_H`。状态栏原来把「main ↑2」拼成一条 galley，`↑2` 无法单独定位，
+  改成逐段画（间隔 4pt），判据才能比「↑2 跟没跟在分支名后面」。
+- 表头竖线判据扫全宽横线时会把状态栏顶那条 1pt 分隔线算进来，加 y 带过滤。
+  提交图判据的 7 条提交被状态栏吃掉一行，那条判据改用 `WIN_H + STATUS_H` 的窗口跑
+  （它判的是图元越不越列，不是一屏塞得下几条）。
+- toast 在 `Order::Foreground`：全新 `Context` 的第一遍不画那一层，而且 `Area` 要几帧才把
+  位置收敛（第一遍只量尺寸）。两条 toast 判据改成同一个 `Context` 多跑几遍再量；
+  卡片底色带 Area 的淡入透明度，所以只认位置/宽度，不认「纯白」。
+  `Frame` 的底色+阴影是塞在 `Shape::Vec` 里发的，`rects()/rounded()` 已能拆组（否则 toast 隐形）。
+
+**仍然没看到过的**
+
+- **真窗口目视**：改完名后侧栏点、日志里的分支药丸、状态栏同时换名字，没有在真窗口里看过。
+- **远端分支改名**：菜单只出现在本地分支上；`origin/xxx` 这一类没有入口，核心层也没做
+  `push origin :old old:new` 的远端联动——本地改完后远端仍是旧名字，这一条没判据。
+- **当前分支正在被别的 worktree 占用**时 `git branch -m` 会失败，错误会原样落到 toast，
+  但没造那个夹具，文案也没目视。
+
+
+
+---
+## 底部状态栏与 toast（2026-10-22）
+
+**这批是借 deckcraft 的两件家具**：状态栏（`Panel::bottom` + painter 直绘）和 toast
+（`Area` 锚在状态栏上方）。动机：操作反馈原来挤在 tab 条右端的 240pt 定宽小格里，
+长提示被截断、还常驻占一行；状态栏则是 SourceTree 有、我们一直空着的窗底。
+
+**决定与依据**
+
+- 状态栏 **26pt 没有参考依据**：四张参考图全把窗口底裁掉了。高度按行节奏取 `ROW_H`，
+  内容只挑没有争议的三样（分支名、↑↓ 计数、进行中操作）+ 右侧仓库路径，等拿到一张
+  带状态栏的参考图或真窗口对照再修（theme.rs `STATUS_H` 注释已登记）。
+- **↑↓ 各自只在有数的时候出现**：`↑0 ↓0` 是噪音，没上游时更是谎言——比「不显示全零」
+  更严，连个位数都不许冒出来。进行中操作（合并/遴选/变基）只认 `repo_state` 非 `none`。
+- toast 生命周期：8 秒自己消失（`request_repaint_after(500ms)` 唤醒下一帧结算）、
+  点 × 立刻关。`note_at`（首次出现时刻）放在 state 里而不是 toast 自己攒：无头判据要能
+  在 `RawInput::time` 里直接造「已经过了 8 秒」。
+- **面板叠序踩坑**：egui 的规矩是**后声明的避让先声明的**（跟直觉相反）。状态栏要贴窗底，
+  就得在 `shell()` 里排在侧栏/暂存带**之前**声明，否则状态栏只画到侧栏左缘为止
+  （`bands_match_the_measured_reference` 量出了那条斜茬）。
+- 状态栏左边逐段画（分支、↑、↓、操作各一块 galley）：拼成一条字符串的话，
+  「↑2 跟没跟在分支名后面」这类判据按前缀定位不到。
+
+**无头判据的三条新账**
+
+- `Order::Foreground` 的 Area：全新 `Context` 第一遍不画、第二遍起才有形状，且 **Area 有
+  淡入动画**——第二遍时白底是 `#3C3C3C3C`（255×0.235）、阴影 α28→7，全是
+  `gamma_multiply(进度)` 的中间色。判据要多跑几帧等动画收敛，颜色断言也别卡「纯白」。
+- `Frame` 带阴影时底色**塞在 `Shape::Vec` 组里发**（egui 0.37 `frame.rs` 的
+  `Shape::Vec([shadow, frame])`）：`rects()/rounded()` 不拆组的话整张卡对判据隐形。
+  新增 `collect_rects` 递归拆组。
+- 状态栏让出的 26pt 波及一批旧判据（带的下缘、侧栏文字 y 带、表头横线搜索区、
+  日志虚拟化行数），全部跟着 `WIN_H - STATUS_H` 重排。
+
+**判据**
+
+| 判据 | 钉的是 |
+|---|---|
+| `the_status_bar_bands_the_bottom_edge` | 窗底 26pt 灰条横贯整窗，暂存带底边上移；`STATUS_H=26` 钉常量 |
+| `the_status_bar_names_the_branch_and_counts` | 分支名贴左、↑2 跟在后面、绝不出现 ↑0/↓0 |
+| `the_note_shows_as_a_toast_above_the_status_bar` | 卡片悬在状态栏上 8pt、水平居中、不超宽，文字在卡内 |
+| `the_toast_closes_on_click_and_fades_after_eight_seconds` | 真 PointerButton 点 × 立刻关；拨钟 8.5s 后自己消失 |
+
+**仍然没看到过的**
+
+- **真窗口目视**：状态栏与 toast 的字色、间距、阴影浓淡都没在真窗口里看过。
+- toast 的出入场动画（淡入有了，淡出是瞬间消失）与多行提示的换行观感没有对照。

@@ -8,4 +8,5 @@ pub(crate) mod fonts;
 pub(crate) mod graph;
 pub(crate) mod state;
 pub(crate) mod theme;
+pub(crate) mod toast;
 pub(crate) mod widgets;

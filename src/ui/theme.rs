@@ -87,9 +87,6 @@ pub(crate) const WIN_H: f32 = 545.0;
 /// `interact_size.y`，而那个值就是 `ROW_H`（见 `style()`），所以这条跟着行高走——
 /// 行高从 21 改成 26 时这里没跟着改，侧栏的底色矩形就超出窗口底 6pt（`bands_match_...` 抓到）。
 pub(crate) const SIDE_FILTER_H: f32 = 4.0 + ROW_H;
-/// 工具栏那条开发期提示占的宽度。1050pt 的窗口里右侧 11 枚按钮要 473pt，
-/// 左边仓库名 + 分支 + 书签下拉 + 添加仓库再要 ~280pt，留给提示的就只剩这一格。
-pub(crate) const NOTE_W: f32 = 240.0;
 /// 侧栏内容框离面板左缘的距离（`Frame::inner_margin`）。下面那几个数全是**面板坐标**，
 /// 画的时候减去它才是行内偏移——这样常量的名字就等于参考图上量到的那个位置。
 pub(crate) const SIDE_INSET: i8 = 5;
@@ -155,6 +152,10 @@ pub(crate) const WARN: Color32 = Color32::from_rgb(0xb0, 0x3a, 0x2e);
 pub(crate) const WARN_BG: Color32 = Color32::from_rgb(0xfd, 0xf0, 0xee);
 /// 冲突横幅的行高。也没有参考图；和 `ROW_H` 差 4pt，塞得下 11.5 号字与两枚小按钮。
 pub(crate) const CONFLICT_BANNER_H: f32 = 30.0;
+/// 底部状态栏。SourceTree 的四张参考图都把窗口底裁掉了（量不到它的状态栏），
+/// 高度按行节奏取 `ROW_H`；文案与几何等拿到一张带状态栏的参考图或真窗口对照再修，
+/// PROCESS「还没量到的」已登记。
+pub(crate) const STATUS_H: f32 = 26.0;
 // 描述列那几枚 ref 药丸。三个值都是在参考图上量的（`docs/reference/…-repo-window-2026-10-20.png`，
 // 第一行 `⑂ main` 的浅蓝底取 (213,229,253)、描边取 (170,170,170)、`超前3个版本` 的藏青底取 (0,57,121)）。
 pub(crate) const PILL_BG: Color32 = Color32::from_rgb(0xd5, 0xe5, 0xfd);

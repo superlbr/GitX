@@ -105,6 +105,8 @@ pub(crate) enum Action {
     /// `-d`（不是 `-D`）：没合并过的分支让 git 自己拒掉，错误原样落到 `note` 里。
     /// 不做「静默强删」——那正是用户点错一枚菜单项时会丢工作的地方。
     DeleteBranch(String),
+    /// 改本地分支名。`from` 是菜单打开那一刻的名字。
+    RenameBranch { from: String, to: String },
     Merge(String),
     CreateTag { name: String, target: String },
     DeleteTag(String),
@@ -159,6 +161,8 @@ pub(crate) enum Form {
     StashSave { include_untracked: bool },
     /// 在选中的那条提交上打一个轻量标签。
     NewTag { oid: String },
+    /// 把一条本地分支改名。`from` 是右键那一刻的名字，输入框留空等新名字。
+    RenameBranch { from: String },
     /// 从本地分支里挑一条合并进当前分支。
     Merge { branches: Vec<String> },
     /// 克隆。源地址走 `Modal.text`（第一格），目标目录放在这里（第二格）：
@@ -201,6 +205,17 @@ impl Modal {
         }
     }
 
+    /// 重命名分支。旧名字放在说明里，输入框空着等新名字——预填旧名字会让用户
+    /// 在末尾接着打，得到 `main-new` 这种串。
+    pub(crate) fn rename_branch(from: String) -> Self {
+        Modal {
+            title: "重命名分支",
+            detail: Some(format!("{from} 改名为")),
+            text: Some(String::new()),
+            form: Form::RenameBranch { from },
+        }
+    }
+
     pub(crate) fn merge(branches: Vec<String>) -> Self {
         Modal { title: "合并到当前分支", detail: None, text: None, form: Form::Merge { branches } }
     }
@@ -226,6 +241,7 @@ impl Modal {
             Form::NewBranch { .. } => "分支名",
             Form::StashSave { .. } => "贮藏说明（可留空）",
             Form::NewTag { .. } => "标签名",
+            Form::RenameBranch { .. } => "新分支名",
             Form::Clone { .. } => "源仓库地址（https://… 或 /路径）",
             Form::Merge { .. } | Form::Confirm { .. } => "",
         }
@@ -252,6 +268,7 @@ impl Modal {
             Form::NewBranch { .. } => "创建并切换",
             Form::StashSave { .. } => "贮藏",
             Form::NewTag { .. } => "创建",
+            Form::RenameBranch { .. } => "重命名",
             Form::Clone { .. } => "克隆",
             Form::Merge { .. } => "",
             Form::Confirm { .. } => "确定",
@@ -333,6 +350,9 @@ pub struct Gitx {
     pub(crate) seq: u64,
     pub(crate) busy: bool,
     pub(crate) note: Option<String>,
+    /// `note` 第一次出现的时刻（egui 时间，秒）。toast 靠它结算 8 秒超时；
+    /// `None` 表示这一帧还没画过。无头判据直接往 `RawInput::time` 塞值来造「过了 8 秒」。
+    pub(crate) note_at: Option<f64>,
     pub(crate) log_filter: String,
     pub(crate) side_filter: String,
     /// 日志排序方式，即筛选条上那枚「层级顺序」：`false` = 日期序，`true` = 拓扑序。

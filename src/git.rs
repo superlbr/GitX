@@ -2342,6 +2342,27 @@ mod tests {
         assert!(br.iter().any(|b| b.name == "feature" && b.is_current));
     }
 
+    /// 重命名当前分支：ref 换了名字，提交一条不少，HEAD 指的还是同一个 oid。
+    #[test]
+    fn renaming_the_current_branch_keeps_its_commits_and_head() {
+        let (_d, p) = init_repo();
+        let old = run_git(&p, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let head = run_git(&p, &["rev-parse", "HEAD"]).unwrap();
+        rename_branch(&p, &old, "renamed").unwrap();
+
+        let br = branches(&p).unwrap();
+        assert!(br.iter().any(|b| b.name == "renamed" && b.is_current));
+        assert!(!br.iter().any(|b| b.name == old), "旧名字还留在 refs 里");
+        assert_eq!(
+            run_git(&p, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap().trim(),
+            "renamed"
+        );
+        assert_eq!(run_git(&p, &["rev-parse", "HEAD"]).unwrap(), head);
+    }
+
     /// `origin/main` is the only thing that tells you where the other end is, and
     /// `branches()` cannot supply it — so the query needs its own evidence.
     #[test]
