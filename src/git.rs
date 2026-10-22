@@ -2596,6 +2596,28 @@ mod tests {
         assert!(pushed_refs(&p, "HEAD").unwrap().is_empty());
     }
 
+    /// amend 换的是 HEAD 本身：提交条数不变、信息变成新的、暂存内容并进同一条。
+    #[test]
+    fn amend_replaces_head_instead_of_adding_a_commit() {
+        let (_d, p) = init_repo();
+        assert_eq!(run_git(&p, &["rev-list", "--count", "HEAD"]).unwrap().trim(), "1");
+        fs::write(format!("{}/late.txt", p), "新内容\n").unwrap();
+        stage(&p, &["late.txt".to_string()]).unwrap();
+
+        commit(&p, "修正后的信息", true, &[], false, false).unwrap();
+
+        assert_eq!(
+            run_git(&p, &["rev-list", "--count", "HEAD"]).unwrap().trim(),
+            "1",
+            "amend 不该多出一条提交"
+        );
+        assert_eq!(commit_message(&p, "HEAD").unwrap(), "修正后的信息");
+        assert!(
+            run_git(&p, &["ls-tree", "--name-only", "HEAD"]).unwrap().contains("late.txt"),
+            "已暂存的内容没并进 amend 后的 HEAD"
+        );
+    }
+
     /// The first push of a fresh branch: `-u` is the only way ahead/behind
     /// stops being a silent 0/0.
     #[test]

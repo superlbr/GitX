@@ -43,6 +43,7 @@ use crate::viewport;
             log_seq: 0,
             commit_msg: String::new(),
             commit_desc: String::new(),
+            amend: false,
             clear_msg_on_load: false,
             add_open: false,
             add_path: String::new(),
@@ -2126,6 +2127,38 @@ use crate::viewport;
         assert!(app.note.is_none(), "提交路上报了 note：{}", app.note.clone().unwrap_or_default());
         // 多出来的这条也得有图元——图序列是跟着 snapshot 一起重排的。
         assert_eq!(snap.graph.len(), snap.commits.len(), "提交完图序列和日志行号对不上");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// amend：勾上「修正上一条」之后，提交按钮/⌘Enter 落地的是 `--amend`——
+    /// 提交条数不变、上一条换成新信息、已暂存内容并进同一条，落地后勾自动去掉。
+    #[test]
+    fn ticking_amend_rewrites_head_instead_of_adding_a_commit() {
+        let (mut app, dir) = open_repo("amend");
+        let before = app.snap.as_ref().unwrap().commits.len();
+        assert!(click_text(&mut app, "修正上一条"), "提交框里没有「修正上一条」");
+        assert!(app.amend, "点了勾但 app.amend 还是 false");
+        assert!(type_into(&mut app, "提交摘要", "改写后的提交"), "提交摘要没找到");
+        // 用按钮而不是 ⌘Enter：勾选框刚被点过，焦点还在它身上，Enter 可能被当成
+        // 勾选框的激活键（把勾又按掉）。按钮和回车最终都走同一个 `Action::Amend`。
+        assert!(click_text(&mut app, "修正上一条提交"), "勾上之后按钮没换成「修正上一条提交」");
+        assert!(app.modal.is_some(), "amend 没先问一句");
+        assert!(click_warm(&mut app, "确定"), "确认卡上没有「确定」");
+        pump(&mut app, |a| {
+            a.snap
+                .as_ref()
+                .and_then(|s| s.commits.first())
+                .map(|c| c.subject == "改写后的提交")
+                .unwrap_or(false)
+        });
+
+        let snap = app.snap.as_ref().unwrap();
+        assert_eq!(snap.commits.len(), before, "amend 多出了一条提交");
+        assert!(!app.amend, "amend 落地后勾还留着");
+        assert!(
+            git_in(&dir, &["show", "HEAD:a.txt"]).contains("第二行"),
+            "已暂存的内容没并进 amend 后的 HEAD"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

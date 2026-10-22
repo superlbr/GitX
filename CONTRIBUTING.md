@@ -94,9 +94,13 @@ cp /tmp/green_app.rs src/ui/app.rs && cmp /tmp/green_app.rs src/ui/app.rs   # �
 ./scripts/gates.sh
 ```
 
-CI 在 macos-14 上跑同一条路（eframe 要系统框架，Linux runner 上装那堆 GTK/X11 开发包
-判的东西和本机不一致）。CI 上没有那份 8.3MB 的 CJK 字体，workflow 会打一条警告——
-见下面「测试数据」。
+**全套不必在本机跑**：每次 push / PR，CI 会把同样的四条跑一遍——素材审计单独放 ubuntu（只读文本，
+5 分钟内），三条 Rust 门禁放 macos-14（eframe 要系统框架，Linux runner 上装那堆 GTK/X11 开发包
+判的东西和本机不一致），两边并行。三条里有一条红了，其余两条仍会跑完，不会让你等一轮才知道
+第二条也红。本机只在需要立即看到结果时跑。
+
+CI 上没有那份 8.3MB 的 CJK 字体，workflow 会打一条警告——见下面「测试数据」。
+`cargo test` / `cargo build` 在 CI 上都带 `--locked`：`Cargo.lock` 入库了，依赖不该在 runner 上漂。
 
 ## 测试数据
 

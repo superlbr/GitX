@@ -6,18 +6,40 @@ on:
   pull_request:
   workflow_dispatch:
 
-# 同一分支上后来的提交把前面那次跑掉的排队取消掉。
+# 同一分支/PR 上后来的提交把前面那次跑掉的排队取消掉。
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# 门禁只读代码，不给默认那条 write 令牌。
+permissions:
+  contents: read
+
+env:
+  # 日志里留住颜色（下面几条命令的输出都是给人看的）。
+  CARGO_TERM_COLOR: always
+  # CI 的 target 目录由 rust-cache 整份搬运，增量编译产出的中间件只会把缓存撑大。
+  CARGO_INCREMENTAL: 0
+
 jobs:
+  # 第四条门禁只读文本（LICENSE*、NOTICE、ATTRIBUTION.md、Cargo.toml、OFL.txt），
+  # 不需要编译器，也不需要 macOS——放进 ubuntu 上与下面那条并行跑，省 macOS 分钟。
+  audit:
+    name: 许可证与素材审计
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      # 与本机 `./scripts/gates.sh` 调的是同一个文件（不是复制一份逻辑）。
+      - run: ./scripts/license-audit.sh
+
   rust:
     # eframe 要系统框架：Linux 上要装一堆 GTK / X11 / Wayland 开发包，
     # 而这个应用目前只在 macOS 上跑，所以整条门禁放在 mac runner 上，
     # 和本机 `./scripts/gates.sh` 判的东西一致。
     name: Rust（核心层 + egui 无头门禁）
     runs-on: macos-14
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -25,11 +47,11 @@ jobs:
         with:
           workspaces: |
             . -> target
+          # PR 只读缓存；写入只发生在 main。否则每个 PR 都会存一份自己的 target，
+          # LRU 里把 main 的热缓存挤掉，下一次命中率反而更低。
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: git 是否可用（核心层全部走 git CLI）
         run: git --version
-      # 第四条门禁与本机跑的是同一个文件（不是复制一份逻辑）。
-      - name: 许可证与素材审计
-        run: ./scripts/license-audit.sh
       # 那 8.3MB 全量 CJK 被 .gitignore 挡在仓库外，所以 runner 上**没有**它：
       # 无头帧会退回 egui 自带的字体链，那条链没有汉字，`.notdef` 的 advance 正好是 0.5×字号。
       # 左缘类判据（每格贴住自己表头）不受影响，但凡是「这一列放得下」的判据，
@@ -42,11 +64,20 @@ jobs:
           else
             echo "::warning::缺 assets/fonts/NotoSansSC-Regular.otf：这份 CJK 字体没进仓库，CI 上的宽度判据是半宽的"
           fi
-      - run: cargo test --lib
-      - run: cargo test --bin gitx
+      # 三条里哪条红了都别停在第一条上：本机 gates.sh 也是一次报全，
+      # CI 停在这里只会让人再等一轮才知道第二条也红。`!cancelled()` 保证取消仍然立收手。
+      - name: 核心层（lib 单测）
+        if: ${{ !cancelled() }}
+        run: cargo test --lib --locked
+      - name: egui 无头判据
+        if: ${{ !cancelled() }}
+        run: cargo test --bin gitx --locked
       - name: 构建必须零警告
+        if: ${{ !cancelled() }}
+        # `cargo test` 的输出里混着测试代码的诊断，「产品代码零警告」要按 `cargo build` 的输出来判。
+        # （`cargo build` 无事可做时也会打一行 "Finished"，所以只认以 warning/error 开头的那些行。）
         run: |
-          out=$(cargo build 2>&1)
+          out=$(cargo build --locked 2>&1)
           printf '%s\n' "$out"
           if printf '%s\n' "$out" | grep -qE "^(warning|error)"; then
             echo "::error::构建有警告"

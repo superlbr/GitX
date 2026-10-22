@@ -289,7 +289,7 @@ push/pull 端到端判据（fetch 有，push/pull 仍无 remote 样本）、命�
 多选、拖拽与「扫描文件夹」入口、原生目录选择器（要引 `rfd`）、深色模式、
 按**行**暂存（`line.hunk` 已经给每一行留了值）、差异区右上角那条「搜索」、
 `COL_GRAPH` 超过 4 道目前是 **assert 报错**（没做列宽自适应）、`--depth`/bare/submodule、
-克隆进度与 stderr 流式（现在只有结果一条 note）、`.gitignore` 编辑器、amend / `--no-verify` / `-S` 签名、
+克隆进度与 stderr 流式（现在只有结果一条 note）、`.gitignore` 编辑器、`--no-verify` / `-S` 签名、
 上面「它有一整块」那一段里的全部。
 对照表里这六条现在只是**文档**、没有判据：大补丁必须在 `diff --git` 边界折叠、窄列路径省略换头部、
 UI 不许出现 emoji、提交行高度只有一个来源、没有上游时绝不显示 `↑0 ↓0`、push 实参里不得出现加速节点串。
@@ -1008,3 +1008,64 @@ M2 顺带抓到一条**探针口径**：`visible_texts` 里 hunk 那一行的两
 
 - **真窗口目视**：状态栏与 toast 的字色、间距、阴影浓淡都没在真窗口里看过。
 - toast 的出入场动画（淡入有了，淡出是瞬间消失）与多行提示的换行观感没有对照。
+
+---
+
+## 修正上一条提交（amend HEAD，2026-10-22）
+
+**这批也是接线**：核心层 `git::commit` 早就有 `amend` 参数，界面层十一处调用全传 `false`。
+加的是一枚勾 + 一条出口。
+
+**决定与依据**
+
+- **单独 `Action::Amend(String)`，不给 `Commit` 加布尔字段**：它要过确认卡、落地后还要把勾
+  去掉，和普通提交不是同一条路。合在一个变体里的话，`needs_confirm` 与 `clear_msg_on_load`
+  都得在运行时读布尔，判据也只能间接钉。
+- **勾上时不再要求暂存区非空**：`git commit --amend` 只改信息本来就合法。原来的
+  `staged_count > 0` 闸门在 amend 时会把「只改提交信息」这条正当用法一起拦掉。
+- **必须过确认卡**：amend 换的是已经落地的 HEAD，推送过的分支这一下会让本地与远端分叉。
+  拦在 `needs_confirm`（出口）而不是勾选框上——以后再加入口也不会漏。
+- **落地后把勾清掉**：不 `self.amend = false` 的话，下一次普通提交会静默变成 amend，
+  那正是最该防的误操作。清空动作挂在 `Msg::Loaded` 的 `clear_msg_on_load` 块里，
+  与提交信息一起走（失败时两者都留着）。
+- 按钮文案跟着勾换（「提交到 main (2)」↔「修正上一条提交」），否则勾在左边、按钮还说
+  「提交」，用户分不清落地的是哪一条。
+
+**改了什么**
+
+- `src/git.rs`：核心判据 `amend_replaces_head_instead_of_adding_a_commit`
+  （提交条数仍是 1、信息换成新的、已暂存内容并进同一条）。
+- `src/ui/state.rs`：`Action::Amend(String)`、`Gitx.amend: bool`。
+- `src/ui/app.rs`：`act()` 映射到 `git::commit(..., amend: true, ...)`；提交框加勾选框与
+  两套按钮文案；`Msg::Loaded` 里落地后复位勾。
+- `src/ui/widgets.rs`：`needs_confirm` 收 `Amend`；`confirm_of` 给标题「修正上一条提交」
+  与「推送过的分支要强推」的说明。
+- `src/geometry.rs`：`ticking_amend_rewrites_head_instead_of_adding_a_commit`。
+
+**判据 + 反向变异表**
+
+| 判据 | 钉的是 |
+|---|---|
+| `amend_replaces_head_instead_of_adding_a_commit` | `--amend` 不多出提交，HEAD 的信息与树都被替换（核心层） |
+| `ticking_amend_rewrites_head_instead_of_adding_a_commit` | 勾上 → 按钮换文案 → 确认卡 → 确定之后：条数不变、勾复位、暂存内容并进 HEAD |
+
+| # | 变异 | 期望 | 实际 |
+|---|---|---|---|
+| M1 | `needs_confirm` 去掉 `Action::Amend` | 判据红 | 红：`amend 没先问一句` |
+| M2 | `act()` 把 `Amend` 当普通提交（`amend=false`） | 判据红 | 红：提交条数 2 ≠ 1 |
+| M3 | 删掉落地后的 `self.amend = false` | 判据红 | 红：`amend 落地后勾还留着` |
+
+**无头判据踩到的两处**
+
+- 勾选框刚被点过，焦点在它身上，`⌘Enter` 会被当成它的激活键（把勾又按掉），于是发出的是
+  普通 `Commit`、不过确认卡。判据改用点按钮，与回车走同一个 `Action::Amend` 出口。
+- 确认卡也在 `Order::Foreground`，`click_text` 用全新 `Context` 第一遍画不出那一层；
+  改用既有的 `click_warm(&mut app, "确定")`（同 `Context` 多跑几帧）。
+
+**仍然没看到过的**
+
+- **真窗口目视**：勾选框压在提交框左下角、与按钮同行的间距，没在真窗口里看过。
+- **amend 之后的推送**：本地改写了 HEAD、远端仍是旧的，界面没有「需要强推」的提示，
+  只靠确认卡那句说明；`git push` 会失败并把错误落到 toast，没造那个夹具。
+- **冲突中 amend**：合并/变基进行到一半时勾上会怎样（git 自己会拒），文案没目视，
+  也没判据。

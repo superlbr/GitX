@@ -466,6 +466,8 @@ pub(crate) fn needs_confirm(a: &Action) -> bool {
             // 继续/终止都会落一次提交或回滚整段操作，SourceTree 同样先问一句。
             | Action::ContinueOp { .. }
             | Action::AbortOp { .. }
+            // amend 换掉的是已经落地的上一条提交；推送过的仓库这一下会让本地与远端分叉。
+            | Action::Amend(_)
     )
 }
 
@@ -518,6 +520,11 @@ pub(crate) fn confirm_of(a: &Action) -> (&'static str, String) {
         Action::DeleteTag(name) => ("删除标签", format!("标签 {name} 从本地删掉；远端那份要另外推一次才会没。")),
         Action::StashPop(i) => ("弹出贮藏", format!("stash@{{{i}}} 回到工作区，同时从贮藏列表里删掉。")),
         Action::StashDrop(i) => ("丢弃贮藏", format!("stash@{{{i}}} 那份改动直接丢掉，找不回来。")),
+        Action::Amend(_) => (
+            "修正上一条提交",
+            "上一条提交会被新的信息和暂存内容替换。没推送过就没有影响；推送过的分支要强推才能更新远端。"
+                .to_owned(),
+        ),
         Action::RestoreFile { oid, path } => (
             "恢复到旧版本",
             format!(

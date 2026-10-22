@@ -50,6 +50,7 @@ impl Gitx {
             log_seq: 0,
             commit_msg: String::new(),
             commit_desc: String::new(),
+            amend: false,
             clear_msg_on_load: false,
             add_open: false,
             add_path: String::new(),
@@ -241,7 +242,7 @@ impl Gitx {
         self.busy = true;
         // 只有提交**成功**落地才清空那格信息：git 报错、pre-commit 钩子拦下来、空信息被 core 挡掉，
         // 都得把字留着——否则用户得重打一遍。
-        self.clear_msg_on_load = matches!(action, Action::Commit(_));
+        self.clear_msg_on_load = matches!(action, Action::Commit(_) | Action::Amend(_));
         let tx = self.tx.clone();
         let (topo, rev) = (self.topo, self.log_rev.clone());
         std::thread::spawn(move || {
@@ -255,6 +256,7 @@ impl Gitx {
                 Action::UnstageHunk { path, hunk } => git::unstage_hunk(&repo, path, *hunk),
                 Action::DiscardHunk { path, hunk } => git::discard_hunk(&repo, path, *hunk),
                 Action::Commit(m) => git::commit(&repo, m, false, &[], false, false).map(|_| ()),
+                Action::Amend(m) => git::commit(&repo, m, true, &[], false, false).map(|_| ()),
                 Action::Checkout(name) => git::checkout_branch(&repo, name),
                 Action::Fetch => git::fetch(&repo, None, None),
                 Action::FetchRemote(name) => git::fetch(&repo, Some(name), None),
@@ -461,6 +463,9 @@ impl Gitx {
                     if std::mem::take(&mut self.clear_msg_on_load) {
                         self.commit_msg.clear();
                         self.commit_desc.clear();
+                        // 「修正上一条」是一次性的：落地后不把勾留着，否则下一次普通提交
+                        // 会静默变成 amend——那正是最该防的误操作。
+                        self.amend = false;
                     }
                     // 动作落地之后**按原来那一格**重新取差异。以前只在「没选文件」时重取整份
                     // 未暂存补丁，于是暂存了某个文件之后，右边那格还挂着已经暂存掉的内容；
@@ -1282,9 +1287,10 @@ impl Gitx {
                     .desired_width((w - 8.0).max(80.0)),
             );
             let msg = commit_text(&self.commit_msg, &self.commit_desc);
-            let can = staged_count > 0 && !msg.is_empty();
+            // amend 允许没有新暂存内容：只改写上一条的信息也是合法用法。
+            let can = !msg.is_empty() && (staged_count > 0 || self.amend);
             // 两句话分开报，措辞抄 core 那句（`gitx-core/src/git.rs:1082`）。
-            let why = if staged_count == 0 { "先勾选要提交的文件" } else { "提交信息不能为空" };
+            let why = if msg.is_empty() { "提交信息不能为空" } else { "先勾选要提交的文件" };
             // ⌘/Ctrl+Enter 提交（参考版 placeholder 里就写着这条）。读不了 `Ui::input`——0.37 的
             // `InputState` 只挂在 `Context` 上（egui-0.37.0/src/ui.rs 里没有 `fn input`）。
             // `i.modifiers` 是**按下修饰键时那条 `ModifiersChanged`** 更新出来的（input_state/mod.rs:434），
@@ -1294,12 +1300,19 @@ impl Gitx {
             });
             if can && enter {
                 // 键盘与鼠标各只有一处判断：同一个开关读两遍会让一条判据永远杀不死另一半。
-                act = Some(Action::Commit(msg.clone()));
+                act = Some(if self.amend { Action::Amend(msg.clone()) } else { Action::Commit(msg.clone()) });
             }
             ui.horizontal(|ui| {
-                let btn = egui::Button::new(RichText::new(format!("提交到 {branch} ({staged_count})")).size(11.5));
+                ui.checkbox(&mut self.amend, RichText::new("修正上一条").size(11.0))
+                    .on_hover_text("改写 HEAD：换掉上一条提交的信息，已暂存的内容会一起并进去");
+                let label = if self.amend {
+                    "修正上一条提交".to_owned()
+                } else {
+                    format!("提交到 {branch} ({staged_count})")
+                };
+                let btn = egui::Button::new(RichText::new(label).size(11.5));
                 if ui.add_enabled(can, btn).clicked() {
-                    act = Some(Action::Commit(msg.clone()));
+                    act = Some(if self.amend { Action::Amend(msg.clone()) } else { Action::Commit(msg.clone()) });
                 }
                 if !can {
                     ui.label(RichText::new(why).size(11.0).color(MUTED));

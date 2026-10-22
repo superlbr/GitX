@@ -20,8 +20,8 @@ GitX 与 Atlassian 无关，不含任何 SourceTree 的素材、商标或代码�
 
 | | 是什么 | 状态 |
 | --- | --- | --- |
-| `src/lib.rs`（lib target `gitx`） | 纯 Rust 的 git 与本地状态层，**零 UI 依赖**（87 例单测） | 稳，功能都在这层，改这里最划算 |
-| `src/ui/`（bin target `gitx`） | egui/eframe 的原生壳，**直连核心、没有 IPC 那一跳**（108 例无头判据） | 进行中：外壳几何、提交图、暂存/提交已通，其余见「壳里还缺的」 |
+| `src/lib.rs`（lib target `gitx`） | 纯 Rust 的 git 与本地状态层，**零 UI 依赖**（88 例单测） | 稳，功能都在这层，改这里最划算 |
+| `src/ui/`（bin target `gitx`） | egui/eframe 的原生壳，**直连核心、没有 IPC 那一跳**（109 例无头判据） | 进行中：外壳几何、提交图、暂存/提交已通，其余见「壳里还缺的」 |
 
 > **许可证**：GitX 按 **MIT 或 Apache-2.0 双许可**发布，由你二选一（[`LICENSE-MIT`](LICENSE-MIT)、
 > [`LICENSE-APACHE`](LICENSE-APACHE)、[`NOTICE`](NOTICE)）。选 Apache 那一半是为了它的**明示专利授权**，
@@ -47,7 +47,7 @@ gitx/
 │   ├── db.rs               # SQLite 持久化（仓库书签、设置、平台令牌）
 │   ├── models.rs           # 共享数据模型
 │   ├── error.rs
-│   ├── main.rs             # 壳的入口：viewport 配置 + eframe::run_native，以及 108 例无头判据的挂载点
+│   ├── main.rs             # 壳的入口：viewport 配置 + eframe::run_native，以及 109 例无头判据的挂载点
 │   ├── geometry.rs         # 无头门禁本体（bin 的 cfg(test) 模块，模块名 geometry_tests 不变）
 │   └── ui/                 # 界面模块（拆分自旧 main.rs，见 PROCESS.md「拆分 main.rs」）
 │       ├── app.rs          #   壳本体：面板布局、动作分发（stage/commit/fetch…全走 gitx::git）
@@ -71,7 +71,7 @@ gitx/
 设计要点：
 - **git 操作用 git CLI 封装**（而非 libgit2），避免额外 C 依赖，行为稳定、覆盖全面。
 - **分层可测**：核心层（lib target）不认识任何 UI——它看不见 `crate::ui::*`，`cargo test --lib` 直接跑；
-  壳也认识得很少——它的 108 例判据是**无头**的（不需要屏幕，自己 `git init` 临时仓库，不碰你手上的仓库）。
+  壳也认识得很少——它的 109 例判据是**无头**的（不需要屏幕，自己 `git init` 临时仓库，不碰你手上的仓库）。
 - 本地状态（仓库书签、设置）存于 SQLite，路径 `~/Library/Application Support/com.gitx.app/gitx.db`。
 - **界面态不再有任何 WebView 存储**：已删除那层的 localStorage 键（提交草稿、自定义键位、
   免确认白名单、分栏比例）随着那层一起没了，egui 壳目前只有 SQLite 一条持久化通路。
@@ -159,6 +159,10 @@ gitx/
 - **底部状态栏与 toast**：窗底 26pt 一条——左：当前分支名 + 有上游才出现的 ↑↓ 计数
   （绝不显示 `↑0 ↓0`）+ 进行中的操作（合并/遴选/变基），右：仓库路径；操作反馈从 tab 条
   右端的 240pt 定宽小格改成悬在状态栏上方的 toast，8 秒自己淡出、点 × 立刻关
+- **修正上一条提交（amend HEAD）**：提交框左边一枚「修正上一条」，勾上之后按钮换成
+  「修正上一条提交」，落地 `git commit --amend`；勾上时不再要求暂存区非空（只改信息也合法）。
+  它走确认卡——推送过的分支改 HEAD 会让本地与远端分叉；落地成功后勾自动去掉，
+  不会把下一次普通提交静默变成 amend
 
 ### 壳里还缺的（这就是活干到哪了，也是好活的清单）
 
@@ -166,7 +170,7 @@ gitx/
 
 - **设置卡**：工具栏 11 枚里只剩 index 10「设置」没接（点了是显式提示）
 - **`.gitignore` 编辑器 / rebase**：核心层函数齐全或已有 API，界面层**零调用**
-- **多选（⌘/Shift 范围）**、**amend HEAD**、**按行暂存**（`line.hunk` 已给每行留了值）
+- **多选（⌘/Shift 范围）**、**按行暂存**（`line.hunk` 已给每行留了值）
 - **键盘操作体系**：已删除那层有一整套可重绑键位 + chord（`g h`、`⌘↵`、`j/k`）和命令面板，
   壳里目前只有 ⌘/Ctrl+Enter 提交
 - **拖放开仓库**、**扫描文件夹**、**原生目录选择器**（要引 `rfd`）
@@ -183,7 +187,7 @@ gitx/
 ```bash
 cargo run --bin gitx              # 起真窗口
 cargo test --lib                  # 核心层单测
-cargo test --bin gitx             # 108 例无头判据（不需要屏幕）
+cargo test --bin gitx             # 109 例无头判据（不需要屏幕）
 ./scripts/gates.sh                # 四条门禁一次跑完（改动阶段只跑受影响的那一条）
 node gen-icon.mjs                 # 重新生成 assets/icon.png
 ```
@@ -206,7 +210,7 @@ node gen-icon.mjs                 # 重新生成 assets/icon.png
 
 ## 测试
 
-- 核心层 87 例（`cargo test --lib`）：在临时 fixture 仓库上验证
+- 核心层 88 例（`cargo test --lib`）：在临时 fixture 仓库上验证
   status / stage / commit / diff / range / branch / tag / stash 全流程、
   `untracked_patch` 合成（文本 / 二进制）、`commits` 路径·作者筛选（路径是三条 pathspec 的并集）、
   `repo_files`（`git ls-files`，有数量上限）、SQLite 持久化、
@@ -232,7 +236,7 @@ node gen-icon.mjs                 # 重新生成 assets/icon.png
   节点改写 2 例 + **离线端到端**（无节点 fetch 失败、带节点成功、`refs/remotes/origin/main` 落下、
   `origin` 的 URL 一字未改）、老数据库补 `last_fetched_at` 列、`release_api_url` 的镜像主机 /
   `{url}` 模板 / 非 https 拒绝 / 含空格拒绝。
-- 壳 108 例（egui 无头，`cargo test --bin gitx`，**不需要屏幕**）：
+- 壳 109 例（egui 无头，`cargo test --bin gitx`，**不需要屏幕**）：
   各面板的几何带、行距（日志 21pt / 差异 15pt 逐行断言）、长列表虚拟化、提交图车道、
   日志五列与差异正文的**齐左**（每格左缘贴住自己表头左缘，数字取自参考截图实测），
   以及**真的点击与键入**——临时 git 仓库、打提交信息、按提交按钮（或 ⌘/Ctrl+Enter）、
@@ -240,7 +244,8 @@ node gen-icon.mjs                 # 重新生成 assets/icon.png
   合法路径真的落库。
 - **四条门禁串在一个脚本里**：`./scripts/gates.sh`（核心测试、egui 无头判据、egui 零警告构建、
   许可证与素材审计）。最后那一条只读文本文件，实现在 `scripts/license-audit.sh` 里只有一份，
-  CI 调的是同一个脚本。CI 每次 push 跑同一份，见 `.github/workflows/gates.yml`。
+  CI 调的是同一个脚本。CI 每次 push / PR 都会跑：审计在 ubuntu、三条 Rust 门禁在 macos-14，
+  两条 job 并行，见 `.github/workflows/gates.yml`——所以全套不必在本机跑。
 
 已删除那层曾有的 226 例前端测试（vitest）随源码一起没了，其中**结论仍然成立、值得在 egui 里重做**的：
 大补丁必须在 `diff --git` 边界折叠（按字节直接砍会留下半个 hunk，画得出来但行号是假的）、

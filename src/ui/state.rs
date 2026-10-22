@@ -94,6 +94,9 @@ pub(crate) enum Action {
     /// 提交**暂存区**（不带路径 = `git commit -m` 的默认行为），和旧 React 版 `store.commit`
     /// 传的空 `paths` 一致。
     Commit(String),
+    /// 修正上一条提交（`git commit --amend`）。单独一条动作而不是给 `Commit` 加布尔字段：
+    /// 它要过确认卡、落地后还要把「修正上一条」那枚勾去掉，和普通提交不是同一条路。
+    Amend(String),
     Checkout(String),
     Fetch,
     /// 只问一个远端：侧栏「远端」那一栏右键用的，`Fetch` 是全抓。
@@ -373,7 +376,10 @@ pub struct Gitx {
     /// SourceTree 那格是**两个框**：摘要 + 描述。落进 git 是一条 `-m`，中间隔一个空行。
     pub(crate) commit_msg: String,
     pub(crate) commit_desc: String,
-    /// 下一次 `Msg::Loaded` 落地时要不要清空 `commit_msg`——只有提交那一个动作会置上。
+    /// 提交框左边那枚「修正上一条」：勾上之后提交按钮落地的是 `git commit --amend`，
+    /// 不是新的一条。成功落地后连同信息一起清掉。
+    pub(crate) amend: bool,
+    /// 下一次 `Msg::Loaded` 落地时要不要清空 `commit_msg`——只有提交/修正那两条动作会置上。
     pub(crate) clear_msg_on_load: bool,
     /// 顶部那格「添加仓库」的路径输入。和 `commit_msg` 一样放在壳里而不是控件里：
     /// 无头门禁要能直接读它，而且清空/收起的时机由动作决定。
