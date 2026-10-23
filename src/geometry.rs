@@ -1,7 +1,9 @@
 //! 门禁：全部无头断言。模块名保持 geometry_tests（scripts 与 PROCESS 里的过滤串不变）。
 
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, pos2, vec2};
-use gitx::models::{Branch, ChangeStatus, Commit, DiffEntry, FileStatus, RemoteRef, Repo, RepoStatus, Tag};
+use gitx::models::{
+    Branch, ChangeStatus, Commit, DiffEntry, FileStatus, Remote, RemoteRef, Repo, RepoStatus, Tag,
+};
 use gitx::{db, git};
 use std::sync::mpsc::channel;
 
@@ -25,7 +27,10 @@ use crate::viewport;
             sel: Sel::Uncommitted,
             commit_files: Vec::new(),
             file: None,
+            diff_rows: (0..diff.len()).collect(),
+            collapsed: Default::default(),
             diff,
+            diff_cols: 0,
             patch_label: "全部未暂存变更".to_owned(),
             seq: 0,
             busy: false,
@@ -34,8 +39,17 @@ use crate::viewport;
             log_filter: String::new(),
             side_filter: String::new(),
             topo: false,
-            log_rev: None,
+            scope: git::Scope::Current,
             show_remote: true,
+            // 夹具没有数据库（`conn: None`），这一格只影响 `open()` 之后要不要再去摸上一次那本；
+            // 默认按 `Gitx::new` 里 `Prefs::load(None)` 的结果填 true，免得夹具自己造一个新默认。
+            restore_last: true,
+            // 下面四条同样按 `Prefs::load(None)`（没有数据库那层）的结果填：夹具要测的是
+            // 「卡打开时长什么样」，初值必须由判据自己摆得上来，而不是靠构造函数偷偷读库。
+            push_behavior: PushBehavior::Matching,
+            default_remote: String::new(),
+            push_tags: false,
+            allow_force: true,
             // 夹具里把「还有下一页」拧死：不然「滚到底要下一页」那格判据会在无头帧里真起线程，
             // 拿 `/fixture` 当仓库跑 git，回来的 `Msg::Failed` 会污染别的断言。
             log_more: false,
@@ -45,8 +59,6 @@ use crate::viewport;
             commit_desc: String::new(),
             amend: false,
             clear_msg_on_load: false,
-            add_open: false,
-            add_path: String::new(),
             // 夹具默认停在「全部未暂存变更」那一格：和上面 `patch_label` 对得上，
             // 也让 hunk 那两枚按钮在整份补丁上**不出现**（没有单一文件路径可打）。
             target: Some(Target::Working { staged: false, path: None, untracked: false }),
@@ -68,7 +80,7 @@ use crate::viewport;
     /// 一份够用的假数据：三条提交、已暂存/未暂存/未跟踪各一条、一段带 hunk 头的补丁。
     /// 目的不是测 git，是让日志、文件表、差异区**真的有内容可排**——空态壳钉不住排版。
     fn loaded() -> Gitx {
-        filled(3, &layout(PATCH))
+        filled(3, &layout(PATCH, false))
     }
 
     /// 某一条提交的改动列表：两行，一行改、一行新增，选中挪到第一条提交上。
@@ -167,7 +179,7 @@ use crate::viewport;
     /// 上面那三份改动之外再加 `n` 份未暂存改动——「文件多到列表必须滚」只有这一种造法，
     /// 别在每个判据里各抄一遍 push 循环。
     fn many_unstaged(n: usize) -> Gitx {
-        let mut app = filled(3, &layout(PATCH));
+        let mut app = filled(3, &layout(PATCH, false));
         for i in 0..n {
             app.snap.as_mut().unwrap().status.files.push(FileStatus {
                 path: format!("src/overflow/{i}.rs"),
@@ -271,7 +283,7 @@ use crate::viewport;
     /// 仓库给到 6 个、提示给到 30 字，是为了把两条带都塞满——空列表那帧什么都压不到。
     #[test]
     fn the_top_bands_have_no_overlapping_widgets() {
-        let mut app = filled(3, &layout(PATCH));
+        let mut app = filled(3, &layout(PATCH, false));
         for i in 0..6 {
             app.repos.push(Repo {
                 id: None,
@@ -311,7 +323,7 @@ use crate::viewport;
     /// tab 条点一枚 = 开那个仓库。这一条是 #23 的全部行为：列表摊成 tab，点就是开。
     #[test]
     fn a_repo_tab_opens_that_repo() {
-        let mut app = filled(3, &layout(PATCH));
+        let mut app = filled(3, &layout(PATCH, false));
         app.repos.push(Repo {
             id: None,
             path: "/other".to_owned(),
@@ -425,6 +437,17 @@ use crate::viewport;
             .filter(|(r, _)| r.fill != Color32::TRANSPARENT && r.corner_radius != egui::CornerRadius::ZERO)
             .map(|(r, _)| (r.fill, r.rect, r.corner_radius))
             .collect()
+    }
+
+    /// 卡背后那一块：这一帧里**面积最大**的圆角矩形，连底色一起给。
+    /// 按面积取最大是量出来的——卡最少 380×130，而卡里第二大的圆角块是那条输入框（426×26，
+    /// 到了 40pt 高的扩展描述也只有 426×45.6）；改成按颜色取最大就会被淡入那一格乘灰，
+    /// 见 `settled_frame`。
+    fn card_back(out: &egui::FullOutput) -> Option<(Color32, Rect)> {
+        rounded(out)
+            .into_iter()
+            .max_by_key(|(_, r, _)| (r.width() * r.height()) as i64)
+            .map(|(fill, r, _)| (fill, r))
     }
 
     /// 这一帧画出的**只有描边、没有底色**的圆角矩形，连描边颜色一起给。
@@ -988,7 +1011,7 @@ use crate::viewport;
     fn an_equal_length_hunk_reads_as_a_single_range() {
         // 与 `PATCH` 只差 hunk 头：删一行、加一行，新旧都是 4 行。
         const EVEN: &str = "--- a/src/loose.rs\n+++ b/src/loose.rs\n@@ -8,4 +8,4 @@\n 上下文甲\n-删掉的一行\n+加上的一行\n 上下文乙\n 上下文丙\n";
-        let t = texts(&frame(&mut filled(3, &layout(EVEN))));
+        let t = texts(&frame(&mut filled(3, &layout(EVEN, false))));
         let hit = t.iter().find(|(s, _)| s.contains("块 1： 行 8-11"));
         assert!(hit.is_some(), "等长的块没照参考图写成单区间：{:?}", t.iter().map(|(s, _)| s).filter(|s| s.contains("行")).collect::<Vec<_>>());
         let said = &hit.unwrap().0;
@@ -1511,8 +1534,8 @@ use crate::viewport;
 
         // 差异区：只给一条提交，日志那边固定占两行，多出来的都是差异行。
         let (diff_few, diff_many) = (
-            rows(&mut filled(1, &layout(&patch(400)))),
-            rows(&mut filled(1, &layout(&patch(40_000)))),
+            rows(&mut filled(1, &layout(&patch(400), false))),
+            rows(&mut filled(1, &layout(&patch(40_000), false))),
         );
         assert!(diff_few > log_few, "差异区总共才排 {} 行，比日志还少：差异没进帧", diff_few);
         assert_eq!(diff_few, diff_many, "差异 400→40000 行，行数 {diff_few}→{diff_many}：虚拟化失效");
@@ -1549,9 +1572,14 @@ use crate::viewport;
         };
         assert!(!snap.status.branch.is_empty(), "真仓库的当前分支名是空的");
         assert!(!snap.commits.is_empty(), "真仓库一条提交都没有");
-        assert!(!app.busy, "snapshot 都到了，busy 还挂着");
         // 图序列也必须是**这一次 snapshot 一起排好**送回来的，行数跟提交数一一对上。
         assert_eq!(snap.graph.len(), snap.commits.len(), "图序列和提交列表对不上行号");
+        // `open()` 现在还会顺手取一份工作区差异（选中行得和右边对得上，见
+        // `opening_a_dirty_repo_shows_its_working_diff_without_a_click`），所以快照落地
+        // 这一刻 busy 可以是 true——那是第二件事还在途。等它自己清掉、标签自己落下来；
+        // 清不掉就是真卡死，`pump` 600 帧会红。
+        assert!(app.target.is_some(), "开仓库没给差异区派活：选中行和右边对不上");
+        pump(&mut app, |a| !a.busy && !a.patch_label.is_empty());
         // 排布局的线程不是主线程：帧里一次都没排，图序列却已经画得出来了。
         assert_eq!(graph_layouts(), 0, "主线程排了 {} 次图序列：这笔开销又回到帧里了", graph_layouts());
     }
@@ -2004,6 +2032,39 @@ use crate::viewport;
         out
     }
 
+    /// `warm_frame` 那一套，但**时钟在走**：同一个 Context 里连喂 8 帧，`RawInput::time`
+    /// 从 0 涨到 `secs`，取最后一帧。
+    /// 为什么要它：egui 的 `Area` 默认带淡入（area.rs:152 `fade_in: true`，算式在 698），
+    /// 整层颜色按 `(i.time - 这层第一次出现的时间) / global_style().animation_time`（默认 0.2s）
+    /// 乘一遍不透明度。`raw_input` 不给 `time`（留 `None` 时 egui 自己去取墙上时钟），两帧之间
+    /// 只隔几十微秒，所以逐帧问下去那一层**停在淡入的第一格**（实测卡底 255 的白被乘成 60，
+    /// 连遮罩的 80 也只剩 19）——形状在、位置对，颜色不是本来的颜色。要看「淡完那一格」
+    /// 只能把钟拨起来。
+    fn settled_frame(app: &mut Gitx, secs: f64) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        style(&ctx);
+        // 头一帧就是 `warm` 那一遍空跑（`Order::Foreground` 那层要到第二遍才画，见 `warm`），
+        // 时间戳从 0 起：`Area` 把「第一次出现」记在 Context 里，所以这一整套必须共用一个
+        // Context、且**每一帧都给显式 `time`**——留 `None` 会让 egui 自己取墙上时钟，
+        // 那和后面这些 0.05、0.10… 不在同一个刻度上，年龄算出来是负的，淡入永远走不完。
+        let mut out = ctx.run_ui(raw_timed(0.0), |ui| app.shell(ui));
+        out.textures_delta.clear();
+        for i in 1..=8 {
+            let mut next = ctx.run_ui(raw_timed(secs * i as f64 / 8.0), |ui| app.shell(ui));
+            // 换掉上一帧时那份纹理增量得先 `clear`：中缝里没人消费它，留着不放会在 drop 时 panic。
+            next.textures_delta.clear();
+            out = next;
+        }
+        out
+    }
+
+    /// `raw_input` 那一格，但把 egui 的时钟钉在 `secs`（见 `settled_frame` 为什么要钉）。
+    fn raw_timed(secs: f64) -> egui::RawInput {
+        let mut ri = raw_input(Vec::new());
+        ri.time = Some(secs);
+        ri
+    }
+
     /// 无头往输入框里敲字。焦点必须在**同一个 Context** 里拿到（见 `click_at`）。
     /// 喂的是 `Event::Text`：macOS 拼音输入法上屏那一刻交给控件的就是这个事件，
     /// 所以这条走的是真输入路径，不是绕过控件直接改字段。
@@ -2020,6 +2081,106 @@ use crate::viewport;
         .textures_delta
         .clear();
         true
+    }
+
+    // --------------------------------------------------------------- 卡上定位三件套
+    //
+    // 面板上的词和卡里的词撞得很凶：内联提交框的占位文字「提交摘要… (⌘/Ctrl+Enter 提交)」
+    // 把卡里那一格「提交摘要」整个盖在前面，而 `locate` 是**前缀匹配、取 shapes 里第一块**，
+    // 于是会把鼠标送到遮罩上、还以为点中了卡里那一格。所以凡在卡上点东西，一律先把范围
+    // 收到卡片矩形里；按钮那一类再按整串相等（见 `click_card_button` 那段）。
+
+    /// 此刻那张卡的矩形：和 `modal_layer` 用同一份 `card_rect`、同一块无头屏幕。
+    /// 卡片矩形是**算出来的**（`rows()` × 那几条常量），不是从帧里量出来的——所以判据里
+    /// 真量到形状的那条（`the_settings_card_is_the_measured_size`）不靠它，靠帧里的白底那条矩形。
+    fn card_now(app: &Gitx) -> Rect {
+        let m = app.modal.as_ref().expect("判据要在卡上点东西，可这会儿没有打开的卡");
+        card_rect(m, Rect::from_min_size(pos2(0.0, 0.0), vec2(WIN_W, WIN_H)))
+    }
+
+    /// 卡里按文字找落点。范围收在 `card_now` 里，遮罩后面那层的同名词挡不了道。
+    /// `exact` = 整串相等；`foot` = 只看卡脚那一条带子（`modal_layer` 把两枚按钮钉在
+    /// `card.max.y - MODAL_FOOT_H/2`，按钮只可能在那儿）。两个开关都要：提交卡的**标题**就叫
+    /// 「提交」，和主按钮同名，光按整串相等认还是会点到标题上——那一格不吃点击，判据还以为
+    /// 「点了没关 = 产品错了」。
+    fn locate_card(
+        ctx: &egui::Context,
+        app: &mut Gitx,
+        label: &str,
+        exact: bool,
+        foot: bool,
+    ) -> Option<Pos2> {
+        let card = card_now(app);
+        let band = (card.max.y - MODAL_FOOT_H)..=card.max.y;
+        let mut out = ctx.run_ui(raw_input(Vec::new()), |ui| app.shell(ui));
+        let hit = out.shapes.iter().find_map(|c| match &c.shape {
+            egui::Shape::Text(t) => {
+                let text = t.galley.text();
+                let r = t.galley.rect.translate(t.pos.to_vec2());
+                let named = if exact { text == label } else { text.starts_with(label) };
+                let placed = card.contains(r.center()) && (!foot || band.contains(&r.center().y));
+                (named && placed).then_some(r.center())
+            }
+            _ => None,
+        });
+        out.textures_delta.clear();
+        hit
+    }
+
+    /// 在卡上点一项：说明行、勾选框、页签这一类按前缀就够。
+    fn click_card(app: &mut Gitx, label: &str) -> bool {
+        let ctx = warm(app);
+        match locate_card(&ctx, app, label, false, false) {
+            Some(at) => {
+                click_at(&ctx, app, at);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 在卡上点**按钮**（`hunk_button` 那一格落的文字就是按钮名本身）。
+    fn click_card_button(app: &mut Gitx, label: &str) -> bool {
+        let ctx = warm(app);
+        match locate_card(&ctx, app, label, true, true) {
+            Some(at) => {
+                click_at(&ctx, app, at);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 往卡里那一格文本框敲字（喂 `Event::Text`，和 `type_into` 同一条真输入通路）。
+    fn type_into_card(app: &mut Gitx, hint: &str, text: &str) -> bool {
+        let ctx = warm(app);
+        let Some(at) = locate_card(&ctx, app, hint, false, false) else { return false };
+        click_at(&ctx, app, at);
+        ctx.run_ui(
+            raw_input(vec![egui::Event::PointerMoved(at), egui::Event::Text(text.to_owned())]),
+            |ui| app.shell(ui),
+        )
+        .textures_delta
+        .clear();
+        true
+    }
+
+    /// 卡上画没画出这个词（前缀）。第二遍才有卡，所以走 `warm`。
+    fn card_has(app: &mut Gitx, label: &str) -> bool {
+        let ctx = warm(app);
+        locate_card(&ctx, app, label, false, false).is_some()
+    }
+
+    /// 卡脚上画没画出那枚**按钮**（整串相等 + 落在卡脚那一条带子里）。
+    fn card_has_button(app: &mut Gitx, label: &str) -> bool {
+        let ctx = warm(app);
+        locate_card(&ctx, app, label, true, true).is_some()
+    }
+
+    /// 从 tab 条上那枚「添加仓库」端出卡片。
+    fn open_add_card(app: &mut Gitx) {
+        assert!(click_text(app, "添加仓库"), "tab 条上没有「添加仓库」");
+        assert!(app.modal.is_some(), "点了「添加仓库」没开出卡");
     }
 
     /// ⌘/Ctrl+Enter。修饰键要**单独发一条 `ModifiersChanged`**——egui 的 `i.modifiers` 只由那条
@@ -2159,6 +2320,49 @@ use crate::viewport;
             git_in(&dir, &["show", "HEAD:a.txt"]).contains("第二行"),
             "已暂存的内容没并进 amend 后的 HEAD"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 整份差异里有多个文件时，每个文件前有一条文件头带；点它只折叠自己名下的行，
+    /// 再点一次展开。整份补丁不画文件头的话，两个文件的首尾是连着的，分不出哪儿换了文件。
+    #[test]
+    fn a_multi_file_diff_folds_one_file_at_a_time() {
+        let (mut app, dir) = open_repo("fold");
+        // 造第二个未暂存文件：先入库、再改，这样 `git diff` 里才有它。
+        std::fs::write(dir.join("b.txt"), "b 一行\n").unwrap();
+        git_in(&dir, &["add", "b.txt"]);
+        std::fs::write(dir.join("b.txt"), "b 一行\nb 第二行\n").unwrap();
+        // a.txt 上一批的改动已经暂存，再改一次，让它在未暂存差异里也有一块。
+        std::fs::write(dir.join("a.txt"), "一行\n第二行\n第三行\n").unwrap();
+
+        app.request(Target::Working { staged: false, path: None, untracked: false });
+        pump(&mut app, |a| a.diff.iter().filter(|l| l.kind == Kind::File).count() == 2);
+
+        let headers: Vec<&str> = app
+            .diff
+            .iter()
+            .filter(|l| l.kind == Kind::File)
+            .map(|l| l.text.as_str())
+            .collect();
+        assert_eq!(headers, ["a.txt", "b.txt"], "两个文件该各有一条文件头");
+
+        let t = texts(&frame(&mut app));
+        assert!(t.iter().any(|(s, _)| s.contains("第三行")), "a.txt 的改动没画出来");
+        assert!(t.iter().any(|(s, _)| s.contains("b 第二行")), "b.txt 的改动没画出来");
+
+        let before = app.diff_rows.len();
+        assert!(click_text(&mut app, "文件  a.txt"), "找不到 a.txt 的文件头带");
+        assert!(app.collapsed.contains(&1), "点了 a.txt 的文件头但它没被折叠");
+        assert!(app.diff_rows.len() < before, "折叠之后可见行没变少");
+        let t = texts(&frame(&mut app));
+        assert!(!t.iter().any(|(s, _)| s.contains("第三行")), "折叠了 a.txt，它的内容还画着");
+        assert!(t.iter().any(|(s, _)| s.contains("b 第二行")), "折叠 a.txt 把 b.txt 也藏了");
+        assert!(t.iter().any(|(s, _)| s.contains("已折叠  a.txt")), "折叠后文件头没换文案");
+
+        assert!(click_text(&mut app, "已折叠  a.txt"), "折叠后的文件头带点不到");
+        assert!(!app.collapsed.contains(&1), "再点一次没有展开");
+        let t = texts(&frame(&mut app));
+        assert!(t.iter().any(|(s, _)| s.contains("第三行")), "展开之后 a.txt 的内容没回来");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2503,7 +2707,7 @@ use crate::viewport;
         assert!(filter_text(&mut app, TOPO_ORDER).is_some(), "换了排序，按钮上还是旧那一项");
         assert_eq!(filter_text(&mut app, DATE_ORDER), None, "按钮上两档同时出现：文案没跟着换");
         popup_pick(&mut app, TOPO_ORDER, DATE_ORDER);
-        assert!(!app.topo, "点「日期顺序」没换回来");
+        assert!(!app.topo, "点「{DATE_ORDER}」没换回来");
         pump(&mut app, |a| a.snap.is_some() && !a.topo);
         let _ = dir;
     }
@@ -2521,7 +2725,7 @@ use crate::viewport;
                 .unwrap_or_else(|| panic!("筛选条上没有「{label}」这枚按钮"));
             t[label.len()..].chars().filter(|c| !c.is_whitespace()).count()
         };
-        for label in [ALL_BRANCHES, SHOW_REMOTE, DATE_ORDER] {
+        for label in [CURRENT_BRANCH, SHOW_REMOTE, DATE_ORDER] {
             assert_eq!(marks(label), 1, "「{label}」那枚的第二层标记不是一枚");
         }
         assert_eq!(marks("紧凑视图"), 0, "还没接的那枚不该带标记");
@@ -2530,13 +2734,49 @@ use crate::viewport;
         assert_eq!(app.note.as_deref(), Some("egui 版还没接：紧凑视图"), "点没接的那枚该说实话");
     }
 
-    /// 「所有分支」点开列本地分支，选中一条 = `git log <那条分支>`：只有它走得到的提交才留下。
-    /// 支线从**初始提交**分出去、主线再往前走一步，于是两条线各有一个对面拿不到的提交——
-    /// 拿长度当判据不行（两边都是 2 条），只能比**提交主题**。
-    /// 结尾用 `git rev-list --count` 复核长度，不听 app 自己的证词。
+    /// 四条官方文案**逐字**钉住。字面量写死在这条判据里、**不引用** `widgets.rs` 那几个常量：
+    /// 引用常量的话把常量改成任何别的字都照样绿（方法论第 1 条「常量自比」）。
+    /// 出处 = 本机 SourceTree 4.2.19 `Contents/Resources/zh_CN.lproj/Localizable.strings`
+    /// （UTF-16LE，得 `iconv -f UTF-16 -t UTF-8` 才搜得到）：
+    /// `LogDateOrder`=按日期排序、`JumpToRevisionLabelGit`=转到Commit的SHA-1、
+    /// `PendingFiles`+`SortedByPath`=待定的文件, 已依照路径排序、`LogBranchesCurrent`=当前分支。
+    /// 正向按**整串相等**比：「已依照路径排序」是「已依照路径 (反向) 排序」的子串，
+    /// 反向按 `contains` 比：旧自创文案以任何形式回潮都该看得见。
     #[test]
-    fn the_scope_menu_walks_only_the_picked_branch() {
-        let (mut app, dir) = open_repo("scope-side-branch");
+    fn the_filter_bar_and_summary_carry_the_official_strings() {
+        let (mut app, dir) = open_repo("official-strings");
+        let out = frame(&mut app);
+        let t = texts(&out).into_iter().map(|(s, _)| s).collect::<Vec<_>>();
+        for want in [
+            "按日期排序 ▼",
+            "当前分支 ▼",
+            "转到Commit的SHA-1",
+            "待定的文件, 已依照路径排序",
+        ] {
+            assert!(t.iter().any(|s| s == want), "没有整串「{want}」，这一帧画的是：{t:?}");
+        }
+        // 我们自己的旧说法一条都不许留下（「日期顺序」是我们自己写的，官方没这四个字）。
+        for gone in ["日期顺序", "跳转到:", "按路径排序"] {
+            assert!(!t.iter().any(|s| s.contains(gone)), "自创文案回潮「{gone}」：{t:?}");
+        }
+        let _ = dir;
+    }
+
+    /// 开仓默认那档 = 当前分支。**这条读的是配置对象而不是画布**（方法论第 11 条）：
+    /// 无头夹具自己填 `Gitx` 的字段，产品构造函数里那一位在帧里根本读不到。
+    /// 和核心层 `commits()` == `commits_on(HEAD)` 是一对：一条钉壳的默认，一条钉核心的默认。
+    #[test]
+    fn the_log_opens_on_the_current_branch() {
+        assert_eq!(crate::ui::app::default_scope(), git::Scope::Current, "开仓默认没走当前分支");
+    }
+
+    /// 筛选条最左那枚是**三档**：所有分支（`--all`）/ 当前分支（不传范围，走 HEAD）/
+    /// 具体分支（把它当位置参数传给 `git log`）。前两档是 SourceTree 的官方两态，第三档是我们加的。
+    /// 支线从**初始提交**分出去、主线再往前走一步，于是两条线各有一个对面拿不到的提交——
+    /// 拿长度当判据不行（两边都是 2 条），只能比**提交主题**，每档再拿 `git rev-list` 复核一次长度。
+    #[test]
+    fn the_scope_menu_switches_between_all_branches_and_the_current_one() {
+        let (mut app, dir) = open_repo("scope-three-arm");
         let base = git_in(&dir, &["branch", "--show-current"]);
         git_in(&dir, &["checkout", "-q", "-b", "side"]);
         std::fs::write(dir.join("side.txt"), "侧\n").unwrap();
@@ -2550,23 +2790,39 @@ use crate::viewport;
         let path = dir.to_str().expect("utf-8 路径").to_owned();
         app.open(&path);
         pump(&mut app, |a| line_of(a).contains(&"只在主线".to_owned()));
-        assert_eq!(app.log_rev, None, "默认不该带 rev");
+        // 默认那一档 = 当前分支。**这一条同时钉住"没把默认偷偷换成 --all"**：
+        // 换成 --all 的话支线的提交会在第一帧就出现在列表里。
+        assert_eq!(app.scope, git::Scope::Current, "默认不该带范围");
+        assert!(filter_text(&mut app, CURRENT_BRANCH).is_some(), "按钮上没写「当前分支」");
         assert!(!line_of(&app).contains(&"只在支线".to_owned()), "HEAD 那条线里不该有支线的提交");
 
+        popup_pick(&mut app, CURRENT_BRANCH, ALL_BRANCHES);
+        assert_eq!(app.scope, git::Scope::All, "菜单里点「所有分支」没落到范围上");
+        assert!(app.busy && app.snap.is_none(), "换了范围没重取列表：日志会停在旧范围上");
+        pump(&mut app, |a| a.snap.is_some() && a.scope == git::Scope::All);
+        let l = line_of(&app);
+        for want in ["只在主线", "只在支线"] {
+            assert!(l.contains(&want.to_owned()), "「所有分支」那一档没有「{want}」：{l:?}");
+        }
+        let want = git_in(&dir, &["rev-list", "--all", "--count"]).parse::<usize>().expect("数字");
+        assert_eq!(l.len(), want, "所有分支的条数和仓库里的对不上：app 说 {l:?}");
+        assert!(filter_text(&mut app, ALL_BRANCHES).is_some(), "换了档，按钮上还是旧那一项");
+        assert_eq!(filter_text(&mut app, CURRENT_BRANCH), None, "按钮上两档同时出现：文案没跟着换");
+
         popup_pick(&mut app, ALL_BRANCHES, "side");
-        assert_eq!(app.log_rev.as_deref(), Some("side"), "菜单里点了分支没落到范围上");
-        pump(&mut app, |a| a.snap.is_some() && a.log_rev.as_deref() == Some("side"));
+        assert_eq!(app.scope, git::Scope::Rev("side".to_owned()), "菜单里点了分支没落到范围上");
+        pump(&mut app, |a| a.snap.is_some() && a.scope == git::Scope::Rev("side".to_owned()));
         let l = line_of(&app);
         assert!(l.contains(&"只在支线".to_owned()), "按支线筛完，列表里没有支线独有的提交：{l:?}");
         assert!(!l.contains(&"只在主线".to_owned()), "支线列表里混进了只有主线走得到的提交：{l:?}");
         let want = git_in(&dir, &["rev-list", "--count", "side"]).parse::<usize>().expect("数字");
         assert_eq!(l.len(), want, "列表长度和仓库里的对不上：app 说 {l:?}");
 
-        // 点回「所有分支」= 范围清空，回到 HEAD 那条线。
-        popup_pick(&mut app, "side", ALL_BRANCHES);
-        assert_eq!(app.log_rev, None, "点「所有分支」没把范围清空");
-        pump(&mut app, |a| a.snap.is_some() && a.log_rev.is_none());
-        assert!(!line_of(&app).contains(&"只在支线".to_owned()), "回到「所有分支」还留着支线");
+        // 回到「当前分支」= 范围清空，支线的提交得再消失一次。
+        popup_pick(&mut app, "side", CURRENT_BRANCH);
+        assert_eq!(app.scope, git::Scope::Current, "点「当前分支」没把范围清空");
+        pump(&mut app, |a| a.snap.is_some() && a.scope == git::Scope::Current);
+        assert!(!line_of(&app).contains(&"只在支线".to_owned()), "回到「当前分支」还留着支线");
     }
 
     /// 「显示远程分支」那一枚**只决定远程药丸画不画**：不重取列表（`git log` 的参数一个字没动，
@@ -3116,6 +3372,176 @@ use crate::viewport;
         assert!(first > gutter_right, "正文起点 {first} 没让出两个行号栏（右缘 {gutter_right}）");
     }
 
+    /// 宽度账本：ASCII 1 格、CJK 2 格、制表符 4 格（egui 不认制表位，保守按四个空格算）。
+    /// 差异区能往右滚多远全靠这个数，**估窄了行尾就永远滚不到**。
+    #[test]
+    fn the_column_ruler_counts_double_wide_glyphs() {
+        assert_eq!(columns("abc"), 3);
+        assert_eq!(columns("中文字"), 6);
+        assert_eq!(columns("\tab"), 6);
+        assert_eq!(columns(""), 0);
+    }
+
+    /// 在差异区里横向滚一把，返回滚之前/滚停之后那一行的**落点 x**，再加上滚停之后那一帧
+    /// 画出的所有文字——「区块按钮跟着内容跑出屏幕没有」只能问最后一帧。
+    /// 规矩和 `scroll_log` 一模一样：`ScrollArea` 只吃**指针悬停在那一块**的滚轮，
+    /// 一次离散的滚轮事件还要摊到后面几十帧才放得完。
+    fn scroll_diff_x(app: &mut Gitx, needle: &str, dx: f32) -> (f32, f32, Vec<(String, Pos2)>) {
+        let ctx = egui::Context::default();
+        style(&ctx);
+        let over_diff = pos2(
+            (SIDEBAR_W + FILES_W + WIN_W) / 2.0,
+            WIN_H - STATUS_H - STAGING_H + DIFF_HEAD_H + 12.0,
+        );
+        let hover = vec![egui::Event::PointerMoved(over_diff)];
+        let raw = |time: f64, events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(WIN_W, WIN_H))),
+            time: Some(time),
+            events,
+            ..Default::default()
+        };
+        let at = |out: &egui::FullOutput| -> f32 {
+            out.shapes
+                .iter()
+                .find_map(|c| match &c.shape {
+                    egui::Shape::Text(t) if t.galley.text() == needle => Some(t.pos.x),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("差异区里没画出那一行（要找 {needle:?}）"))
+        };
+        let mut out = ctx.run_ui(raw(0.0, hover.clone()), |ui| app.shell(ui));
+        let before = at(&out);
+        out.textures_delta.clear();
+        let mut after = before;
+        let mut last = Vec::new();
+        for i in 0..40 {
+            let events = if i == 0 {
+                vec![
+                    egui::Event::PointerMoved(over_diff),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: vec2(-dx, 0.0),
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Wheel,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ]
+            } else {
+                hover.clone()
+            };
+            let mut f = ctx.run_ui(raw(0.016 * (i as f64 + 1.0), events), |ui| app.shell(ui));
+            after = at(&f);
+            last = texts(&f);
+            f.textures_delta.clear();
+        }
+        (before, after, last)
+    }
+
+    /// 那一行到底**落了几个字**。`galley.text()` 问不出这件事：它返回原始整句，被切掉的
+    /// 尾巴照样留在字符串里（第一版判据拿它比全文，`.truncate()` 变异下去还是绿的）。
+    /// 要看 `elided`（宽度不够时 epaint 会置位）和各行真有的 glyph 数。
+    /// 返回 `(落点 x, 切过没有, 落笔字数, 排版出来的宽度)`。
+    fn laid_out(out: &egui::FullOutput, needle: &str) -> (f32, bool, usize, f32) {
+        out.shapes
+            .iter()
+            .find_map(|c| match &c.shape {
+                egui::Shape::Text(t) if t.galley.text() == needle => Some((
+                    t.pos.x,
+                    t.galley.elided,
+                    t.galley.rows.iter().map(|r| r.glyphs.len()).sum(),
+                    t.galley.size().x,
+                )),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("这一帧没画出那一行（要找 {needle:?}）"))
+    }
+
+    /// 差异区要能**往右看**：一行比这一格宽的时候，行尾不许只剩三个点——整行必须落笔，
+    /// 底色条要跟着最长那行铺满，横向滚一把之后尾巴进得来这一格
+    /// （用户 2026-10-23：「右侧，文件改动详情不能往右查看内容（目前只有三个点省略）」）。
+    /// 宽度那笔账走**真通路**算：`request()` → 后台线程 → `Msg::Patch`。夹具直接填
+    /// `diff_cols` 那种写法测不到这一位，改坏生产代码也不会红。
+    #[test]
+    fn a_long_diff_line_can_be_scrolled_to_its_end() {
+        let (mut app, dir) = open_repo("diff-scroll");
+        let tail = "行尾那几个字";
+        std::fs::write(dir.join("a.txt"), format!("{}\n", "宽".repeat(300) + tail)).unwrap();
+        app.request(Target::Working { staged: false, path: Some("a.txt".to_owned()), untracked: false });
+        pump(&mut app, |a| !a.diff.is_empty());
+        let want = app
+            .diff
+            .iter()
+            .map(|l| l.text.clone())
+            .find(|s| s.ends_with(tail))
+            .expect("补丁里没有那行长内容");
+
+        // 1) 整行真的落了笔，没有被收成三个点。
+        let out = frame(&mut app);
+        let (x, elided, glyphs, w) = laid_out(&out, &want);
+        assert!(!elided, "那一行被切掉了尾巴（{glyphs}/{} 个字落笔）", want.chars().count());
+        assert_eq!(glyphs, want.chars().count(), "那一行只落笔了 {glyphs} 个字");
+
+        // 2) 增行的底色条要铺到那一行的**排版右缘**——这就是 `diff_cols` 唯一该管的活。
+        //    条子短了，滚到右边是半截白。`rects()` 拿的是和 clip 求交后的值，这里必须用
+        //    没裁过的原矩形，否则尾巴本来就在格子外，判据永远只能等于视口右缘。
+        let mut raw: Vec<(&egui::epaint::RectShape, Rect)> = Vec::new();
+        for c in &out.shapes {
+            collect_rects(&c.shape, c.clip_rect, &mut raw);
+        }
+        let band_right = raw
+            .iter()
+            .filter(|(r, _)| r.fill == ADD_BG)
+            .map(|(r, _)| r.rect.max.x)
+            .fold(f32::MIN, f32::max);
+        assert!(
+            band_right >= x + w - 1.0,
+            "底色条只铺到 {band_right}，那一行的尾巴在 {}：行宽那笔账没跟着最长行撑开",
+            x + w
+        );
+
+        // 3) 滚一把：整行的落点往左走那么多，行尾才进得来这一格。
+        let dx = 200.0;
+        let (before, after, last) = scroll_diff_x(&mut app, &want, dx);
+        assert!(
+            (after - (before - dx)).abs() < 1.0,
+            "横向滚 {dx}pt，那一行从 {before} 只走到 {after}：内容根本没跟着滚（或压根没撑开）"
+        );
+
+        // 4) 滚过之后「只动这一块」那两枚还得在**看得见**的那一格裡：它们钉的是视口右缘，
+        //    不是内容右缘。钉错了行照样滚得动，按钮却跟着跑到屏幕外、再也点不到——
+        //    短补丁测不出来（内容根本没超过视口），必须拿这一行长行来测。
+        let pane_left = SIDEBAR_W + FILES_W;
+        let p = last
+            .iter()
+            .find(|(s, _)| s == "暂存区块")
+            .map(|(_, p)| *p)
+            .unwrap_or_else(|| panic!("滚到右边之后连「暂存区块」都没画出来：{last:?}"));
+        assert!(
+            p.x > pane_left && p.x < WIN_W - HUNK_BTN_EDGE,
+            "区块按钮滚完落在 {}，看得见的格子是 {pane_left}..{WIN_W}：它跟着内容跑出去了",
+            p.x
+        );
+    }
+
+    /// 只 `open()`、一下都没点：日志第一行「Uncommitted changes」是选中态，右边就得是
+    /// 工作区的差异。真窗口拍到的是「没有差异」（2026-10-23 16:16），而无头判据全绿——
+    /// 它们全都先点一行再看，没人看过只开不开点的壳。这条就是补那个视角。
+    #[test]
+    fn opening_a_dirty_repo_shows_its_working_diff_without_a_click() {
+        let dir = scratch_repo("open-diff");
+        // `scratch_repo` 那处改动是**已暂存**的，未暂存差异是空的；再补一层没暂存的改动。
+        std::fs::write(dir.join("a.txt"), "一行\n第二行\n这行没暂存\n").unwrap();
+        let mut app = blank();
+        app.open(dir.to_str().unwrap());
+        pump(&mut app, |a| !a.diff.is_empty());
+        assert!(matches!(app.sel, Sel::Uncommitted), "选中态自己挪走了：{:?}", app.sel);
+        let painted = texts(&frame(&mut app));
+        assert!(
+            !painted.iter().any(|(s, _)| s == "没有差异"),
+            "开完仓库右边还写着「没有差异」：{painted:?}"
+        );
+    }
+
     /// 新克隆的数据库是空的，`repos` 也就是空的——这一条钉的是「空列表不是死路」：
     /// 工具栏上必须有一个能点的入口，填个路径就能开出仓库来。
     /// 填的是仓库里的**子目录**（`src`），顺带钉住「往上走到仓库根」那一步。
@@ -3125,29 +3551,41 @@ use crate::viewport;
         let sub = dir.join("src");
         std::fs::create_dir_all(&sub).expect("造子目录");
         let mut app = blank();
-        assert!(click_text(&mut app, "添加仓库"), "工具栏上没有「添加仓库」，空书签列表就没有入口");
-        assert!(type_into(&mut app, "仓库路径…", sub.to_str().unwrap()), "输入框没画出来");
-        assert!(click_text(&mut app, "打开"), "路径填了但「打开」没出现");
+        open_add_card(&mut app);
+        assert!(card_has(&mut app, "打开已有"), "卡上那三档没画出来");
+        assert!(card_has_button(&mut app, "添加"), "第一档「打开已有」的主按钮不是「添加」");
+        assert!(
+            type_into_card(&mut app, "已有仓库的路径", sub.to_str().unwrap()),
+            "卡里那一格文本框没画出来"
+        );
+        assert!(click_card_button(&mut app, "添加"), "「添加」那枚没点到");
         pump(&mut app, |a| a.snap.is_some());
         assert_eq!(app.repo.as_deref(), Some(dir.to_str().unwrap()), "填子目录没走到仓库根");
         assert_eq!(app.repos.len(), 1, "开起来的仓库没进书签列表");
-        assert!(!app.add_open && app.add_path.is_empty(), "添加完成后那条输入没收起来");
+        assert!(app.modal.is_none(), "仓库都开起来了，那张卡还盖在上面");
     }
 
-    /// 拒绝的那条路要留得下来改：给提示、不清空、不收起，更不能把仓库登记进去。
+    /// 拒绝的那条路要留得下来改：给提示、不关卡、不清空，更不能把仓库登记进去。
+    /// 「不关卡」这一条走的是 `land` 那个返回值 —— 填错一个字母不该从头再打一遍路径。
     #[test]
     fn a_path_that_is_not_a_repo_is_refused_without_touching_the_list() {
         let mut app = blank();
-        assert!(click_text(&mut app, "添加仓库"));
-        assert!(type_into(&mut app, "仓库路径…", "/definitely/not/a/repo-20261020"));
-        assert!(click_text(&mut app, "打开"));
+        open_add_card(&mut app);
+        let bad = "/definitely/not/a/repo-20261020";
+        assert!(type_into_card(&mut app, "已有仓库的路径", bad));
+        assert!(click_card_button(&mut app, "添加"));
         assert!(
             app.note.as_deref().unwrap_or_default().contains("不是仓库"),
             "拒了一条还没给提示：{:?}",
             app.note
         );
         assert!(app.repos.is_empty() && app.repo.is_none(), "不是仓库的路径被登记进去并打开了");
-        assert!(app.add_open && !app.add_path.is_empty(), "被拒后把输入清空了，用户没法改完再来");
+        let m = app.modal.as_ref().expect("拒了一条就把卡关了，打错的那串路径跟着没了");
+        assert!(
+            matches!(m.form, Form::AddRepo { tab: AddTab::Open, .. }),
+            "卡留下了，但换成了另一张"
+        );
+        assert_eq!(m.text.as_deref(), Some(bad), "卡留下了却把输入清空，等于让用户从头打一遍");
     }
 
     /// 书签要**落库**：只在内存里记一份的话重启就没了，而这条通路 core 那边早就有函数，
@@ -3161,9 +3599,9 @@ use crate::viewport;
         app.conn = Some(
             db::open(db_dir.join("gate.db").to_str().unwrap()).expect("临时库"),
         );
-        app.add_open = true;
-        app.add_path = dir.to_str().unwrap().to_owned();
-        assert!(click_text(&mut app, "打开"));
+        open_add_card(&mut app);
+        assert!(type_into_card(&mut app, "已有仓库的路径", dir.to_str().unwrap()));
+        assert!(click_card_button(&mut app, "添加"));
         pump(&mut app, |a| a.snap.is_some());
         let listed = db::list_repos(app.conn.as_ref().unwrap()).expect("读回来");
         assert_eq!(
@@ -3171,6 +3609,48 @@ use crate::viewport;
             1,
             "书签只进了内存，没进库：{listed:?}"
         );
+    }
+
+    /// 那三档不是装饰：换一档，占位文字、主按钮、卡的高度都得跟着换。
+    /// 克隆那一档独有一格「目标目录」，所以它比另两档高一整行；这一条同时钉住
+    /// 「高度这笔账真跟着表单走」（`rows()` 里那条 `+Clone`）。
+    #[test]
+    fn the_add_repo_card_tabs_change_what_the_field_asks_for() {
+        let mut app = blank();
+        open_add_card(&mut app);
+        let open_h = card_now(&app).height();
+        assert!(click_card(&mut app, "克隆到本地"), "三档里没有「克隆到本地」");
+        assert!(card_has(&mut app, "源仓库地址"), "换到克隆档，第一格还问的是本地路径");
+        assert!(card_has(&mut app, "目标目录"), "克隆档没端出第二格");
+        assert!(card_has_button(&mut app, "克隆"), "克隆档的主按钮不是「克隆」");
+        let clone_h = card_now(&app).height();
+        assert_eq!(clone_h - open_h, MODAL_ROW_H, "多那一格没让卡长高：{open_h} → {clone_h}");
+        assert!(click_card(&mut app, "新建仓库"), "三档里没有「新建仓库」");
+        assert!(card_has(&mut app, "新仓库的目录"), "换到新建档，第一格还问的是源地址");
+        assert!(card_has_button(&mut app, "创建"), "新建档的主按钮不是「创建」");
+        assert_eq!(card_now(&app).height(), open_h, "新建档该和打开档一样高");
+        assert!(!card_has(&mut app, "目标目录"), "换出克隆档了，第二格还赖在卡上");
+    }
+
+    /// 「新建仓库」那一档：填一个**连前导目录都还不存在**的路径 → 真 `git init` →
+    /// 地上有了 `.git`、书签里多一条、tab 开到它上面。复核问的是磁盘，不是 app 的说法。
+    #[test]
+    fn the_new_repo_tab_initializes_a_directory_and_opens_it() {
+        let root = std::env::temp_dir().join(format!("gitx-init-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let fresh = root.join("brand/new");
+        let mut app = blank();
+        open_add_card(&mut app);
+        assert!(click_card(&mut app, "新建仓库"));
+        assert!(type_into_card(&mut app, "新仓库的目录", fresh.to_str().unwrap()));
+        assert!(click_card_button(&mut app, "创建"), "「创建」那枚没点到");
+        pump(&mut app, |a| a.snap.is_some());
+        assert!(fresh.join(".git").exists(), "落地的目录里没有 .git：{fresh:?}");
+        assert_eq!(app.repo.as_deref(), Some(fresh.to_str().unwrap()), "新建完没把 tab 开上去");
+        assert_eq!(app.repos.len(), 1, "新建的仓库没进书签");
+        assert!(app.modal.is_none(), "仓库都建好了，卡还盖着");
+        assert!(app.note.is_none(), "路上报了 note：{}", app.note.clone().unwrap_or_default());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // ------------------------------------------------------ 卡片 / 右键菜单
@@ -3486,20 +3966,120 @@ use crate::viewport;
         assert_ne!(tagged, git_in(&dir, &["rev-parse", "HEAD"]), "标签打到了 HEAD 上");
     }
 
-    /// 贮藏的来回：卡里存进去 → 侧栏那一栏右键丢出来。顺手钉确认闸对贮藏也生效。
-    #[test]
-    fn a_stash_round_trips_through_the_sidebar() {
-        let (mut app, dir) = open_repo("card-stash");
+    /// 用界面存一条贮藏（工具条「贮藏」→ 卡 → 敲说明 → 回车），等它进侧栏。
+    /// 三条贮藏判据共用这一段前戏，不在每一条里各抄一遍。
+    fn stash_one(tag: &str, message: &str) -> (Gitx, std::path::PathBuf) {
+        let (mut app, dir) = open_repo(tag);
         click_tool(&mut app, 6);
-        assert!(type_into(&mut app, "贮藏说明", "先收起来"), "贮藏卡里那格输入框没找到");
+        assert!(type_into(&mut app, "贮藏说明", message), "贮藏卡里那格输入框没找到");
         press(&mut app, egui::Key::Enter);
         pump(&mut app, |a| a.snap.as_ref().map(|s| s.stashes.len()).unwrap_or(0) == 1);
+        (app, dir)
+    }
+
+    /// 贮藏的来回：卡里存进去 → 侧栏那一栏右键丢出来。顺手钉确认闸对贮藏也生效。
+    /// 菜单挂在**说明**那一行上：`stash@{0}:` 这层包装已经从名字里拿掉了。
+    #[test]
+    fn a_stash_round_trips_through_the_sidebar() {
+        let (mut app, dir) = stash_one("card-stash", "先收起来");
         assert!(git_in(&dir, &["stash", "list"]).contains("先收起来"));
-        menu_pick(&mut app, "stash@{0}", "丢弃这条贮藏");
+        menu_pick(&mut app, "先收起来", "丢弃这条贮藏");
         assert!(app.modal.is_some(), "丢弃贮藏没先问一句");
         assert!(click_warm(&mut app, "确定"));
         pump(&mut app, |a| a.snap.as_ref().map(|s| s.stashes.is_empty()).unwrap_or(false));
         assert_eq!(git_in(&dir, &["stash", "list"]), "");
+    }
+
+    /// 连着存两条：新那条顶上来当 `stash@{0}`，早那条退成 `stash@{1}`。
+    /// 只有这种情形测得出「下标会挪」——只存一条时列表会清空，`Msg::Loaded` 的越界回退
+    /// 抢先把选中改回工作区，那条判据对真正的 bug 是假绿。
+    fn stash_two(tag: &str, first: &str, second: &str) -> (Gitx, std::path::PathBuf) {
+        let (mut app, dir) = stash_one(tag, first);
+        std::fs::write(dir.join("a.txt"), "第二版内容\n").unwrap();
+        click_tool(&mut app, 6);
+        assert!(type_into(&mut app, "贮藏说明", second), "贮藏卡里那格输入框没找到");
+        press(&mut app, egui::Key::Enter);
+        pump(&mut app, |a| a.snap.as_ref().map(|s| s.stashes.len()).unwrap_or(0) == 2);
+        (app, dir)
+    }
+
+    /// 侧栏那一行**只写用户自己那句说明**：`stash@{0}: ` 是列表的包装、
+    /// `On <分支>: ` 是 git 的包装，两截都不该出现在名字里
+    /// （用户 2026-10-23：「stash名字去掉前缀'stash@{0}: On'」）。
+    #[test]
+    fn a_stash_row_is_named_by_its_own_message() {
+        let (mut app, _) = stash_one("stash-label", "先看名字");
+        let out = frame(&mut app);
+        let t = texts(&out);
+        assert!(t.iter().any(|(s, _)| s == "先看名字"), "侧栏那一行不是光秃秃的说明：{t:?}");
+        let junk: Vec<&String> = t
+            .iter()
+            .map(|(s, _)| s)
+            .filter(|s| s.contains("stash@{") || s.contains("On "))
+            .collect();
+        assert!(junk.is_empty(), "贮藏名字里还带着包装：{junk:?}");
+    }
+
+    /// 「点开看内容」：侧栏那一行一按，左边换出这条贮藏改了哪些文件、右边换出它的补丁。
+    /// 全程走**真通路**（真仓库、真 git、后台线程），不是往字段里塞假数据。
+    #[test]
+    fn clicking_a_stash_row_opens_its_changes() {
+        let (mut app, _) = stash_one("stash-open", "点开看内容");
+        assert!(click_text(&mut app, "点开看内容"), "侧栏没有那条贮藏");
+        pump(&mut app, |a| {
+            matches!(a.sel, Sel::Stash(0)) && !a.commit_files.is_empty() && !a.diff.is_empty()
+        });
+        assert!(
+            app.commit_files.iter().any(|f| f.path == "a.txt"),
+            "这条贮藏的改动列表里没有 a.txt：{:?}",
+            app.commit_files.iter().map(|f| f.path.clone()).collect::<Vec<_>>()
+        );
+        assert!(app.patch_label.contains("贮藏的全部改动"), "右侧那格的标题不是贮藏：{}", app.patch_label);
+        assert!(
+            app.diff.iter().any(|l| l.text.contains("第二行")),
+            "补丁里没有这条贮藏收起来的那一行：{:?}",
+            app.diff.iter().map(|l| l.text.clone()).collect::<Vec<_>>()
+        );
+        let t = texts(&frame(&mut app));
+        assert!(
+            t.iter().any(|(s, _)| s.contains("这条贮藏改了 1 个文件")),
+            "文件表那格的说明还在按提交说话：{t:?}"
+        );
+        assert!(!t.iter().any(|(s, _)| s.contains("这个提交改了")), "贮藏那一栏套了提交的文案：{t:?}");
+    }
+
+    /// 弹出/丢弃之后那条贮藏没了，`stash@{n}` 的后一位会顶上来。继续按旧下标看
+    /// 就会静默换成**另一条**贮藏，所以选中项必须回工作区。
+    #[test]
+    fn dropping_a_stash_does_not_leave_the_next_one_selected() {
+        let (mut app, _) = stash_one("stash-drop-sel", "丢掉看选中");
+        assert!(click_text(&mut app, "丢掉看选中"), "侧栏没有那条贮藏");
+        pump(&mut app, |a| matches!(a.sel, Sel::Stash(0)));
+        menu_pick(&mut app, "丢掉看选中", "丢弃这条贮藏");
+        assert!(click_warm(&mut app, "确定"));
+        pump(&mut app, |a| a.snap.as_ref().map(|s| s.stashes.is_empty()).unwrap_or(false));
+        assert!(matches!(app.sel, Sel::Uncommitted), "丢完之后还停在贮藏那一档：{:?}", app.sel);
+    }
+
+    /// 丢掉的**正是当前选中那一条**时，选中必须回工作区：剩下那条会挪进 `stash@{0}`，
+    /// 下标没变、内容换了人，差异区于是静默展示另一条贮藏。两条才测得出挪位
+    /// （一条时列表清空，回退替我把选中改掉了——那是假绿，见 `stash_two`）。
+    #[test]
+    fn dropping_the_selected_stash_does_not_shift_another_one_under_it() {
+        let (mut app, dir) = stash_two("stash-drop-shift", "头一条", "第二条");
+        assert_eq!(app.snap.as_ref().unwrap().stashes[0].message, "第二条");
+        assert!(click_text(&mut app, "第二条"), "侧栏没有那条贮藏");
+        pump(&mut app, |a| matches!(a.sel, Sel::Stash(0)));
+        menu_pick(&mut app, "第二条", "丢弃这条贮藏");
+        assert!(click_warm(&mut app, "确定"));
+        pump(&mut app, |a| a.snap.as_ref().map(|s| s.stashes.len()).unwrap_or(9) == 1);
+        assert_eq!(git_in(&dir, &["stash", "list"]).lines().count(), 1, "丢的不是「第二条」");
+        assert_eq!(app.snap.as_ref().unwrap().stashes[0].message, "头一条");
+        assert!(
+            matches!(app.sel, Sel::Uncommitted),
+            "丢完还停在旧下标：{} 挪到了 stash@{{0}} 顶上，看着像同一条、其实换了人",
+            app.snap.as_ref().unwrap().stashes[0].message
+        );
     }
 
     /// 文件行的右键菜单只动那一个文件。
@@ -3545,20 +4125,21 @@ use crate::viewport;
     // `git clone /路径 /另一个路径` 走的是同一条代码通路（同一份 `git::clone_repo`），
     // 换 https 只是换个字符串。
 
-    /// 「添加仓库」展开那一条 →「克隆…」→ 两格都填 → 真 `git clone`：
+    /// 「添加仓库」卡 →「克隆到本地」那一档 → 两格都填 → 真 `git clone`：
     /// 书签里多一条、tab 开到它上面、HEAD 与 `origin` 都对得上源。
+    /// 这一条按**鼠标那一下**（「克隆」）发动，另一条（`a_clone_needs_both_fields`）按 Enter，
+    /// 两条合起来才把「主按钮和 Enter 是同一个出口」钉住。
     #[test]
     fn the_clone_card_makes_a_working_copy() {
         let src = scratch_repo("clone-src");
         let dst = std::env::temp_dir().join(format!("gitx-clone-dst-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dst);
         let mut app = blank();
-        assert!(click_text(&mut app, "添加仓库"), "tab 条上没有「添加仓库」");
-        assert!(click_text(&mut app, "克隆…"), "展开的那一条里没有「克隆…」");
-        assert!(app.modal.is_some(), "点「克隆…」没开出卡");
-        assert!(type_into(&mut app, "源仓库地址", src.to_str().unwrap()), "卡里第一格没找到");
-        assert!(type_into(&mut app, "目标目录", dst.to_str().unwrap()), "卡里第二格没找到");
-        press(&mut app, egui::Key::Enter);
+        open_add_card(&mut app);
+        assert!(click_card(&mut app, "克隆到本地"), "卡上没有「克隆到本地」那一档");
+        assert!(type_into_card(&mut app, "源仓库地址", src.to_str().unwrap()), "卡里第一格没找到");
+        assert!(type_into_card(&mut app, "目标目录", dst.to_str().unwrap()), "卡里第二格没找到");
+        assert!(click_card_button(&mut app, "克隆"), "主按钮不是「克隆」");
         pump(&mut app, |a| !a.repos.is_empty());
         assert_eq!(app.repos[0].path, dst.to_str().unwrap(), "书签加错了目录");
         assert_eq!(app.repo.as_deref(), Some(dst.to_str().unwrap()), "克隆完没把新仓库打开");
@@ -3772,18 +4353,21 @@ use crate::viewport;
 
     /// 只填地址、目标目录还空着：卡不许关，而且**不许留下半个目录**——`git clone` 一旦开跑
     /// 就先把目录建出来，所以这一条钉的是主按钮压根没点下去。
+    /// 这一条按 Enter 发动（和上面按鼠标那条合起来覆盖同一个出口）。
     #[test]
     fn a_clone_needs_both_fields() {
         let src = scratch_repo("clone-half");
         let dst = std::env::temp_dir().join(format!("gitx-clone-half-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dst);
         let mut app = blank();
-        click_text(&mut app, "添加仓库");
-        click_text(&mut app, "克隆…");
-        assert!(type_into(&mut app, "源仓库地址", src.to_str().unwrap()));
+        open_add_card(&mut app);
+        assert!(click_card(&mut app, "克隆到本地"));
+        assert!(type_into_card(&mut app, "源仓库地址", src.to_str().unwrap()));
         press(&mut app, egui::Key::Enter);
         frame(&mut app);
-        assert!(app.modal.is_some(), "目标目录还空着就把卡关了");
+        let m = app.modal.as_ref().expect("目标目录还空着就把卡关了");
+        assert!(matches!(m.form, Form::AddRepo { tab: AddTab::Clone, .. }), "卡留下了，但换成了另一张");
+        assert_eq!(m.text.as_deref(), Some(src.to_str().unwrap()), "Enter 被吞了，第一格的字也跟着没了");
         assert!(!dst.exists(), "主按钮按下去了：{dst:?} 被建出来");
         assert!(app.repos.is_empty(), "书签里冒出了一条不该有的仓库");
         let _ = std::fs::remove_dir_all(&src);
@@ -3906,3 +4490,956 @@ use crate::viewport;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+
+    // -------------------------------------------- 弹窗批次：提交卡、设置卡（#47）
+    //
+    // 这一批的产品说法只有一句：「添加仓库/提交太简陋了，要弹窗，设置都没有」。
+    // 所以判据一律从**入口那一枚**起：工具条/tab 条上点一下 → 卡真端出来 → 卡上填/勾 →
+    // 复核问的是仓库、库文件和帧里的形状，不问 app 自己怎么说。
+
+    /// 一份**只属于这条判据**的临时库。旧那几条共用 `gitx-db-{pid}`，写偏好键不能再用它：
+    /// 几条判据并行，读回来的会是隔壁刚写进去的那份开关。
+    fn temp_db(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("gitx-prefs-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("造临时库目录");
+        let _ = std::fs::remove_file(dir.join("gate.db"));
+        dir.join("gate.db")
+    }
+
+    /// 工具条那枚 ⊕ 端出来的是一张**卡**，不是「把光标丢进内联那一格」：得写明提交到哪个分支、
+    /// 已暂存几个文件，得有摘要、三行描述、两枚勾和最右那枚「提交」。
+    /// 说明行按**整串**认：内联那一格也报暂存数，但它的说法是另一套字。
+    #[test]
+    fn the_commit_button_in_the_toolbar_opens_a_commit_card() {
+        let (mut app, dir) = open_repo("commit-card-shell");
+        let branch = git_in(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        assert!(click_tool(&mut app, 0), "工具条第一枚（⊕）没点到");
+        assert!(app.modal.is_some(), "按 ⊕ 没端出卡");
+        let painted: Vec<String> = texts(&warm_frame(&mut app)).into_iter().map(|(s, _)| s).collect();
+        let want = format!("提交到 {branch} · 已暂存 1 个文件");
+        assert!(painted.iter().any(|s| *s == want), "说明行不是那一句：{painted:?}");
+        for label in ["提交摘要", "扩展描述", "修正上一条提交", "提交之后立刻推送"] {
+            assert!(card_has(&mut app, label), "卡上少了「{label}」那一格");
+        }
+        assert!(card_has_button(&mut app, "提交"), "主按钮不是「提交」");
+        assert!(!card_has_button(&mut app, "修正并提交"), "没勾修正，主按钮不该是修正那一句");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 端到端：卡里敲字 → 点「提交」→ core 真提交 → 日志多一条。
+    /// 复核问的是 `git log -1`，不是快照自己报的数。
+    #[test]
+    fn a_commit_typed_in_the_card_lands_in_the_repo() {
+        let (mut app, dir) = open_repo("commit-card");
+        let before = app.snap.as_ref().unwrap().commits.len();
+        assert!(click_tool(&mut app, 0));
+        assert!(type_into_card(&mut app, "提交摘要", "弹窗里补的一条"));
+        assert!(click_card_button(&mut app, "提交"), "「提交」那枚没点到");
+        assert!(app.modal.is_none(), "动作都发出去了，卡还盖在界面上");
+        pump(&mut app, |a| a.snap.as_ref().map(|s| s.commits.len()) == Some(before + 1));
+        assert_eq!(git_in(&dir, &["log", "-1", "--format=%s"]), "弹窗里补的一条");
+        assert_eq!(git_in(&dir, &["show", "HEAD:a.txt"]).lines().count(), 2, "已暂存那行没进提交");
+        assert!(app.note.is_none(), "路上报了 note：{}", app.note.clone().unwrap_or_default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 摘要空着：主按钮按下去一个 git 都不许发，卡留着。
+    /// 只填描述、摘要还空着，也算「没信息」——`commit_text` 会把空摘要和描述拼成
+    /// 「\n\n描述」，那串非空、git 还真会收，落下来的是一条没有标题的提交，所以关卡看的是**摘要**。
+    #[test]
+    fn an_empty_message_keeps_the_commit_card_open() {
+        let (mut app, dir) = open_repo("commit-card-empty");
+        let head = git_in(&dir, &["rev-parse", "HEAD"]);
+        assert!(click_tool(&mut app, 0));
+        assert!(click_card_button(&mut app, "提交"));
+        frame(&mut app);
+        assert!(!app.busy, "信息还空着就发了一次 git（busy 拧上了）");
+        let m = app.modal.as_ref().expect("摘要空着就把卡关了");
+        assert!(matches!(m.form, Form::Commit { .. }), "卡留下了，但换成了另一张");
+        assert_eq!(git_in(&dir, &["rev-parse", "HEAD"]), head, "空信息也落了一条提交");
+        assert!(type_into_card(&mut app, "扩展描述", "只有正文没有标题"));
+        assert!(click_card_button(&mut app, "提交"));
+        frame(&mut app);
+        assert!(app.modal.is_some(), "只填了描述也把卡关了，落的是没有标题的提交");
+        assert!(!app.busy, "只填了描述也发了 git");
+        assert_eq!(git_in(&dir, &["rev-parse", "HEAD"]), head, "没有标题的那条落进仓库了");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 卡里那枚「修正上一条提交」：勾上之后主按钮跟着换名，按下去先问一句（确认卡），
+    /// 确定之后**条数不变**、上一条换成新信息、已暂存那行并进同一条。
+    #[test]
+    fn the_commit_card_amend_goes_through_the_confirm_card() {
+        let (mut app, dir) = open_repo("commit-card-amend");
+        let before = app.snap.as_ref().unwrap().commits.len();
+        let head = git_in(&dir, &["rev-parse", "HEAD"]);
+        assert!(click_tool(&mut app, 0));
+        assert!(click_card(&mut app, "修正上一条提交"), "那枚勾没点到");
+        assert!(card_has_button(&mut app, "修正并提交"), "勾上之后主按钮没换名");
+        assert!(type_into_card(&mut app, "提交摘要", "弹窗里改写的"));
+        assert!(click_card_button(&mut app, "修正并提交"));
+        let m = app.modal.as_ref().expect("amend 没先问一句就落地了");
+        assert!(matches!(m.form, Form::Confirm { .. }), "问那一句的不是确认卡");
+        assert!(click_card_button(&mut app, "确定"), "确认卡上没有「确定」");
+        pump(&mut app, |a| {
+            a.snap.as_ref().and_then(|s| s.commits.first()).map(|c| c.subject.clone())
+                == Some("弹窗里改写的".to_owned())
+        });
+        assert_eq!(app.snap.as_ref().unwrap().commits.len(), before, "amend 多出了一条提交");
+        assert!(app.modal.is_none(), "落地之后卡还挂着：确认卡把自己又问了一遍");
+        assert_ne!(git_in(&dir, &["rev-parse", "HEAD"]), head, "HEAD 还指着原来那条：改写的不是上一条");
+        assert!(
+            git_in(&dir, &["show", "HEAD:a.txt"]).contains("第二行"),
+            "已暂存的内容没并进 amend 后的 HEAD"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 「提交之后立刻推送」：一条 job 里先落提交、再推。远端用**本机的一份裸仓库**——
+    /// 门禁不许连真远端，而 `git push` 走的正是同一条 `git::push`。
+    /// 复核问的是裸仓库那头的 HEAD：推送真到了那边才算这条接通。
+    #[test]
+    fn ticking_push_after_commit_lands_on_the_remote() {
+        let dir = scratch_repo("commit-card-push");
+        let bare = std::env::temp_dir().join(format!("gitx-bare-{}.git", std::process::id()));
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(&bare).expect("造裸仓库目录");
+        git_in(&bare, &["init", "-q", "--bare", "."]);
+        git_in(&dir, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        let branch = git_in(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        git_in(&dir, &["push", "-q", "-u", "origin", &branch]);
+        assert_eq!(git_in(&bare, &["log", "-1", "--format=%s"]), "起点", "起点那条没推上去");
+        let mut app = blank();
+        app.open(dir.to_str().unwrap());
+        pump(&mut app, |a| a.snap.is_some());
+        let before = app.snap.as_ref().unwrap().commits.len();
+        assert!(click_tool(&mut app, 0));
+        assert!(click_card(&mut app, "提交之后立刻推送"), "那枚勾没点到");
+        assert!(type_into_card(&mut app, "提交摘要", "带着推送的一条"));
+        assert!(click_card_button(&mut app, "提交"));
+        pump(&mut app, |a| a.snap.as_ref().map(|s| s.commits.len()) == Some(before + 1));
+        assert!(app.note.is_none(), "推送路上报了 note：{}", app.note.clone().unwrap_or_default());
+        assert_eq!(
+            git_in(&bare, &["log", "-1", "--format=%s"]),
+            "带着推送的一条",
+            "提交落了、推送没到远端"
+        );
+        let _ = std::fs::remove_dir_all(&bare);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 偏好卡的尺寸问的是**帧里真画出来的那块白底**，不是 `PREF_W`/`PREF_H` 那两个常量——
+    /// 拿常量量常量就是让被测对象自己出尺子。那两个数来自 SourceTree 4.2.19 的
+    /// `PreferencesWindow.nib`（`keyedobjects-110000.nib` 里窗口那条 frame `{{436.5, 574}, {855, 441}}`）。
+    /// **2026-10-23 更正**：这条以前钉的是 409——那是把标题栏那 32pt 从内容区里**又减了一遍**
+    /// （441 − 32 = 409）。`NSWindow` 的 `contentRect(forFrameRect:)` 给出的 441 已经是去掉
+    /// 标题栏之后的那一格，不该再减。数字是用 `NSNib` 把那张 nib 实例化后直接读 frame 来的
+    /// （方法见 docs/PROCESS.md「逆向本机 SourceTree.app」——同一条路也推翻了「keyed archive
+    /// 里数值读不出来」那句旧记录）。
+    #[test]
+    fn the_settings_card_is_the_measured_size() {
+        let mut app = filled(3, &layout(PATCH, false));
+        assert!(click_tool(&mut app, 10), "工具条上没有 ⊙ 那枚");
+        let (fill, card) = card_back(&settled_frame(&mut app, 0.4)).expect("卡底那块圆角矩形没画出来");
+        assert_eq!(fill, Color32::WHITE, "卡底不是白的：{fill:?}");
+        assert_eq!((card.width(), card.height()), (855.0, 441.0), "偏好卡不是量出来的那个尺寸");
+        assert!(
+            card.min.x >= 0.0 && card.min.y >= 0.0 && card.max.x <= WIN_W && card.max.y <= WIN_H,
+            "卡溢出默认窗口了：{card:?}，窗口 {WIN_W}×{WIN_H}"
+        );
+    }
+
+    /// 淡入要**淡得完**。egui 的 `Area` 把整层颜色乘上一个按时间涨到 1 的不透明度，那个时间差
+    /// 记在 Context 里、按 Area 的 id 存。所以这条问两头：钟停在 0 那一格还发灰（淡入确实在跑，
+    /// 也正因为跑，量尺寸的判据非用 `settled_frame` 不可），拨过 `animation_time`（默认 0.2s）
+    /// 之后回到本色。
+    /// 会红的样子：Area 的 id 每帧算重一次 → 每帧都是「第一次出现」→ 卡在真窗口里永远半透明。
+    #[test]
+    fn the_modal_card_fades_in_and_settles_at_full_opacity() {
+        let mut app = filled(3, &layout(PATCH, false));
+        assert!(click_tool(&mut app, 10));
+        let (mid, _) = card_back(&warm_frame(&mut app)).expect("淡入中的卡底没画出来");
+        assert_ne!(mid, Color32::WHITE, "头一帧就全白：淡入没在跑，那头一个 `settled_frame` 是白写的");
+        let mut app2 = filled(3, &layout(PATCH, false));
+        assert!(click_tool(&mut app2, 10));
+        let (done, _) = card_back(&settled_frame(&mut app2, 0.4)).expect("淡完那格的卡底没画出来");
+        assert_eq!(done, Color32::WHITE, "淡入走不完，卡停在 {done:?}");
+    }
+
+    /// 窗口收到地板尺寸时，卡不能再比屏幕大：`card_rect` 那头留了 40pt 收边。
+    /// 这条钉的是「量来的尺寸」和「窗口地板」打架时谁让位。
+    #[test]
+    fn the_settings_card_fits_the_window_floor() {
+        let mut app = filled(3, &layout(PATCH, false));
+        assert!(click_tool(&mut app, 10));
+        let m = app.modal.take().expect("卡没打开");
+        let floor = Rect::from_min_size(pos2(0.0, 0.0), vec2(MIN_W, MIN_H));
+        let card = card_rect(&m, floor);
+        app.modal = Some(m);
+        assert!(card.width() < MIN_W && card.height() < MIN_H, "地板窗口里卡没收边：{card:?}");
+        assert!(floor.contains(card.min) && floor.contains(card.max), "卡片角跑到屏幕外：{card:?}");
+    }
+
+    /// 「通用」那一页只有三条**真的接得通**的开关。SourceTree 的偏好窗有八页，这里只摆接得通的
+    /// 两页：摆一条点了没反应的开关、或一页空的壳，都比没有更糟。
+    #[test]
+    fn the_settings_card_lists_the_wired_switches() {
+        let mut app = filled(3, &layout(PATCH, false));
+        assert!(click_tool(&mut app, 10));
+        assert!(card_has(&mut app, "通用"), "页签里没有「通用」");
+        assert!(card_has(&mut app, "关于"), "页签里没有「关于」");
+        for label in ["启动时重新打开上一次的仓库", "日志默认按层级顺序", "描述列显示远程分支那枚药丸"] {
+            assert!(card_has(&mut app, label), "通用那一页少了「{label}」");
+        }
+        assert!(!card_has(&mut app, "账户"), "摆了一条没接的页签进来");
+        assert!(!card_has(&mut app, "差异视图"), "摆了一条没接的页签进来");
+    }
+
+    /// 「关于」那一页念两条**事实**：书签里几本仓库、库文件在哪儿。数字按整串认，
+    /// 少写一本多写本都会红；地址只认它真是个路径（尾巴上那个文件名）。
+    #[test]
+    fn the_about_page_states_two_facts() {
+        let mut app = blank();
+        assert!(click_tool(&mut app, 10));
+        assert!(click_card(&mut app, "关于"), "页签里没有「关于」");
+        let painted: Vec<String> = texts(&warm_frame(&mut app)).into_iter().map(|(s, _)| s).collect();
+        // 一本书签都没有的壳，卡上就得写「0 本」——写成别的数（或者干脆漏掉这一行）都算这条红。
+        assert!(painted.iter().any(|s| s == "书签里的仓库：0 本"), "书签数不是那一句：{painted:?}");
+        assert!(
+            painted.iter().any(|s| s.starts_with('/') && s.ends_with("gitx.db")),
+            "关于那一页没念出库文件的路径：{painted:?}"
+        );
+    }
+
+    /// 关掉「描述列显示远程分支那枚药丸」：这一帧里 `⤴origin/main` 就该没了（屏上真变了），
+    /// 库里写的是字面 `"false"`（不是内存里改一改），而 `Prefs::load` 读回来要和屏上那份
+    /// 一模一样（下次启动读得到同一个开关）。三段各管一种改坏。
+    #[test]
+    fn the_pill_switch_takes_the_pills_off_and_persists() {
+        let db_file = temp_db("pill");
+        let mut app = filled(3, &layout(PATCH, false));
+        app.conn = Some(db::open(db_file.to_str().unwrap()).expect("临时库"));
+        assert!(app.show_remote, "夹具默认就该是开着药丸的");
+        assert!(click_tool(&mut app, 10));
+        assert!(click_card(&mut app, "描述列显示远程分支那枚药丸"), "那枚开关没点到");
+        frame(&mut app);
+        let out = frame(&mut app);
+        assert!(
+            !texts(&out).iter().any(|(s, _)| s.contains("⤴origin/main")),
+            "关掉之后药丸还画在描述列上"
+        );
+        assert!(!app.show_remote, "屏上没了但开关没拧");
+        assert_eq!(
+            db::get_setting(app.conn.as_ref().unwrap(), Prefs::KEY_REMOTE)
+                .ok()
+                .flatten()
+                .as_deref(),
+            Some("false"),
+            "开关没落库"
+        );
+        assert_eq!(Prefs::load(app.conn.as_ref()), app.prefs(), "读回来的和屏上的不是同一份");
+        let _ = std::fs::remove_file(&db_file);
+    }
+
+    /// 「日志默认按层级顺序（而不是日期）」这条改的是**同一个** `topo`：屏上重排、筛选条那枚
+    /// 按钮跟着换文案、库里落 `"true"`。它和弹出菜单那条路共用一份状态，不是第二套开关。
+    #[test]
+    fn the_topo_switch_resorts_and_persists() {
+        let db_file = temp_db("topo");
+        let (mut app, dir) = open_repo("topo-switch");
+        app.conn = Some(db::open(db_file.to_str().unwrap()).expect("临时库"));
+        assert!(!app.topo, "夹具默认该是日期序");
+        assert!(filter_text(&mut app, DATE_ORDER).is_some(), "按钮上写的不是默认那一档");
+        assert!(click_tool(&mut app, 10));
+        assert!(click_card(&mut app, "日志默认按层级顺序"), "那枚开关没点到");
+        assert!(app.topo, "点了开关没换排序");
+        pump(&mut app, |a| a.snap.is_some());
+        assert!(filter_text(&mut app, TOPO_ORDER).is_some(), "换了排序，按钮上还是旧那一项");
+        assert_eq!(
+            db::get_setting(app.conn.as_ref().unwrap(), Prefs::KEY_TOPO).ok().flatten().as_deref(),
+            Some("true"),
+            "开关没落库"
+        );
+        assert_eq!(Prefs::load(app.conn.as_ref()), app.prefs(), "读回来的和屏上的不是同一份");
+        let _ = std::fs::remove_file(&db_file);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 「启动时重新打开上一次的仓库」这条改的是**下一次**启动读不读那格 `gitx_last_repo`：
+    /// 屏上这一帧看不见变化，所以判据问到两头 —— 拧完 `app.restore_last` 是新的，
+    /// `Prefs::load` 读回来也是新的（`Gitx::new` 走的就是这一个函数）。
+    #[test]
+    fn the_restore_last_switch_is_read_back_at_startup() {
+        let db_file = temp_db("restore");
+        let mut app = filled(3, &layout(PATCH, false));
+        app.conn = Some(db::open(db_file.to_str().unwrap()).expect("临时库"));
+        assert!(app.restore_last, "夹具默认该是开着「重新打开上一次」的");
+        assert!(click_tool(&mut app, 10));
+        assert!(click_card(&mut app, "启动时重新打开上一次的仓库"), "那枚开关没点到");
+        assert!(!app.restore_last, "点了开关没拧");
+        assert_eq!(Prefs::load(app.conn.as_ref()).restore_last, false, "下次启动读回来还是开的");
+        assert_eq!(Prefs::load(app.conn.as_ref()), app.prefs(), "三份开关没一起落库");
+        let _ = std::fs::remove_file(&db_file);
+    }
+
+    /// 「完成」和 Enter 都只干一件事：**关卡**，不发任何动作（偏好卡的开关当场就落了，
+    /// 没有「主动作」这回事）。两条各测一次，因为这条通路真的有两个入口。
+    #[test]
+    fn the_settings_card_closes_without_firing_anything() {
+        let mut app = filled(3, &layout(PATCH, false));
+        assert!(click_tool(&mut app, 10));
+        assert!(card_has_button(&mut app, "完成"), "偏好卡的主按钮不是「完成」");
+        assert!(!card_has_button(&mut app, "取消"), "开关当场就落了，不该谎称能取消");
+        assert!(click_card_button(&mut app, "完成"));
+        assert!(app.modal.is_none(), "按「完成」没关卡");
+        assert!(!app.busy, "「完成」发了一条 git 动作");
+        assert!(app.note.is_none(), "「完成」报了 note：{:?}", app.note);
+
+        assert!(click_tool(&mut app, 10));
+        press(&mut app, egui::Key::Enter);
+        assert!(app.modal.is_none(), "Enter 没关卡");
+        assert!(!app.busy, "Enter 发了一条 git 动作");
+    }
+
+    // ------------------------------------------------------- 推送卡 / 拉取卡（#38 #43）
+    //
+    // 这两张卡上每一格的坐标都是从本机 nib 实例化后读 frame 量出来的（常量在 theme.rs，
+    // 方法见 docs/PROCESS.md）。所以下面量尺寸的几条钉的是**字面数字**，不引用那两个常量——
+    // 引用常量等于让被测对象自己出尺子（反向变异表里记了这一条）。
+
+    /// 推送/拉取两张卡要的夹具：两条本地分支（`main` 有上游、`feature/x` 没有）、
+    /// 两条远端（`origin` 上两个跟踪指针、`fork` 上一个只在它那儿存在的分支）。
+    /// `filled` 那一份没有远端，两张卡根本开不出来。
+    fn with_remotes() -> Gitx {
+        let mut app = filled(3, &layout(PATCH, false));
+        let (oid0, oid1) = {
+            let s = app.snap.as_ref().unwrap();
+            (s.commits[0].id.clone(), s.commits[1].id.clone())
+        };
+        let s = app.snap.as_mut().unwrap();
+        s.remotes = vec![
+            Remote {
+                name: "origin".to_owned(),
+                url: "/tmp/gate-upstream.git".to_owned(),
+                push_url: None,
+            },
+            Remote {
+                name: "fork".to_owned(),
+                url: "/tmp/gate-fork.git".to_owned(),
+                push_url: Some("/tmp/gate-fork-push.git".to_owned()),
+            },
+        ];
+        s.branches.push(Branch {
+            name: "feature/x".to_owned(),
+            is_current: false,
+            upstream: None,
+            ahead: 0,
+            behind: 1,
+            target: oid1.clone(),
+        });
+        s.remote_refs.extend([
+            RemoteRef { name: "origin/feature/x".to_owned(), target: oid1 },
+            RemoteRef { name: "fork/only-on-fork".to_owned(), target: oid0 },
+        ]);
+        app
+    }
+
+    /// 卡上那张表现在的样子：`(本地分支, 勾了没, 跟踪勾了没, 远端那一侧叫什么)`。
+    /// 读的是**卡自己那份数据**（不是 `PushBehavior::picks`）——判据里再调一次 `picks`
+    /// 就成了用被测对象量被测对象。
+    fn push_rows(app: &Gitx) -> Vec<(String, bool, bool, String)> {
+        let m = app.modal.as_ref().expect("判据要在卡上读表，可这会儿没有打开的卡");
+        match &m.form {
+            Form::Push { rows, .. } => rows
+                .iter()
+                .map(|r| (r.local.clone(), r.picked, r.track, r.remote_name.clone()))
+                .collect(),
+            _ => panic!("打开的不是推送卡"),
+        }
+    }
+
+    /// 推送卡表格第 `i` 行**最左那一格方框**的落点。坐标按 `push_card` 那一套常量算，
+    /// 用途只有一个：端到端那条判据要真的用鼠标点掉某一行，而不是直接改字段。
+    fn push_row_box(card: Rect, i: usize) -> Pos2 {
+        let top = pos2(card.min.x, card.min.y + MODAL_TITLE_H);
+        let x = top.x + PUSH_TABLE_X + PUSH_COL_PICK / 2.0;
+        let y = top.y + PUSH_TABLE_TOP + PUSH_HEAD_H + PUSH_ROW_H * i as f32 + PUSH_ROW_H / 2.0;
+        pos2(x, y)
+    }
+
+    /// 在卡上某个坐标按一次（按下+松手）。和 `click_card` 同一条通路，只是这一格没有文字可找。
+    fn click_card_at(app: &mut Gitx, at: Pos2) {
+        let ctx = warm(app);
+        click_at(&ctx, app, at);
+    }
+
+    /// 这一帧画出来的、整串等于 `word` 的文字单元有几个。
+    fn word_count(out: &egui::FullOutput, word: &str) -> usize {
+        out.shapes
+            .iter()
+            .filter(|c| matches!(&c.shape, egui::Shape::Text(t) if t.galley.text() == word))
+            .count()
+    }
+
+    /// 卡上那枚弹出按钮点开之后，菜单里**有没有** `item` 这一项。
+    /// 只能问增量：分支名在侧栏和日志行上也画（「origin 那一列里有没有 feature/x」光看
+    /// 「这一帧有没有这个字」永远是真，白测）。所以数两次——没点开时几个、点开之后几个，
+    /// 变多了才算菜单里有。
+    fn menu_shows(app: &mut Gitx, trigger: &str, item: &str) -> bool {
+        let before = warm_frame(app);
+        let n0 = word_count(&before, item);
+        let ctx = warm(app);
+        let Some(at) = locate_card(&ctx, app, trigger, false, false) else {
+            panic!("卡上没有那枚弹出按钮：{trigger}");
+        };
+        click_at(&ctx, app, at);
+        let mut out = ctx.run_ui(raw_input(Vec::new()), |ui| app.shell(ui));
+        let n1 = word_count(&out, item);
+        out.textures_delta.clear();
+        n1 > n0
+    }
+
+    /// 点开弹出按钮再点菜单里那一项（真鼠标两下，不是直接改表单字段）。
+    /// 菜单画在最上层，同名的那一项在 shapes 里排在最后，所以从**后**往前找。
+    fn click_menu_item(app: &mut Gitx, trigger: &str, item: &str) {
+        let ctx = warm(app);
+        let at = locate_card(&ctx, app, trigger, false, false)
+            .unwrap_or_else(|| panic!("卡上没有那枚弹出按钮：{trigger}"));
+        click_at(&ctx, app, at);
+        let mut out = ctx.run_ui(raw_input(Vec::new()), |ui| app.shell(ui));
+        let spot = out
+            .shapes
+            .iter()
+            .rev()
+            .find_map(|c| match &c.shape {
+                egui::Shape::Text(t) if t.galley.text() == item => {
+                    Some(t.galley.rect.translate(t.pos.to_vec2()).center())
+                }
+                _ => None,
+            });
+        out.textures_delta.clear();
+        let Some(spot) = spot else { panic!("菜单里没有那一项：{item}") };
+        click_at(&ctx, app, spot);
+    }
+
+    #[test]
+    fn the_push_card_is_the_measured_size() {
+        let mut app = with_remotes();
+        assert!(click_tool(&mut app, 2), "工具条上没有「推送」那枚");
+        let (fill, card) = card_back(&settled_frame(&mut app, 0.4)).expect("推送卡的卡底没画出来");
+        assert_eq!(fill, Color32::WHITE, "卡底不是白的：{fill:?}");
+        // `GitPushSheet` 内容区实测 650×271，加我们自己那一条标题带 30。
+        assert_eq!((card.width(), card.height()), (650.0, 301.0), "推送卡不是量出来的那个尺寸");
+        assert!(
+            card.min.x >= 0.0 && card.min.y >= 0.0 && card.max.x <= WIN_W && card.max.y <= WIN_H,
+            "推送卡溢出默认窗口了：{card:?}，窗口 {WIN_W}×{WIN_H}"
+        );
+    }
+
+    /// 表里每一条本地分支都得有一行，且**远端那一侧预先填的是同名**——不同名就得由人改，
+    /// 预先替你改成一个猜的名字等于替你决定远端上多出一条分支。
+    /// URL 那一格念的是 `push_url`（没有才退回 `url`）：推和拉走的可能不是同一个地址，
+    /// 卡上要说的是「推到哪儿」。
+    #[test]
+    fn the_push_card_shows_every_local_branch_and_where_it_would_land() {
+        let mut app = with_remotes();
+        assert!(click_tool(&mut app, 2));
+        for word in [
+            "推送到仓库：",
+            "要推送的分支",
+            "本地分支",
+            "远程分支",
+            "跟踪？",
+            "全选",
+            "推送所有标签",
+            "强制推送",
+            "main",
+            "feature/x",
+        ] {
+            assert!(card_has(&mut app, word), "推送卡上少了这一格：{word}");
+        }
+        let rows = push_rows(&app);
+        assert_eq!(
+            rows.iter().map(|(l, _, _, r)| (l.as_str(), r.as_str())).collect::<Vec<_>>(),
+            vec![("main", "main"), ("feature/x", "feature/x")],
+            "表里每一行的远端那一侧不是预先同名"
+        );
+        // 夹具里 `origin` 没有 push_url、`fork` 有：卡片跟着远端那一格换 URL。
+        assert!(card_has(&mut app, "/tmp/gate-upstream.git"), "选 origin 时 URL 那格没念对");
+        assert!(!card_has(&mut app, "/tmp/gate-fork-push.git"), "没选 fork 却画了它的 push_url");
+        app.allow_force = false;
+        assert!(
+            !card_has(&mut app, "强制推送"),
+            "偏好里关了「允许强制推送」，卡上那枚勾还摆着"
+        );
+    }
+
+    /// 五档预先勾哪几条。这一档**不改 git 的实参**（卡上的推送一律带明确 refspec，
+    /// 而带 refspec 的 `git push` 完全无视 `push.default`），它唯一的可见后果就在这儿。
+    #[test]
+    fn the_push_behavior_pref_picks_which_rows_start_checked() {
+        for (behavior, expect) in [
+            (PushBehavior::Nothing, vec![false, false]),
+            (PushBehavior::Matching, vec![true, true]),
+            (PushBehavior::Upstream, vec![true, false]),
+            (PushBehavior::Simple, vec![true, false]),
+            (PushBehavior::Current, vec![true, false]),
+        ] {
+            let mut app = with_remotes();
+            app.push_behavior = behavior;
+            assert!(click_tool(&mut app, 2), "{behavior:?} 那档开不出推送卡");
+            let got: Vec<bool> = push_rows(&app).into_iter().map(|(_, p, _, _)| p).collect();
+            assert_eq!(got, expect, "{behavior:?} 那档预先勾错了");
+        }
+    }
+
+    /// 一条都没勾、也没勾标签 → 主按钮按下去**什么都没发生**（卡留着、不起线程）；
+    /// 「全选」勾满之后同一次按才把卡交出去。两半都要：只有前半会放行「永远按不动」，
+    /// 只有后半会放行「一条没勾也去跑 git」。
+    #[test]
+    fn the_push_card_only_fires_when_something_is_picked() {
+        let mut app = with_remotes();
+        app.push_behavior = PushBehavior::Nothing;
+        assert!(click_tool(&mut app, 2));
+        assert!(click_card_button(&mut app, "推送"), "卡脚上没有「推送」那枚");
+        assert!(app.modal.is_some(), "一条都没勾还是把卡关掉了");
+        assert!(!app.busy, "一条都没勾却起了 git 线程");
+        assert!(click_card(&mut app, "全选"), "「全选」没点到");
+        assert!(push_rows(&app).iter().all(|(_, p, _, _)| *p), "「全选」之后还有行没勾上");
+        assert!(click_card_button(&mut app, "推送"));
+        assert!(app.modal.is_none(), "勾满了按「推送」没把卡交出去");
+        assert!(app.busy, "卡交出去了但没有动作在路上");
+    }
+
+    /// 表格第 0 行那一格方框点一下就把那一条取消——这是「只推勾着的那几条」唯一的手工入口。
+    /// 用坐标而不是文字：方框没有文字可找（和文件表那几条同一套）。
+    #[test]
+    fn clicking_a_push_row_box_unchecks_only_that_row() {
+        let mut app = with_remotes();
+        assert!(click_tool(&mut app, 2));
+        let card = card_now(&app);
+        click_card_at(&mut app, push_row_box(card, 0));
+        let rows = push_rows(&app);
+        assert_eq!(rows[0].1, false, "点掉第 0 行的方框没生效");
+        assert_eq!(rows[1].1, true, "把没点的那一行也一起取消了");
+    }
+
+    #[test]
+    fn the_pull_card_is_the_measured_size() {
+        let mut app = with_remotes();
+        assert!(click_tool(&mut app, 1), "工具条上没有「拉取」那枚");
+        let (fill, card) = card_back(&settled_frame(&mut app, 0.4)).expect("拉取卡的卡底没画出来");
+        assert_eq!(fill, Color32::WHITE, "卡底不是白的：{fill:?}");
+        // `GitPullSheet` 内容区实测 614×299，加标题带 30。
+        assert_eq!((card.width(), card.height()), (614.0, 329.0), "拉取卡不是量出来的那个尺寸");
+    }
+
+    /// 「选项」那只框里三枚勾**逐字**取自 nib（第四句「立即提交合并的改动」是 git 的默认行为，
+    /// 摆了看不出区别，所以那一格留空 —— 位置留着，控件不摆）。
+    #[test]
+    fn the_pull_card_shows_the_three_rows_and_the_options() {
+        let mut app = with_remotes();
+        assert!(click_tool(&mut app, 1));
+        for word in [
+            "从仓库拉取：",
+            "要拉取的远程分支：",
+            "拉取到本地分支：",
+            "刷新",
+            "选项",
+            "包括被合并提交的信息内容",
+            "无论是否可以快进更新都创建新的提交",
+            "用变基代替合并 (警告：请确保您还没有推送您的变更)",
+        ] {
+            assert!(card_has(&mut app, word), "拉取卡上少了这一格：{word}");
+        }
+        // 当前分支 `main` 的上游是 `origin/main` → 远端那格念 origin，远程分支那格念 main，
+        // 本地那格就是当前分支。这三格是卡的初值，不是 git 的参数。
+        assert!(card_has(&mut app, "origin ▼"), "远端那一格没落在当前分支的上游上");
+        assert!(card_has(&mut app, "/tmp/gate-upstream.git"), "URL 那格没念所选远端");
+    }
+
+    /// 拉取卡上那三格此刻写着什么：`(远端, 远程分支, 拉到哪条本地分支)`。
+    fn pull_fields(app: &Gitx) -> (String, String, String) {
+        let m = app.modal.as_ref().expect("判据要读拉取卡，可这会儿没有打开的卡");
+        match &m.form {
+            Form::Pull { remote, branch, into, .. } => {
+                (remote.clone(), branch.clone(), into.clone())
+            }
+            _ => panic!("打开的不是拉取卡"),
+        }
+    }
+
+    /// 远程分支那一列**只列所选远端**：`fork/only-on-fork` 在选 origin 时不许出现，
+    /// 把远端换成 fork 之后它才出现、origin 那两条反而没了。
+    /// 换远端走的是**真鼠标**（点开那枚弹出按钮、点菜单里那一项），不是直接改表单字段——
+    /// 直接改字段就测不到 `cell_popup` 那一层，而那正是这一格唯一的手。
+    #[test]
+    fn the_pull_card_lists_only_the_selected_remote() {
+        let mut app = with_remotes();
+        assert!(click_tool(&mut app, 1));
+        assert!(menu_shows(&mut app, "main ▼", "feature/x"), "选了 origin，那一列里却没有 origin/feature/x");
+        assert!(!menu_shows(&mut app, "main ▼", "only-on-fork"), "origin 那一列里混进了 fork 的分支");
+
+        click_menu_item(&mut app, "origin ▼", "fork");
+        assert_eq!(pull_fields(&app).0, "fork", "点了菜单里的 fork，卡上远端那一格没换");
+        assert!(menu_shows(&mut app, "main ▼", "only-on-fork"), "换成 fork 后那一列没跟上");
+        assert!(!menu_shows(&mut app, "main ▼", "feature/x"), "fork 那一列里还留着 origin 的分支");
+        // 拉取念的是 `url`，推送才念 `push_url`——夹具里 fork 这两条不一样，正好分得开。
+        assert!(card_has(&mut app, "/tmp/gate-fork.git"), "换成 fork 后 URL 那格没跟着换");
+    }
+
+    /// 推送卡那三格旗标：`(远端, 强制, 推送所有标签)`。
+    fn push_flags(app: &Gitx) -> (String, bool, bool) {
+        let m = app.modal.as_ref().expect("判据要读推送卡，可这会儿没有打开的卡");
+        match &m.form {
+            Form::Push { remote, force, tags, .. } => (remote.clone(), *force, *tags),
+            _ => panic!("打开的不是推送卡"),
+        }
+    }
+
+    /// 往卡上某个坐标那一格**重写**（先点它拿焦点、⌘A 全选，再喂 `Event::Text`）。
+    /// 全选那一步不能省：真用户改一个已有的名字就是先选中再打，光点一下是接在后面追加。
+    fn retype_at_card(app: &mut Gitx, at: Pos2, text: &str) {
+        let ctx = warm(app);
+        click_at(&ctx, app, at);
+        let a = |pressed: bool| egui::Event::Key {
+            key: egui::Key::A,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        };
+        let mods = |m: egui::Modifiers| egui::Event::ModifiersChanged(m);
+        for events in [
+            vec![egui::Event::PointerMoved(at), mods(egui::Modifiers::COMMAND), a(true)],
+            vec![a(false), mods(egui::Modifiers::NONE)],
+            vec![egui::Event::PointerMoved(at), egui::Event::Text(text.to_owned())],
+        ] {
+            ctx.run_ui(raw_input(events), |ui| app.shell(ui)).textures_delta.clear();
+        }
+    }
+
+    /// 表格第 `i` 行**「远程分支」那一格**的中心——那一格是可编辑的 `TextEdit`。
+    fn push_remote_cell(card: Rect, i: usize) -> Pos2 {
+        let top = pos2(card.min.x, card.min.y + MODAL_TITLE_H);
+        let x = top.x + PUSH_TABLE_X + PUSH_COL_PICK + PUSH_COL_LOCAL + PUSH_COL_REMOTE / 2.0;
+        let y = top.y + PUSH_TABLE_TOP + PUSH_HEAD_H + PUSH_ROW_H * i as f32 + PUSH_ROW_H / 2.0;
+        pos2(x, y)
+    }
+
+    /// 偏好卡「推送与拉取」那一页改的四条，推送卡**当场**就该读得到；闸关掉之后那枚勾
+    /// 摆都不摆。远端那一格的落点也在这条里问：当前分支没有上游时它读偏好，
+    /// 偏好也没设就**留空、主按钮按不动**——宁可让人挑，不替他猜 `origin`。
+    #[test]
+    fn the_push_preferences_change_what_the_push_card_starts_with() {
+        let db_file = temp_db("push-prefs");
+        let mut app = with_remotes();
+        app.conn = Some(db::open(db_file.to_str().unwrap()).expect("临时库"));
+        // 把「当前分支」换成 `feature/x`——它没有上游，这时「默认远端」才说了算。
+        {
+            let s = app.snap.as_mut().unwrap();
+            s.branches[0].is_current = false;
+            s.branches[1].is_current = true;
+        }
+        assert!(click_tool(&mut app, 2), "没有上游也该开得出推送卡");
+        assert_eq!(push_flags(&app).0, "", "当前分支没上游、偏好也没设默认远端时，那一格该留空");
+        assert!(click_card_button(&mut app, "推送"));
+        assert!(app.modal.is_some(), "远端那一格空着还把卡交出去了（等于替你猜远端）");
+        press(&mut app, egui::Key::Escape);
+
+        assert!(click_tool(&mut app, 10));
+        assert!(click_card(&mut app, "推送与拉取"), "偏好卡上没有「推送与拉取」那一页");
+        click_menu_item(&mut app, "（没有） ▼", "fork");
+        assert!(click_card(&mut app, "允许强制推送"), "那枚闸没点到");
+        assert!(click_card(&mut app, "推送所有标签"), "那枚勾没点到");
+        assert!(!app.allow_force, "点了闸但 app.allow_force 没拧");
+        assert!(app.push_tags, "点了「推送所有标签」但没拧");
+        assert_eq!(app.default_remote, "fork", "默认远端没落到界面上");
+        assert_eq!(Prefs::load(app.conn.as_ref()), app.prefs(), "四条没一起落库");
+        assert!(click_card_button(&mut app, "完成"));
+
+        assert!(click_tool(&mut app, 2));
+        let (remote, force, tags) = push_flags(&app);
+        assert_eq!(remote, "fork", "默认远端没成为卡上那一格的初值");
+        assert!(!force, "「强制推送」不该带着勾开出来");
+        assert!(tags, "「推送所有标签」那枚初值没读到偏好");
+        assert!(!card_has(&mut app, "强制推送"), "闸关了，卡上那枚勾还摆着");
+        assert!(card_has(&mut app, "/tmp/gate-fork-push.git"), "推送卡该念 fork 的 push_url");
+        let _ = std::fs::remove_file(&db_file);
+    }
+
+    /// 端到端：真仓库 + 真裸仓库当远端。表里**取消勾选**的那条不许推上去，勾着的按
+    /// 卡上「远程分支」那一格的名字推上去（refspec），没上游的那条推完把上游记下来。
+    /// 这三件事全在远端那头的 ref 上验，不看 app 自己的说法。
+    #[test]
+    fn the_push_card_sends_only_the_checked_rows_under_the_names_it_shows() {
+        let dir = scratch_repo("card-push");
+        let bare = std::env::temp_dir().join(format!("gitx-bare-push-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(&bare).expect("造裸仓库目录");
+        git_in(&bare, &["init", "-q", "--bare", "."]);
+        git_in(&dir, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git_in(&dir, &["push", "-q", "-u", "origin", "main"]);
+        // 本地再多一条（不推）、再长一条没有上游的分支：卡上那两条正是「勾掉的」和「要推的」。
+        git_in(&dir, &["commit", "-q", "--allow-empty", "-m", "这条不该推上去"]);
+        git_in(&dir, &["branch", "feature/x"]);
+        let mut app = blank();
+        app.open(dir.to_str().unwrap());
+        pump(&mut app, |a| a.snap.is_some());
+
+        assert!(click_tool(&mut app, 2), "真仓库开不出推送卡");
+        let card = card_now(&app);
+        let i = push_rows(&app)
+            .iter()
+            .position(|(l, _, _, _)| l == "main")
+            .expect("表里没有 main 那一行");
+        click_card_at(&mut app, push_row_box(card, i));
+        let j = push_rows(&app)
+            .iter()
+            .position(|(l, _, _, _)| l == "feature/x")
+            .expect("表里没有 feature/x 那一行");
+        retype_at_card(&mut app, push_remote_cell(card, j), "renamed");
+        assert_eq!(
+            push_rows(&app).remove(j).3,
+            "renamed",
+            "「远程分支」那一格敲的字没落到绑定上"
+        );
+        assert!(click_card_button(&mut app, "推送"));
+        pump(&mut app, |a| !a.busy);
+
+        let heads = git_in(&bare, &["for-each-ref", "--format=%(refname:short)", "refs/heads/"]);
+        assert_eq!(heads, "main\nrenamed", "远端上落下来的 ref 不对：{heads:?}");
+        assert_eq!(
+            git_in(&bare, &["log", "-1", "--format=%s", "main"]),
+            "起点",
+            "取消勾选的那条也被推上去了（而且带的还是旧的 main）"
+        );
+        assert_eq!(
+            git_in(&dir, &["config", "--get", "branch.feature/x.remote"]),
+            "origin",
+            "「跟踪？」勾着却没记上游"
+        );
+        assert!(app.note.is_none(), "推送路上报了 note：{}", app.note.clone().unwrap_or_default());
+        let _ = std::fs::remove_dir_all(&bare);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --------------------------------------------------------------- 拉取端到端
+    //
+    // 和推送那条同一套规矩：真仓库 + 真裸仓库当远端，断言问的全是磁盘上的事实。
+
+    /// 一个空裸仓库当远端。
+    fn bare_remote(tag: &str) -> std::path::PathBuf {
+        let bare = std::env::temp_dir().join(format!("gitx-bare-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(&bare).expect("造裸仓库目录");
+        git_in(&bare, &["init", "-q", "--bare", "."]);
+        bare
+    }
+
+    /// 拉取端到端夹具：本地 main 和远端 main 从「起点」分岔——本地多了「我的」
+    /// （动的就是 a.txt），远端多了「他们的」。工作区是干净的：变基不许带着未提交改动跑。
+    fn divergent_repo(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = scratch_repo(tag);
+        // 夹具里那条已暂存的改动就是「我的」这一步：commit 掉，工作区也跟着干净了。
+        let bare = bare_remote(tag);
+        git_in(&dir, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git_in(&dir, &["push", "-q", "-u", "origin", "main"]);
+        git_in(&dir, &["commit", "-q", "-m", "我的"]);
+        git_in(&dir, &["checkout", "-q", "-b", "theirs", "HEAD~1"]);
+        git_in(&dir, &["commit", "-q", "--allow-empty", "-m", "他们的"]);
+        git_in(&dir, &["push", "-q", "origin", "theirs:main"]);
+        git_in(&dir, &["checkout", "-q", "main"]);
+        git_in(&dir, &["branch", "-q", "-D", "theirs"]);
+        (dir, bare)
+    }
+
+    /// 拉取卡某一行弹出按钮的中心。「拉到哪条」那行初值多半也写着 main，两行按文字
+    /// 找分不出彼此——所以这枚按量来的行坐标点，不按字找。x 只敢往**左**偏：那枚按钮
+    /// 实际只有文字那么宽，单元格正中早出了它的命中矩形、点到的就是遮罩。
+    fn pull_cell(card: Rect, y: f32) -> Pos2 {
+        let top = pos2(card.min.x, card.min.y + MODAL_TITLE_H);
+        pos2(top.x + PULL_FIELD_X + 28.0, top.y + y + 12.5)
+    }
+
+    /// `menu_shows` 的按行版：数两次（没点开时几个、点开之后几个），变多了才算菜单里有。
+    fn pull_menu_shows(app: &mut Gitx, y: f32, item: &str) -> bool {
+        let before = warm_frame(app);
+        let n0 = word_count(&before, item);
+        let ctx = warm(app);
+        click_at(&ctx, app, pull_cell(card_now(app), y));
+        let mut out = ctx.run_ui(raw_input(Vec::new()), |ui| app.shell(ui));
+        let n1 = word_count(&out, item);
+        out.textures_delta.clear();
+        n1 > n0
+    }
+
+    /// `click_menu_item` 的按行版：点开那行弹出按钮、再点菜单里那一项。
+    fn pull_pick(app: &mut Gitx, y: f32, item: &str) {
+        let ctx = warm(app);
+        click_at(&ctx, app, pull_cell(card_now(app), y));
+        let mut out = ctx.run_ui(raw_input(Vec::new()), |ui| app.shell(ui));
+        let spot = out
+            .shapes
+            .iter()
+            .rev()
+            .find_map(|c| match &c.shape {
+                egui::Shape::Text(t) if t.galley.text() == item => {
+                    Some(t.galley.rect.translate(t.pos.to_vec2()).center())
+                }
+                _ => None,
+            });
+        out.textures_delta.clear();
+        let Some(spot) = spot else { panic!("菜单里没有那一项：{item}") };
+        click_at(&ctx, app, spot);
+    }
+
+    /// 「拉取到本地分支」选的不是当前那条：壳里得先切过去再拉（`git pull` 只会拉进
+    /// 当前分支）。拉完目标那条到了「那边的」、HEAD 停在那条上，main 一个字没动。
+    #[test]
+    fn pulling_lands_on_the_local_branch_the_card_names() {
+        let dir = scratch_repo("pull-into");
+        git_in(&dir, &["reset", "-q", "--hard", "HEAD"]);
+        let bare = bare_remote("pull-into");
+        git_in(&dir, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git_in(&dir, &["push", "-q", "-u", "origin", "main"]);
+        git_in(&dir, &["branch", "side"]);
+        git_in(&dir, &["push", "-q", "origin", "side"]);
+        git_in(&dir, &["checkout", "-q", "-b", "tmp", "side"]);
+        git_in(&dir, &["commit", "-q", "--allow-empty", "-m", "那边的"]);
+        git_in(&dir, &["push", "-q", "origin", "HEAD:side"]);
+        git_in(&dir, &["checkout", "-q", "main"]);
+        git_in(&dir, &["branch", "-q", "-D", "tmp"]);
+
+        let mut app = blank();
+        app.open(dir.to_str().unwrap());
+        pump(&mut app, |a| a.snap.is_some());
+        assert!(click_tool(&mut app, 1));
+        pull_pick(&mut app, PULL_BRANCH_Y, "side");
+        pull_pick(&mut app, PULL_INTO_Y, "side");
+        let (remote, branch, into) = pull_fields(&app);
+        assert_eq!(
+            (remote.as_str(), branch.as_str(), into.as_str()),
+            ("origin", "side", "side"),
+            "两格没选上"
+        );
+        assert!(click_card_button(&mut app, "拉取"), "卡脚上没有「拉取」那枚");
+        pump(&mut app, |a| !a.busy);
+        assert!(app.note.is_none(), "拉取路上报了 note：{}", app.note.clone().unwrap_or_default());
+        assert_eq!(
+            git_in(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "side",
+            "没切到要拉进的那条上"
+        );
+        assert_eq!(git_in(&dir, &["log", "-1", "--format=%s", "side"]), "那边的", "side 没被拉上去");
+        assert_eq!(git_in(&dir, &["log", "-1", "--format=%s", "main"]), "起点", "main 被顺手动了");
+        let _ = std::fs::remove_dir_all(&bare);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 分岔之后拉取：不勾变基就是一次合并（HEAD 两个爹），勾了变基就是把「我的」
+    /// 挪到「他们的」后面（HEAD 一个爹、还是「我的」）。两条都在磁盘上的历史上验，
+    /// 且本地那步的工作（a.txt 的第二行）必须保住。
+    #[test]
+    fn pulling_a_diverged_remote_merges_or_rebases_as_the_switch_says() {
+        for (rebase, parents, why) in
+            [(false, 2usize, "没勾变基却没走合并"), (true, 1, "勾了变基却没走变基")]
+        {
+            let (dir, bare) =
+                divergent_repo(&format!("pull-{}", if rebase { "rebase" } else { "merge" }));
+            let mut app = blank();
+            app.open(dir.to_str().unwrap());
+            pump(&mut app, |a| a.snap.is_some());
+            assert!(click_tool(&mut app, 1));
+            let was = match &app.modal.as_ref().unwrap().form {
+                Form::Pull { opts, .. } => opts.rebase,
+                _ => panic!("打开的不是拉取卡"),
+            };
+            assert!(!was, "重开一张卡，那枚勾得是空的");
+            if rebase {
+                assert!(click_card(&mut app, "用变基代替合并"), "变基那枚勾没点到");
+                let now = match &app.modal.as_ref().unwrap().form {
+                    Form::Pull { opts, .. } => opts.rebase,
+                    _ => panic!("打开的不是拉取卡"),
+                };
+                assert!(now, "点了那枚勾，表单里没变");
+            }
+            assert!(click_card_button(&mut app, "拉取"), "卡脚上没有「拉取」那枚");
+            pump(&mut app, |a| !a.busy);
+            assert!(
+                app.note.is_none(),
+                "拉取路上报了 note：{}",
+                app.note.clone().unwrap_or_default()
+            );
+            let n = git_in(&dir, &["log", "-1", "--format=%P"]).split_whitespace().count();
+            assert_eq!(n, parents, "{why}：HEAD 的爹有 {n} 个");
+            if rebase {
+                assert_eq!(
+                    git_in(&dir, &["log", "-1", "--format=%s"]),
+                    "我的",
+                    "变基完 HEAD 不是挪过去的那条"
+                );
+            }
+            assert!(git_in(&dir, &["log", "--format=%s"]).contains("他们的"), "远端那一步没进来");
+            assert_eq!(
+                std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+                "一行\n第二行\n",
+                "本地那一步的工作没保住"
+            );
+            let _ = std::fs::remove_dir_all(&bare);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// 「刷新」那枚：外面再克隆一本、推一条卡上还没有的新分支，点完刷新之后那一列
+    /// 才出现它。负半截先证它**不在**——不然门禁放行的是「本来就有」。
+    #[test]
+    fn the_refresh_button_brings_the_remote_branch_column_up_to_date() {
+        let dir = scratch_repo("pull-refresh");
+        git_in(&dir, &["reset", "-q", "--hard", "HEAD"]);
+        let bare = bare_remote("pull-refresh");
+        git_in(&dir, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git_in(&dir, &["push", "-q", "-u", "origin", "main"]);
+
+        let mut app = blank();
+        app.open(dir.to_str().unwrap());
+        pump(&mut app, |a| a.snap.is_some());
+        assert!(click_tool(&mut app, 1));
+
+        // 第二个克隆在外面推：本仓库的 refs/remotes/origin 只能靠 fetch 才看得见它。
+        let other = std::env::temp_dir().join(format!("gitx-other-{}-pull-refresh", std::process::id()));
+        let _ = std::fs::remove_dir_all(&other);
+        git_in(
+            &std::env::temp_dir(),
+            &["clone", "-q", bare.to_str().unwrap(), other.to_str().unwrap()],
+        );
+        git_in(&other, &["config", "user.email", "t@t.com"]);
+        git_in(&other, &["config", "user.name", "tester"]);
+        git_in(&other, &["commit", "-q", "--allow-empty", "-m", "别人推的"]);
+        git_in(&other, &["push", "-q", "origin", "HEAD:refs/heads/from-afar"]);
+
+        assert!(
+            !pull_menu_shows(&mut app, PULL_BRANCH_Y, "from-afar"),
+            "还没刷新那一列就有它了"
+        );
+        // 「刷新」按 nib 量在**正文右上**（`PULL_REFRESH`），不是卡脚那两枚，
+        // 所以走 `click_card`（整张卡里按文字找）而不是只看脚部的 `click_card_button`。
+        assert!(click_card(&mut app, "刷新"), "卡上没有「刷新」那枚");
+        pump(&mut app, |a| {
+            a.snap.as_ref().is_some_and(|s| {
+                s.remote_refs.iter().any(|r| r.name == "origin/from-afar")
+            })
+        });
+        assert!(
+            pull_menu_shows(&mut app, PULL_BRANCH_Y, "from-afar"),
+            "刷新完了那一列还是旧的"
+        );
+        assert!(
+            app.note.is_none(),
+            "刷新路上报了 note：{}",
+            app.note.clone().unwrap_or_default()
+        );
+        let _ = std::fs::remove_dir_all(&bare);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other);
+    }

@@ -129,6 +129,11 @@ pub struct RemoteRef {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Stash {
     pub index: u32,
+    /// 这条贮藏自己的提交号。选中它看内容时按 oid 取，不按 `stash@{n}`——列表随时会
+    /// 因为新存/弹出而重排，下标只在这一份快照里有效。
+    pub oid: String,
+    /// 用户写的那句说明。git 的 `On <分支>: ` / `WIP on <分支>: ` 包装在核心层就剥掉了，
+    /// 侧栏不再显示 `stash@{n}:`。
     pub message: String,
     pub date: String,
 }

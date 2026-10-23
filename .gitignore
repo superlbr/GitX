@@ -14,6 +14,9 @@ assets/fonts/*.ttf
 # Uncomment the line below only if you intend to treat this package as a published library.
 # Cargo.lock
 
+# 界面几何的测量对照（第三方截图，专有）：只在本机保留，不随仓库分发
+docs/reference/
+
 # Logs
 *.log
 npm-debug.log*

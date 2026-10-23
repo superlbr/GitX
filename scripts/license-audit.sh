@@ -24,8 +24,14 @@ done
 audit "NOTICE 要同时点名两个许可证" NOTICE "MIT License"
 audit "NOTICE 要同时点名两个许可证" NOTICE "Apache License, Version 2.0"
 audit "NOTICE 要把商标划出授权范围" NOTICE "trademarks"
-audit "再分发时必须知道截图不是我们的" ATTRIBUTION.md "docs/reference"
+audit "要在 ATTRIBUTION 里说清「本机对照图不入库」" ATTRIBUTION.md "docs/reference"
 audit "包要声明双许可" Cargo.toml 'license = "MIT OR Apache-2.0"'
+
+# 第三方界面截图只作本机测量对照，不许被提交进仓库（.gitignore 已挡住，这里再兜一道）。
+if [ -n "$(git ls-files -- docs/reference)" ]; then
+  printf '\033[31m✗ docs/reference 下的第三方截图被提交进仓库了（见 .gitignore 与 ATTRIBUTION.md）\033[0m\n'
+  failed=1
+fi
 
 # 字体不许混进仓库：8.3 MB，而且它带着 OFL 的署名义务，只该由 README 指路去取。
 if git ls-files --error-unmatch assets/fonts/NotoSansSC-Regular.otf >/dev/null 2>&1; then

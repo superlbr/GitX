@@ -1,4 +1,4 @@
-# GitCraft 开发进度与 TODO
+# GitX 开发进度与 TODO
 
 > 这份台账只留**最近两批的全文** + 可复用的结论。更早的逐批叙述一行一条，全文原样搬进了
 > [`docs/process-archive/`](file:///Users/baorong/Developer/superlbr/gitx/docs/process-archive)（精简时逐字节搬的，
@@ -271,27 +271,28 @@ Create/Apply Patch、Custom Actions、Move/Revert to Revision、冲突 Mark Reso
 - **「紧凑视图」要按两态接**：strings 里 `LogCompactView`=紧凑视图 / `LogExtendedView`=扩展视图，
   它**不是**「还没接的一枚按钮」，是有的第二层 → 该带箭头（现在 `only_the_three_switches_carry_an_arrow`
   钉的是「不带箭头」，#31 一起翻）。
-- **「所有分支」这一档今天 = 不给 git 传 rev**（走 HEAD 那一条线）。strings 里这是**两态**：
-  `LogBranchesAll`=所有分支 ⇄ `LogBranchesCurrent`=当前分支 → 我们这档的语义和标签**正好说反**：
-  「不传 rev」= 当前分支。#31 要改成两态切换，`所有分支` 那一态传 `--all`。
-- **文案与 strings 对不上的**（#31/#32，逐条抄自本机 `zh_CN.lproj/Localizable.strings`）：
-  排序那一档我们写「日期顺序」，官方是**按日期排序**；路径排序那行我们写「按路径排序」，官方是
-  **已依照路径排序**（反向：**已依照路径 (反向) 排序**）；跳转框 hint 我们写「跳转到:」，官方是
-  **转到Commit的SHA-1**；区块文案 **暂存区块 / 取消暂存区块 / 放弃区块 / 回滚区块**，
-  差异头 **块 %d ： 行 %d-%d**；领先落后 **超前%d个版本 / 落后%d个版本**；
-  侧栏还有**子模块**、**子树**两组（我们的侧栏没有）。**「侧栏没有折叠三角/计数」这条结论只对着
-  那张参考截图**，不代表 SourceTree 全部——`#32` 会连这条一起复核。
+- **「所有分支」这一档 = 不给 git 传 rev**（走 HEAD 那一条线）——**#31 已闭**：现在是三档
+  （`所有分支` 传 `--all` / `当前分支` 不传 / 具体分支传位置参数），核心层用 `git::Scope`
+  枚举而不是「rev + 布尔」。**没结案的还剩一条**：SourceTree 开仓默认落在哪一档，nib 读不出来，
+  我们按「不动现状」取了 `当前分支`。
+- **文案与 strings 对不上的**（#31/#32）：**排序那档、路径排序那行、跳转框 hint 已在 #31 逐字抄过**
+  （按日期排序 / 待定的文件, 已依照路径排序 / 转到Commit的SHA-1）。hunk 头与区块文案早就对上了
+  （`块 %d ： 行 %d-%d` = strings 的 `SummaryTextHunkSameLines`，`暂存区块 / 取消暂存区块 /
+  放弃区块` 见 #22 那批）。**还剩**：领先落后那两枚的**呈现位置**没对过参考图；
+  侧栏还有**子模块**、**子树**两组（我们的侧栏没有）；
+  「反向排序」那一档（官方 `已依照路径 (反向) 排序`）我们**只做正向**，等真接反向时再抄那条。
+  **「侧栏没有折叠三角/计数」这条结论只对着那张参考截图**，不代表 SourceTree 全部——`#32` 会连这条一起复核。
 - **还没量到的**：`LogFollowFirst`=仅首个父级 / `LogAllParents`=所有父级 —— 一个我们完全没有的
   图遍历维度；提交图标上的**暂存数角标**；`upstream/HEAD` 那枚药丸。
 
-**功能面**：设置卡（工具栏 11 枚里只剩 index 10「设置」没接，点了是显式提示）、
-push/pull 端到端判据（fetch 有，push/pull 仍无 remote 样本）、命令层 + 命令面板（⌘K 那半在 egui 版还没搬）、
+**功能面**：设置卡只接了「通用 / 关于」两页（其余六页一张空壳比没有更糟，见 `PrefPage`）、
+网络远端的 push/pull 判据（本地裸仓库的端到端已有）、命令层 + 命令面板（⌘K 那半在 egui 版还没搬）、
 多选、拖拽与「扫描文件夹」入口、原生目录选择器（要引 `rfd`）、深色模式、
 按**行**暂存（`line.hunk` 已经给每一行留了值）、差异区右上角那条「搜索」、
 `COL_GRAPH` 超过 4 道目前是 **assert 报错**（没做列宽自适应）、`--depth`/bare/submodule、
 克隆进度与 stderr 流式（现在只有结果一条 note）、`.gitignore` 编辑器、`--no-verify` / `-S` 签名、
 上面「它有一整块」那一段里的全部。
-对照表里这六条现在只是**文档**、没有判据：大补丁必须在 `diff --git` 边界折叠、窄列路径省略换头部、
+对照表里这几条现在只是**文档**、没有判据：窄列路径省略换头部、
 UI 不许出现 emoji、提交行高度只有一个来源、没有上游时绝不显示 `↑0 ↓0`、push 实参里不得出现加速节点串。
 
 **几何/视觉待复核**：`NO_W = 30`（行号栏）**没有参考图依据**，只出现在 `diff_lines_share_one_left_edge` 的右缘计算里；
@@ -362,8 +363,9 @@ UI 不许出现 emoji、提交行高度只有一个来源、没有上游时绝�
 - **文件表方框列、状态图标列、分类全选框**：`check_box` 自己画（egui 那枚跟着字号长，三列对不齐）；
   **判据必须问应用状态**这条在这批查实；M4 判定为死代码删掉、M8 假判据补 `stroked()`
 
-### 最近三批：全文在下面
+### 最近四批：全文在下面
 
+- **#31** 筛选条照抄官方文案 + 分支范围三档（`--all` / 不传 / 位置参数各占 argv 里同一格）
 - **#30** 窗口地板 770×324：**高度不背锅，撞车的是宽度**；顺带把「裁剪后可见」做成 harness 的一等公民
 - **#34** 标题栏合并：那一行 52pt **就是** macOS 标题栏（红绿灯 / 仓库名 / 11 枚按钮同排），
   代价是地板从 770 抬到 **870**
@@ -1069,3 +1071,417 @@ M2 顺带抓到一条**探针口径**：`visible_texts` 里 hunk 那一行的两
   只靠确认卡那句说明；`git push` 会失败并把错误落到 toast，没造那个夹具。
 - **冲突中 amend**：合并/变基进行到一半时勾上会怎样（git 自己会拒），文案没目视，
   也没判据。
+
+---
+
+## 筛选条照抄官方文案 + 分支范围三档（任务 #31，2026-10-23 上午）
+
+**为什么先做它**：#29 把筛选条改成带箭头的弹出按钮时，自己登记了两笔债——① 「所有分支」那一档
+**标签和语义正好说反**（不传 rev 走的是 HEAD，那是「当前分支」）；② 排序档、路径排序那行、
+跳转框 hint 三个文案是我们自己写的，官方另有其字。这两笔都属于契约第③条（**它有的、我们写错了，
+一律按它的文案与结构照抄**），比「补一个它没有的面板」优先。
+
+**决定与依据**
+
+1. **文案只从本机 app 取**：`/Applications/Sourcetree.app/Contents/Resources/zh_CN.lproj/Localizable.strings`
+   是 UTF-16LE，先 `iconv -f UTF-16 -t UTF-8` 再搜键名。抄到的四条连键名一起注在常量后面
+   （`LogDateOrder` / `LogBranchesCurrent` / `JumpToRevisionLabelGit` / `PendingFiles`+`SortedByPath`），
+   下次核对按键搜，不用再猜这字是从哪来的。
+2. **核心层用 `git::Scope` 枚举，不用「rev + 布尔」两个字段**：`{rev: Some("side"), all: true}`
+   这种组合菜单产不出来（`git log --all side` 问的根本不是用户选的那一档），而把它**从类型上建不出来**
+   比拿一条守卫去防便宜。三档各占 argv 里 `--` 之前那**同一格**：`--all` / 什么都不发 / 那条分支名。
+3. **默认那一档拆成 `default_scope()` 函数**。原因是台账方法论第 11 条那一招的复用：无头夹具
+   （`geometry.rs::shell`）自己填 `Gitx` 的字段，产品构造函数里那一位**在任何一帧里都读不到**，
+   改坏它一条判据都不会红——这是方法论第 5 条说的「删掉也不红」，但它不是死代码，是**没处读的默认值**。
+   拆出来以后 `the_log_opens_on_the_current_branch` 直接读函数，和核心层
+   `commits()` == `commits_on(HEAD)` 配成一对（一条钉壳的默认、一条钉核心的默认）。
+4. **「待定的文件」那行去掉自加的「共 N 个」**：官方那一整行就是 `待定的文件, 已依照路径排序`，
+   文件数是我们自己塞的。数量在状态栏和分类行头（`已暂存文件（1）`）都还看得到，不算丢信息。
+5. **「紧凑视图」这批**仍然**不接**，但证据更新了。之前只记着「没量过它折叠什么」，这次把 app 包搜了一遍：
+   `compactViewEnabled` 只在 **`RepoBrowserWindow.nib`**（仓库浏览器那个独立窗口）里命中，
+   主二进制里另有 `showCompactView` / `setCompactViewEnabled:`，且带 `TB,N,V_` 前缀
+   （那是 `NSToolbar` item 的 user-default 键）——**「工具栏上有这么一枚开关」有证据，
+   「它在日志里折叠掉什么」依旧零证据**（`LogView.nib` 里搜不到 compact）。
+   所以保持 #29 立的规矩：不给箭头、不接第二层，点了说实话。造一个空菜单假装像下拉，比承认没接更糟。
+
+**改了什么**
+
+- `src/git.rs`：新增 `pub enum Scope { All, Current, Rev(String) }`；`log_args` / `log_commits` /
+  `commits_page` 那一位从 `rev: Option<&str>` 换成 `scope: &Scope`；`commits` / `commits_topo`
+  传 `Current`，`commits_on` 传 `Rev`。
+- `src/ui/state.rs`：`log_rev: Option<String>` → `scope: git::Scope`（一个字段，不是两个）。
+- `src/ui/app.rs`：`set_rev` → `set_scope`（先比后写，同档重点不重取）；`ask_for_more` / `act`
+  里参数一次抓齐；新增 `default_scope()`；筛选条那枚按钮的菜单项从「所有分支 + 本地分支」
+  变成「所有分支 + **当前分支** + 本地分支」；跳转框 hint、文件表那行文案。
+- `src/ui/widgets.rs`：`DATE_ORDER` 改字面、新增 `CURRENT_BRANCH` / `PENDING_SORTED_BY_PATH` /
+  `JUMP_TO_SHA` 三条官方文案常量与 `scope_label()`（档位→标签**只这一处**，和 #22 那次
+  「两份翻译」的教训同一个防线）。
+- `src/ui/data.rs`：`snapshot_of` / `spawn_snapshot` 跟着换签名。
+
+**判据 + 反向变异表**（核心 90 例、app 111 例，`scripts/gates.sh` 四条全绿）
+
+新增四条：核心 `the_all_scope_adds_only_dash_all_in_the_rev_slot`（argv 逐字节 + 位置）、
+核心 `the_all_scope_reaches_commits_only_a_side_branch_has`（真 git，结尾拿 `rev-list --all --count` 复核条数）、
+app `the_log_opens_on_the_current_branch`、app `the_filter_bar_and_summary_carry_the_official_strings`。
+改写两条：`the_scope_menu_walks_only_the_picked_branch` → `the_scope_menu_switches_between_all_branches_and_the_current_one`
+（三档各走一遍，每档都比**提交主题**再比一次长度）；`only_the_three_switches_carry_an_arrow` 认的默认标签
+从「所有分支」换成「当前分支」。
+
+| # | 变异 | 期望 | 实际 |
+|---|---|---|---|
+| M1 | `Scope::All` 那一支不 push `--all`（枚举留着、argv 里吃掉） | 核心两条 + app 三档那条红 | 红 ×3，app 那句是 `「所有分支」那一档没有「只在支线」：["只在主线", "起点"]` |
+| M2 | `--all` 改到 pathspec **之后** | 核心 argv 那条红 | argv 那条红：`--all 落在 -- 后面就被当成路径了`。**端到端那条反而绿**——夹具没开路径筛选，`--` 压根不存在，git 把末尾的 `--all` 照样当 rev 解析。所以「参数位置」这类契约**只有 argv 层看得见**，这是方法论第 8 条（界面类优先端到端）的反向补充 |
+| M3 | `default_scope()` 改成 `All` | 只该红配置那条 | 红：`开仓默认没走当前分支`（其余全绿，正是它该孤立的形态） |
+| M4 | `scope_label` 两态标签说反 | 三条标签判据红 | 红 ×3 |
+| M5 | `DATE_ORDER` 退回自创的「日期顺序」 | 整串那条红 | 红**只有它**。另外三条引用这个常量的判据（第二层标记、排序菜单、三档范围）**全绿** = 方法论第 1 条「常量自比」的又一实证，也是这批新判据必须写**字面量**的理由 |
+| M6 | `JUMP_TO_SHA` 退回「跳转到:」 | 整串那条红 | 红：`没有整串「转到Commit的SHA-1」`，失败信息把整帧文字倒出来，旧文案在哪一格一眼可见 |
+| M7 | `PENDING_SORTED_BY_PATH` 换成官方**反向**那条（只多 `(反向)`） | 整串那条红 | 红：`没有整串「待定的文件, 已依照路径排序」`。正向/反向只差四个字，按 `contains` 比放得住 |
+| M8 | `set_scope` 删掉那次 `open()`（落了范围不重取） | app 三档那条红 | 红：`换了范围没重取列表：日志会停在旧范围上` |
+
+还原：M1/M2/M4/M5/M6/M7 走 `/tmp/g31_{git,widgets}.rs` 的 `cp` + `cmp`；
+**M3/M8 那两条不能 `cp`**——快照是在拆 `default_scope()` 之前拍的，`cp` 会把新函数一起抹掉，
+所以改成 Edit 就地翻回来（这也是「快照还原」这个习惯本身要留神的地方：快照越旧，还原越危险）。
+
+**仍然没看到过的**
+
+- **真窗口目视照旧欠着**（#25 起就没还上）：10:05 再试，System Events 数到 **0 个窗口** =
+  屏幕还锁在登录界面，`screencapture` 拍不到东西。新构建已经起来（`target/debug/gitx`，进程活着，
+  CJK 字体走 `assets/fonts/NotoSansSC-Regular.otf`），解锁就能看。要核三件事：
+  ① 按钮上「当前分支 ▼」替掉「所有分支 ▼」之后短了一个字，那排按钮的宽度有没有挪；
+  ② 展开那一列「所有分支 / 当前分支 / 本地分支」的**顺序**——官方只有两态，第三条是我们加的，
+  把它排在两态之后是拍的，没有依据；③ hint「转到Commit的SHA-1」比「跳转到:」长得多，
+  260pt 上限够不够、会不会被截断（这条只有眼睛说了算，无头只数得到字在不在）。
+- **SourceTree 开仓默认落在哪一档没依据**：user-default 的**值**在 keyed archive 里读不出来
+  （`plutil` 拒、`ibtool --dump` 不存在），所以 `Current` 是按「不动现状」取的，不是抄来的。
+- **`--all` 和「显示远程分支」那枚互不干涉**：`--all` 会把远程跟踪分支独有的提交也带进列表，
+  而药丸仍可被藏掉——藏掉之后列表里出现「看不出来源」的提交。这个组合对不对，没人判过。
+- **`--all` 会不会把 `refs/stash` 也算进去**：实测不会（git 的 `--all` 走 `refs/` 默认命名空间），
+  但**没有判据**钉这件事，换 git 版本要复看。
+- **反向排序没实现**，所以官方那条 `已依照路径 (反向) 排序` 现在画不出来，也不该画。
+
+## 贮藏可点开 + 名字剥包装 + 差异区向右看（2026-10-23 下午）
+
+用户三条：「左侧已贮藏，不能点开看内容」「stash 名字去掉前缀 `stash@{0}: On`」
+「右侧，文件改动详情不能往右查看内容（目前只有三个点省略）」。
+真窗口目视又抓到第四条：**开仓库那一屏右边写着「没有差异」**，而日志第一行
+「Uncommitted changes」明明是选中态——选中行和差异区各说各话。
+
+**决定与依据**
+
+- **名字那层包装在核心层剥**（`git::stash_message`）：`%gs` 给的是 `On <分支>: <说明>` /
+  `WIP on <分支>: <短号> <主题>`，两截都是 git 的包装，不是用户写的话。剥完
+  `Stash.message` 就只剩用户那句；那句空着（`git stash push -m ""`）时侧栏退回
+  `stash <短号>`，否则那一行是空的、看不出是哪条。界面层不再自己截字符串。
+- **按 oid 取内容，不按 `stash@{n}`**：`Stash` 多带一个 `oid` 字段。列表随时会因为新存/弹出
+  而重排，下标只在这份快照里有效；点行到内容落地中间隔着一次后台取数，用下标会拿到别人的贮藏。
+- **贮藏的未跟踪文件在第三父提交里**：`git stash show -p -u <oid> -- <path>` git 自己就拒
+  （`Too many revisions specified`，实测），所以单文件补丁拆成
+  `git diff --no-color -M <oid>^1 <oid> -- <path>` + `git show --format= --no-color <oid>^3 -- <path>`，
+  后者在**没有未跟踪文件**的贮藏上必失败（`bad revision`），失败要吞掉而不是报错——
+  这一条有专门的判据（M7）。文件清单仍走 `stash show --raw/--numstat -M -u`。
+- **向右看这件事拆成两个互不重叠的职责**（这是这批唯一的设计决定，理由见变异表 M1/M2/M4）：
+  ① **底色条**铺多宽 = `diff_cols`（`diffmodel::columns`：ASCII 1 格、制表符 4 格、其余 2 格），
+  在 `Msg::Patch` 落地时**整份补丁扫一次**存下来，帧里不重扫；② **文字**只按**看得见**的那格
+  （`ui.clip_rect().right()`）申请宽度，模式用 `.extend()` 不用 `.truncate()`——申请窄了也不许
+  把尾巴收成三个点，省略号等于谎报「没有了」。
+  为什么不让 egui 自己量出来的宽度当唯一来源：`show_rows` 每帧只排**可见行**，
+  底色条要铺满的是**全补丁最长那行**，两者不是一回事。
+  为什么文字格不按内容宽申请（第一版就是这么写的）：那样 `.truncate()` 照样不截，
+  两个机制互相顶包，M1 那类改回去的变异全绿。
+- **hunk 那两枚按钮钉视口右缘，不钉内容右缘**：行滚得动之后，钉内容右缘等于把按钮送出屏幕，
+  「只动这一块」再也点不到。
+- **开仓即取工作区差异**（`open()` 末尾一句 `request`）：SourceTree 开仓选中的就是
+  `Uncommitted changes` 并显示它的 diff——规则③（它有、我们没有 → 照它），不算我们的增强。
+
+**改了什么**
+
+- `src/models.rs`：`Stash` 加 `oid`。
+- `src/git.rs`：`stash_list` 改 `%H|%gd|%gs|%aI` 四字段 + `stash_message()`；新增
+  `stash_diff`、`stash_patch`（上面那套父提交拼法）。
+- `src/ui/state.rs`：`Sel::Stash(usize)`（顺带 `Debug`）、`Target::Stash { oid, path }`、
+  `Msg::StashFiles`、`Gitx::diff_cols`。
+- `src/ui/data.rs`：`patch_of` / `patch_label` / `target_path` 三处 match 各加贮藏那一支
+  （标签是 `<短号> · 贮藏的全部改动`）。
+- `src/ui/app.rs`：`select()` 认提交**也**认贮藏（oid 分别从日志/侧栏那份列表取，后台并发起
+  `stash_diff` 与 `commit_diff`）；`poll()` 的 `Msg::Loaded` 保留还数得上的 `Sel::Stash`、
+  `Msg::StashFiles` 照 `CommitFiles` 那一支、`Msg::Patch` 顺手算 `diff_cols`；
+  `act()` 里弹出/丢弃之前把选中收回工作区；侧栏「已贮藏」那一栏改用说明当行名并**左键可点开**
+  （原来只有右键有操作）；`file_list()` 的表头分「这条贮藏改了 N 个文件」/「这个提交改了 N 个文件」；
+  `diff_pane()` 换 `ScrollArea::both()` + `content_w` + `.extend()` + 按钮钉视口；
+  `open()` 末尾补一次工作区差异。
+- `src/ui/diffmodel.rs`：新增 `columns()`。
+- `src/geometry.rs`：夹具 `shell` 补 `diff_cols`；新增 `stash_one` / `stash_two` / `laid_out` /
+  `scroll_diff_x` 四个帮手与五条判据。
+
+**判据 + 反向变异表**（核心 93 例、app 118 例，`scripts/gates.sh` 四条全绿）
+
+新增：核心 `a_stash_without_a_message_falls_back_to_gits_own_wip_line`、
+`a_stash_keeps_the_untracked_files_it_was_stored_with`、
+`a_stash_without_untracked_files_still_has_a_patch`；
+app `a_stash_row_is_named_by_its_own_message`、`clicking_a_stash_row_opens_its_changes`、
+`dropping_a_stash_does_not_leave_the_next_one_selected`、
+`dropping_the_selected_stash_does_not_shift_another_one_under_it`、
+`opening_a_dirty_repo_shows_its_working_diff_without_a_click`、
+`the_column_ruler_counts_double_wide_glyphs`、`a_long_diff_line_can_be_scrolled_to_its_end`。
+改写：`a_stash_round_trips_through_the_sidebar` 改锚在**说明**那一行上（它原来找 `stash@{0}`，
+名字一改就找不到——那是判据跟着产品改，不是产品坏了）；
+`a_real_repo_arrives_through_the_worker_without_blocking_a_frame` 改成等**第二件事**也落地
+（`open()` 现在多派了一份差异，快照落地那一刻 busy 可以是 true）。
+
+| # | 变异 | 期望 | 实际 |
+|---|---|---|---|
+| M1 | 差异行 `.extend()` → `.truncate()` | 长行那条红 | **第一次跑全绿**。两处假绿：① 判据拿 `galley.text()` 比全文，而 epaint 那个函数返回的是**原始整句**，切掉的尾巴照样在字符串里；② 文字格当时按内容宽申请，压根没截。→ 探针换成 `galley.elided` + 数 `rows[].glyphs`，文字格改按视口宽申请。改完再跑：红 `那一行被切掉了尾巴（36/307 个字落笔）` |
+| M2 | `Msg::Patch` 里 `diff_cols` 记 0 | 长行那条红 | 红：`底色条只铺到 1050，那一行的尾巴在 4167.9`——**滚那条反而还绿**，因为 `.extend()` 的 galley 自己会把内容撑开。这就是「两个机制互相顶包」的实证，也是把判据拆成 ①落笔字数 ②底色条 ③滚得动 ④按钮还在视口的原因 |
+| M3 | 底色条 + 文字模式**一起**退回改前（`content_w = width` + `.truncate()`） | 长行那条红 | 红，报在第 ③ 条：`横向滚 200pt，那一行从 … 只走到 …` |
+| M4 | 按钮锚点 `ui.clip_rect().right()` → `rect.max.x` | 长行那条红 | **第一次跑 118 全绿**（既有那两条按钮判据用的是短补丁，内容根本没超过视口）。补第 ④ 条断言后红：`区块按钮滚完落在 4580.7，看得见的格子是 576..1050` |
+| M5 | 侧栏行名退回 `stash@{0}: <说明>` | 名字那条红 | 红 ×4（名字、点开、两条丢弃）——四条都靠行名定位，一起红是对的 |
+| M6 | `stash_message()` 原样返回 | 核心两条红 | 红 ×2：`WIP 贮藏还带着 git 的包装："WIP on main: b1a0ff1 init"` |
+| M7 | `stash_patch` 里 `^3` 取不到就报错 | 无未跟踪文件那条红 | 红：`fatal: ambiguous argument '<oid>^3'` |
+| M8 | `select()` 里贮藏那一支拿掉（一律 `commit_diff`） | 点开那条红 | 红：`600 帧还没等到`（`stash@{0}` 是合并提交，`commit_diff` 给不出那三个文件） |
+| M9 | `columns()` 把非 ASCII 记 1 格 | 尺子那条 + 长行那条红 | 红 ×2：尺子那条比的是字面量，长行那条报 `底色条只铺到 2783.5` |
+| M10 | `act()` 里「丢完回工作区」那道闸短路 | 两条丢弃判据红 | 一条**绿**：只有一条贮藏时列表清空，`Msg::Loaded` 的越界回退抢先把选中改了，真正的挪位（两条、丢顶上那条）没测到。→ 加 `stash_two` 与新判据，再跑红：`丢完还停在旧下标：头一条 挪到了 stash@{0} 顶上，看着像同一条、其实换了人` |
+| M11 | `open()` 末尾那句 `request` 拿掉 | 开仓那条红 | 红 ×2（开仓那条等不到差异；异步那条等不到 `patch_label`）——第二处说明它不是重复判据 |
+
+还原全部走 `/tmp/gitx-batch11/` 的 `cp` + `cmp`。**这批踩了一次自己的坑**：跑完 M4 之后
+`cp` 快照，把快照**之后**新写的 `scroll_diff_x` 与第 ④ 条断言一起抹掉了（变异确实红了，改动丢了，
+得重写）。规矩补进记忆：每跑绿一次就重刷那批文件的快照。
+
+**仍然没看到过的**
+
+- **真窗口里「点贮藏那一行」那一屏没看过**：这台机器上 `osascript` 的 `click at` 被挡
+  （`-25211 osascript 不允许辅助访问`），合成点击做不了；`AXRaise` / 设 frontmost 是通的。
+  所以目视只覆盖**开仓那一屏**（16:23 那张）：侧栏两行写的是「第二条」「头一条」，没有
+  `stash@{0}: On main:`；差异区 `-第一版` / `+宽宽…` 那两行铺到窗口右缘，长行**没有**三个点，
+  是被窗口边裁掉的。点开贮藏的内容、横向滚过之后的样子，都只有无头证据。
+- **横向滚动条本身长什么样没拍到**：egui 的滚动条会淡出，截图时已经没了；它出现时多高、
+  和底部状态栏会不会叠，没人看过。
+- 目视这一屏是**种子出来的**：临时 `HOME` 下光写 `gitx_last_repo` 那条 setting 不够——它要同时
+  在 `repos` 表里有行才恢复，否则停在「没有仓库」。配方记这儿：
+  `HOME=/tmp/gitx-visual/home` + `sqlite3` 塞 `repos`、`settings` 两行，再
+  `HOME=… target/debug/gitx`（窗口在 195,86 起，`screencapture -x -R195,86,1050,545 -o`）。
+- **超长行只在「已跟踪文件的未暂存差异」上测过**：某条提交的单文件差异、未跟踪文件
+  （`^3` 那支）的差异区向右滚，都没测。
+- `columns()` 的制表符记 4 格是**估**的（egui 不认制表位），没拿真带 tab 的补丁比过像素；
+  估宽偏宽（条子超出内容右缘）没有判据，也不该有。
+- `Action::StashApply`（应用到工作区）之后选中态没动、也没判据：apply 不删条目、下标不变，
+  所以没加那道闸。真撞上「apply 完列表重排」要复看。
+- **开仓即取差异**这一改的代价没量：仓库有几千处未暂存改动时，补丁在后台线程排、主线程只多收
+  一次 `Msg::Patch`，但 `columns()` 那一次全量扫描是**每个补丁一次**，没测过 28 875 行那种
+  文件落地时要多久。
+- `Sel::Stash` 和 tab 条、#37（首个 tab = 分组项目列表 + 贮藏展开）的关系没动：贮藏展开成
+  子树那种画法这批改的是**行名**，不是结构。
+
+## 三张卡：添加仓库 / 提交 / 设置（任务 #47，2026-10-23 傍晚）
+
+用户一句：「添加仓库、提交太简陋了，要弹窗，设置都没有」。三件事一起，因为它们共用同一层。
+
+**决定与依据**
+
+- **一张卡只有一个画法**：`widgets::card_rect` 定框，`app::modal_layer` 定内容，卡上长什么
+  由 `state::Form` 那一个枚举决定。再加第四张卡不该再画第三个框——所以三张卡共用
+  `MODAL_W / MODAL_TITLE_H / MODAL_ROW_H / MODAL_FOOT_H` 那四个常量，设置卡是唯一按整窗尺寸
+  量的例外（见下）。
+- **设置卡的 855×409 是从 `.nib` 里量出来的**，不是估的：SourceTree 的
+  `PreferencesWindow.nib` 里那条 `{{436.5, 574}, {855, 409}}` 就是它偏好窗口的内容框
+  （`strings` 读的）。规则③——它有、我们没有 → 照它，连尺寸一起照。
+- **添加仓库那三档（打开已有 / 克隆到本地 / 新建仓库）是我们的入口，不是复刻**（规则②）：
+  SourceTree 的 File ▸ Open 走的是系统文件选择器，这台机器上没法拿它的像素当基准
+  （`docs/reference/` 那两张只有主窗口和书签列表）。所以卡上的字是我们自己的话，
+  结构照它「一个路径 + 一个主按钮」的最小形。
+- **提交卡是第二条入口，内联那块留着**（规则②）：SourceTree 的提交框在主窗口左下角，
+  **没有**弹窗提交。用户要弹窗，那就加一张卡，但**不许**把已经照它抄过的那块内联框挪走或
+  删掉；两处发的是同一个 `Action::Commit`，卡上的文案（提交摘要 / 扩展描述 / 修正上一条提交 /
+  提交之后立刻推送）逐字取自内联那块，也就是取自它的 `.nib`。
+- **关卡的决定只有一处**：`act()` / `land()` 的返回值就是「这个动作被接住了没」。卡开着、
+  字留着，只在**没接住**的时候发生（填的路径不是仓库、手上根本还没仓库）；打错一个字母不该
+  从头再打一遍。确认卡走 `from_confirm` 绕过 `land`，否则它自己会再触发一遍关卡、把自己
+  又问一遍（M3 就是这条）。
+- **刚 `git init`、一条提交还没有的仓库：日志是一份空的日志，不是错误**（`log_commits` 里
+  那一支）。不这么写，新建仓库那一档落地后整屏是红的错误条——用户刚点完「创建」，看到的
+  却是失败。反向的一起钉：真错误（路径压根不是仓库）必须还是错误，否则这一支等于把
+  `log_commits` 所有 `Err` 咽下去。
+- **卡上的开关「改一格算一格」**：偏好卡的三枚开关当场生效、当场 `p.save(conn)`，
+  所以那张卡**没有**「取消」——说「取消」会谎报还没算的那部分能回退。
+
+**改了什么**
+
+- `src/ui/state.rs`：`Form` 加 `AddRepo { tab, dest }` / `Commit { .. }` / `Settings { .. }`
+  三支与 `AddTab`；`Modal::add_repo()` / `commit(branch, staged)` / `settings(prefs, repos, db)`
+  三个构造子；`primary()` / `detail()` / `rows()` 按档给文案。
+- `src/ui/widgets.rs`：`card_rect`（设置卡走 `PREF_W`/`PREF_H` + 40pt 屏边距，其余走 `MODAL_W`）、
+  `primary_action`（把卡上的字变成一个动作，名字空着返回 `None`）、`hunk_button` 复用成卡上的
+  横排按钮。
+- `src/ui/app.rs`：`modal_layer` 一张卡画完（标题、档签、字段、开关、底部两枚右对齐）；
+  `add_repo()` 拒收不关卡；`apply_prefs()` 回写 + 落库；`open_add_card` 等入口从工具条接上。
+- `src/ui/theme.rs`：`PREF_W` / `PREF_H`（上面那两个量出来的数）。
+- `src/git.rs`：`log_commits` 认 unborn 分支那一条。
+- `src/geometry.rs`：帮手 `card_back` / `settled_frame` / `raw_timed` / `card_now` /
+  `locate_card` / `click_card` / `click_card_button` / `type_into_card` / `card_has` /
+  `open_add_card` / `temp_db`，与下面那批判据。
+
+**判据 + 反向变异表**（核心 94 例、app 134 例，`scripts/gates.sh` 四条全绿）
+
+新增：核心 `a_repo_without_any_commits_has_an_empty_log`；
+app `the_commit_button_in_the_toolbar_opens_a_commit_card`、
+`a_commit_typed_in_the_card_lands_in_the_repo`、`an_empty_message_keeps_the_commit_card_open`、
+`the_commit_card_amend_goes_through_the_confirm_card`、`ticking_push_after_commit_lands_on_the_remote`、
+`the_add_repo_card_tabs_change_what_the_field_asks_for`、
+`a_path_that_is_not_a_repo_is_refused_without_touching_the_list`、
+`an_added_repo_is_written_to_the_database`、
+`the_new_repo_tab_initializes_a_directory_and_opens_it`、`a_clone_needs_both_fields`、
+`an_empty_bookmark_list_still_offers_a_way_in`、`the_settings_card_is_the_measured_size`、
+`the_settings_card_fits_the_window_floor`、`the_settings_card_lists_the_wired_switches`、
+`the_about_page_states_two_facts`、`the_pill_switch_takes_the_pills_off_and_persists`、
+`the_topo_switch_resorts_and_persists`、`the_restore_last_switch_is_read_back_at_startup`、
+`the_settings_card_closes_without_firing_anything`、`the_modal_card_fades_in_and_settles_at_full_opacity`。
+
+**踩了一次自己的坑（这次是判据，不是产品）**：`the_settings_card_is_the_measured_size` 头一次跑
+红在 `left: (426.0, 45.59)`——量到的是卡里那块扩展描述，不是卡底。挖下去是 egui 的 `Area`
+**淡入**（`area.rs:152 fade_in: true`，`Style::animation_time = 0.2`）把整层颜色乘了一遍，
+而无头帧的 `RawInput::time` 一直是 `None`，墙钟在两帧之间几乎不走，于是**淡入永远停在中间**：
+白卡底在测试里是 60/255，标题从白色文字里穿出来。两条路：关掉淡入（改产品，为了测试）或
+量**淡完那一格**。选后者——`settled_frame` 让时钟走 0.4s，判据量的是那一帧。并且配一条
+双向判据 `the_modal_card_fades_in_and_settles_at_full_opacity`：头一帧不许是全白（淡入没在跑），
+淡完那格必须是全白（淡入走不完，比如 Area 的 `Id` 不稳）。只加一头，另一头的坏法就漏了。
+
+| # | 变异（把产品改坏） | 红了什么 |
+|---|---|---|
+| M1 | `add_repo` 拒绝分支 `return false` → `true` | `a_path_that_is_not_a_repo_is_refused_without_touching_the_list`：「拒了一条就把卡关了，打错的那串路径跟着没了」 |
+| M2 | 提交关卡 `!raw.is_empty()` → `!msg.is_empty()` | `an_empty_message_keeps_the_commit_card_open`：「只填了描述也把卡关了」——摘要才是必填那格 |
+| M3 | 确认卡也走 `land`（`from_confirm` → `false`） | `the_commit_card_amend_goes_through_the_confirm_card` + 既有两条（`ticking_amend_rewrites_head…`、`aborting_a_merge_asks…`）：卡关掉又立刻重开，死循环 |
+| M4 | `PREF_H` 409 → 380 | `the_settings_card_is_the_measured_size` 给 `left: (855.0, 380.0)`——**尺子是那一帧，不是那个常量**，常量自己改红了才算这条判据有效 |
+| M5 | 拿掉 `log_commits` 认 unborn 那一支 | 核心 `a_repo_without_any_commits_has_an_empty_log` + `the_new_repo_tab_initializes_a_directory_and_opens_it`（note 里露出 git 128） |
+| M6 | `p.save(self.conn.as_ref())` → `p.save(None)` | 三条「落库」判据红；**纯行为那几条仍绿**——开关当场有效和下次启动还有效是两件事，只测前者就是假绿 |
+| M7 | Clone 档去掉 `!dest.is_empty()` | `a_clone_needs_both_fields` |
+| M8 | `if *push_after` → `if false` | `ticking_push_after_commit_lands_on_the_remote` |
+| M9 | 模态 Area 加 `.fade_in(false)` | `the_modal_card_fades_in_and_settles_at_full_opacity`（头一帧就全白） |
+| M10 | `Modal::add_repo()` 初始档 Open → Clone | `the_add_repo_card_tabs_change_what_the_field_asks_for` + `an_empty_bookmark_list_still_offers_a_way_in` |
+| M11 | 拿掉 `db::add_repo(c, &root, &name)` | `an_added_repo_is_written_to_the_database`——列表当场多了那条，重启就没了 |
+
+还原 11 处变异全走 `/tmp/gitx-mut-47/` 的 `cp` + `cmp`（每跑绿一次重刷快照，上一批那条规矩在这儿
+救了一次），`git diff --stat` 对过没有残留。
+
+**仍然没看到过的**
+
+- **真窗口这三张卡都拍到了**（欠的目视还上了），而且是量的不是看的：截图 @2x，
+  设置卡白底连读 854×408 pt 落在 (98, 70.5)、添加卡 379×115 @(335.5, 215)、
+  提交卡 379×245 @(335.5, 150)。窗口 1050×545，居中算下来分别是 (97.5, 68) / (335, 215) /
+  (335, 150)——每一头差的那 1px 是抗锯齿边。**卡溢出窗口、字号、CJK 都在这三张里对过。**
+- **但卡是探针叫出来的，不是点出来的**：临时在 `main.rs` 里读 `GITX_SHOT=add|commit|settings`
+  启动即挂卡，跑完已 `cp /tmp/gitx-mut-47/main.rs src/main.rs` + `cmp` 还原，`grep GITX_SHOT`
+  空。所以**从工具条点 ⊕ / ⊙ 真的把卡叫出来**那一条路径在真窗口里仍然没走过——合成点击被
+  `-25211 osascript 不允许辅助访问` 挡着，这条目视这台机器上做不了。
+- **卡上的交互一次都没在真窗口做过**：打字、切档、点开关、按 Enter、按 Esc、点遮罩、
+  提交卡真提交一条下去。全部只有无头证据。淡入这件事**肉眼没看过**——无头帧里它是停格的，
+  真窗口里 0.2s 一闪，没人确认它好看、也没人确认它不闪。
+- **克隆 / 新建两档没拍过**（截图停在默认的「打开已有」），「关于」那一档也没拍过（停在「通用」）。
+- 提交卡那个摘要+描述框在真窗口里**看着比预期高**：框从标题下面一直留到复选框上面，
+  中间一大片空白（卡 245pt，框占了 80pt 而里面只有两行字）。SourceTree 那块内联框的
+  摘要/描述比例没量过，所以没动它——**这是一处已知没定的几何**，别当它是对的。
+- 探针实例被 `AXRaise` 之后崩过一次：`NSRangeException: Cannot remove an observer
+  <_NSTouchBarFinderObservation …> for the key path "nextResponder" from <WinitView …>`。
+  没诊断、没判据，也不知道是探针特有（启动即挂卡）还是产品特有——第二个实例同样 raise 过、
+  没崩。真窗口用户手点标题栏/切焦点会不会撞上，**没看过**。
+- **添加仓库卡没有基准可比**：SourceTree 那一屏是系统文件选择器，我们这三档是自己设计的，
+  「像不像它」这个问题在这张卡上没有答案，只有「我们有没有把它做顺手」。
+- 提交卡与内联提交框是**两份状态**（卡上那份是 `Form::Commit { desc, amend, push_after }`，
+  内联那格是 `State::commit_msg`）：卡上打的字不会出现在内联那格里，反向也是。
+  这是设计上的选择还是漏的，没定——判据只测了「卡上打字 → 落到仓库」那一条。
+
+## 推送 / 拉取卡 + 整份差异按文件折叠（任务 #48，2026-10-23 深夜）
+
+用户一句：「继续，完善ui功能」。这一批把工具栏里剩的两枚（拉取、推送）接上真 git，
+并把路线图里「大补丁在 `diff --git` 边界折叠」做完。
+
+**决定与依据**
+
+- **两张卡照 `.nib` 量，不套 `MODAL_ROW_H` 那套流水布局**：`GitPushSheet` 内容区 650×271、
+  `GitPullSheet` 614×299，每一格坐标都在 `theme.rs` 的 `PUSH_*` / `PULL_*` 里，
+  `Modal::rows()` 对这两支返回 0。规则③：它有、我们没有 → 连尺寸一起照。
+- **推送按行发 refspec**：卡上「远程分支」那一格说的算，所以走
+  `git push <远端> <本地>:<远端名>` 而不是裸分支名（裸名字走 `push.default`，那是另一件事）。
+  远端名为空当场拒——`main:` 这种半截 refspec 的报错说的是左边、坏的是右边。多行依次推、
+  失败即停、不回滚（和 git 自己推多条一致）。
+- **拉取先切再拉**：`git pull <远端> <分支>` 只拉得进当前分支，目标不是当前那条时先
+  `checkout`，切失败就不拉——在错的分支上拉一次，冲突落到工作区里比报一句错难收拾。
+  `--rebase` 与 `--no-rebase` 都明写，不让策略落回仓库配置。
+- **「刷新」是正文右上那枚，不是卡脚主按钮**：nib 里 `PULL_REFRESH` 在 (513, 72) 87×32。
+  它跑 `git fetch <远端>`，卡留着不关；新快照落地后「远程分支」那一列自己换。
+  判据因此走 `click_card`（整张卡里按文字找），`click_card_button` 只看脚部，找不到它。
+- **折叠只在 `diff --git` 边界折**：文件头带本身不折，点一下在折/展之间翻；可见下标
+  `diff_rows` 在**点击时**重建（O(n) 只发生在点击那一刻），不是每帧过滤。
+  换补丁/换仓库/换选中都清空折叠状态——这一份的第 3 个文件不是上一份的第 3 个。
+- **文件头只在整份差异里画**（`path.is_none()`）：单文件差异顶上那条标题已经写着路径，
+  再画一遍只是把同一句话说两次。
+
+**改了什么**
+
+- `src/ui/diffmodel.rs`：`Kind::File`、`DiffLine.file/hunk`、`layout(patch, show_files)`、
+  `diff_path` / `unquote`（引号路径按最后一个 `" "` 从右切）。
+- `src/ui/state.rs`：`diff_rows` / `collapsed`；`PushRef` / `PushRow`、`PushBehavior`
+  （五档只决定初勾，不进 git 实参）、`Form::Push` / `Form::Pull`、`Modal::push` /
+  `Modal::pull`、`pull_modal()`。
+- `src/ui/widgets.rs`：`push_card` / `pull_card` / `cell` / `cell_left` / `cell_popup`、
+  `primary_action` 的 Push/Pull 两支、`primary_closes`。
+- `src/ui/app.rs`：`request` 按 target 决定画不画文件头；`diff_pane` 文件头带 + 折叠；
+  `Action::PushRefs` / `Action::PullFrom`；`fetch_remote` 那条（刷新不关卡）。
+- `src/ui/theme.rs`：`PUSH_*` / `PULL_*` 两组实测常量。
+- `src/git.rs`：`push_ref`、`push_all_tags`、`remote_branches`、`pull(..., PullOpts)`
+  （明写 rebase 策略）。
+- `src/geometry.rs`：`pull_cell` / `pull_menu_shows` / `pull_pick` / `push_row_box` /
+  `push_remote_cell` / `menu_shows` / `retype_at_card`，与下面那批判据。
+
+**判据 + 反向变异表**（核心 99 例、app 148 例，`scripts/gates.sh` 四条全绿）
+
+新增核心：`a_push_row_lands_under_the_name_on_the_card`、
+`a_push_row_with_a_blank_target_never_reaches_git`、
+`remote_branches_are_listed_per_remote_without_the_prefix`、
+`push_all_tags_sends_the_tags_and_only_the_tags`、`pull_options_change_what_lands_in_the_history`。
+
+新增 app：`a_multi_file_diff_folds_one_file_at_a_time`、
+`opening_a_dirty_repo_shows_its_working_diff_without_a_click`、
+`the_push_card_is_the_measured_size`、
+`the_push_card_shows_every_local_branch_and_where_it_would_land`、
+`the_push_behavior_pref_picks_which_rows_start_checked`、
+`the_push_card_only_fires_when_something_is_picked`、`the_pull_card_is_the_measured_size`、
+`the_pull_card_shows_the_three_rows_and_the_options`、
+`the_pull_card_lists_only_the_selected_remote`、
+`the_push_preferences_change_what_the_push_card_starts_with`、
+`the_push_card_sends_only_the_checked_rows_under_the_names_it_shows`、
+`pulling_lands_on_the_local_branch_the_card_names`、
+`pulling_a_diverged_remote_merges_or_rebases_as_the_switch_says`、
+`the_refresh_button_brings_the_remote_branch_column_up_to_date`。
+
+| # | 变异（把产品改坏） | 红了什么 |
+|---|---|---|
+| M1 | `request` 里 `show_files` 恒 `false` | 折叠判据 600 帧等不到两条文件头 |
+| M2 | 重建可见行时 `filter(... || true)` | 「折叠之后可见行没变少」 |
+| M3 | 文件头 `Sense::click()` → `Sense::hover()` | 「点了 a.txt 的文件头但它没被折叠」 |
+| M4 | 推送表去掉 `.filter(|r| r.picked)` | 「只推勾上的那几行」——没勾的也进了实参 |
+| M5 | 拉取目标分支那一支 `checkout` → `Ok(())` | 「没切到要拉进的那条上」 |
+| M6 | 刷新后不跑 `FetchRemote` | 刷新判据超时，`from-afar` 一直不出现 |
+| M7 | `PUSH_W` 650 → 640 | 推送卡实测尺寸判据（尺子是那一帧） |
+| M8 | `PULL_W` 614 → 600 | 拉取卡实测尺寸判据 |
+| M9 | `PushBehavior::Matching` 的 `picks` 由 `true` → `false` | 「推送偏好决定哪些行预先勾上」 |
+| M10 | `pull` 里 `opts.rebase && false` | 「分岔时按开关合并或变基」——历史形状不对 |
+| M11 | `open()` 里删掉第一格差异请求 | 「开仓就有工作区差异」600 帧等不到 |
+| M12 | 拉取卡分支列去掉 `starts_with(prefix)` | 「只列选中远端的分支」——别的远端混进来 |
+| M13 | 主按钮的「一条都没勾」闸拿掉 | 「没勾任何行时按不动」 |
+| M14 | 推送表只遍历当前分支 | 「列出每一条本地分支」 |
+| M15 | 拉取卡第二行标签改成「远程分支：」 | 「三行标签与选项」 |
+| M16 | `Form::Push` 的 `tags` 恒 `false` | 「偏好改变推送卡初值」 |
+
+16 处变异全部先红后 `cp` + `cmp` 还原（快照 `/tmp/gitx-mut-48/`），`git status` 对过没有残留。
+
+**仍然没看到过的**
+
+- **真窗口里这两张卡没拍过**：没有 `GITX_SHOT` 探针这张截图，坐标只有 nib 数值与无头判据；
+  卡在 1050×545 窗口里居中后底边还剩多少、CJK 字号对不对，肉眼看的是「没截」。
+- **推送 / 拉取只连过本地裸仓库**：没有网络远端、没有凭据 / SSH / 加速节点那条路；
+  推送失败时前半截已经落地、`note` 怎么措辞，只有核心层判据，没有真远端。
+- **折叠只在无头帧里点过**：真窗口里大补丁折开的手感、折叠后横向滚动宽度、
+  折到视口外的文件再滚回去位置对不对，都没看过。
+- **改名 / 二进制 / 引号路径的文件头**：`diff_path` 只被 `layout` 层的判据读过一眼，
+  折叠判据用的是 `a.txt` / `b.txt` 这种最普通的路径；`diff --git a/x b/x` 里带空格的那条没走。
+- **推送卡表格**：行高 16pt、表头 28pt 是 nib 的数，但 egui 的行内控件不按 16pt 自动收，
+  真窗口里可能挤；无头判据只量了卡框和文字在不在，没量行距。

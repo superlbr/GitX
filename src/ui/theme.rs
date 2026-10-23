@@ -1,6 +1,6 @@
-//! （拆分自 main.rs；见 PROCESS.md「拆分 main.rs」。）
+//! （拆分自 main.rs；见 docs/PROCESS.md「拆分 main.rs」。）
 
-use eframe::egui::Color32;
+use eframe::egui::{pos2, Color32, Rect};
 
 
 // ---- 从参考图量出来的几何（pt = @2x 截图的像素 / 2）----
@@ -244,9 +244,84 @@ pub(crate) const MODAL_W: f32 = 380.0;
 pub(crate) const MODAL_TITLE_H: f32 = 30.0;
 pub(crate) const MODAL_ROW_H: f32 = 26.0;
 pub(crate) const MODAL_FOOT_H: f32 = 34.0;
+/// 提交卡里描述那一格给三行（和内联那格 `desired_rows(3)` 同一档）。
+pub(crate) const DESC_ROWS: usize = 3;
+/// 偏好卡那一格的大小：SourceTree 4.2.19
+/// `Contents/Resources/zh_CN.lproj/PreferencesWindow.nib`（英文版同一份，数值一致）里
+/// 「通用」那张窗口的**内容区实测 855×441 pt**，不是拍的。
+/// 这里记一条更正：本仓库早先按 409 摆过，那是**把标题栏 32pt 从内容区里又减了一遍**
+/// （441 − 32 = 409）——NSWindow 的 `contentRect(forFrameRect:)` 给出来的 441 已经是
+/// 去掉标题栏与工具栏之后的那一格，不该再减。测量方法见 docs/PROCESS.md
+/// 「逆向本机 SourceTree.app」那一条（nib 用 `NSNib` 实例化后读 frame）。
+/// 小窗口放不下时按屏 clamp（判据见 `the_preferences_card_fits_a_minimal_window`）。
+pub(crate) const PREF_W: f32 = 855.0;
+pub(crate) const PREF_H: f32 = 441.0;
+
+// ---------------------------------------------------------------- 推送卡 / 拉取卡
+// 下面每一格都是从本机那两张 nib 里读出来的**内容区坐标**（NSWindow 原点在左下，
+// 这里全部换算成我们用的「距内容区顶边多少 pt」：`顶 = 内容高 − y − 高`）。
+// 测量方法与原始数字见 docs/PROCESS.md「逆向本机 SourceTree.app」。
+// 两张卡的尺寸**不跟行数走**（`Modal::rows()` 对它们返回 0），因为那一格里每一格都量过。
+
+/// `GitPushSheet` 内容区 650×271（窗口 frame 650×303，标题栏 32）。
+pub(crate) const PUSH_W: f32 = 650.0;
+pub(crate) const PUSH_H: f32 = 271.0;
+/// 「推送到仓库：」那一行的顶边。三件控件（标签 / 弹出按钮 / URL 框）同属一行，
+/// 行顶按那只 URL 框换算：nib 里 `{{253, 230}, {372, 22}}`，内容高 271 − 230 − 22 = 19。
+pub(crate) const PUSH_ROW1_Y: f32 = 19.0;
+/// 「推送到仓库：」那一行：标签 x、弹出按钮 x 与宽、右边那格显示 URL 的框。
+pub(crate) const PUSH_LABEL_X: f32 = 17.0;
+pub(crate) const PUSH_REMOTE_X: f32 = 141.0;
+pub(crate) const PUSH_REMOTE_W: f32 = 105.0;
+pub(crate) const PUSH_URL_X: f32 = 253.0;
+pub(crate) const PUSH_URL_W: f32 = 372.0;
+/// 「要推送的分支」那只框（NSBox，含标题那一条）。
+pub(crate) const PUSH_BOX: Rect = Rect::from_min_max(pos2(17.0, 45.0), pos2(633.0, 215.0));
+/// 框里的表格：列宽 38/186/260/43（表头 28pt 高、行高 16pt）——四列的宽度是 nib 里
+/// `NSTableColumn` 的实测值，行高是 `rowHeight` 的实测值。
+pub(crate) const PUSH_TABLE_X: f32 = 39.0;
+pub(crate) const PUSH_TABLE_TOP: f32 = 70.0;
+pub(crate) const PUSH_HEAD_H: f32 = 28.0;
+pub(crate) const PUSH_ROW_H: f32 = 16.0;
+pub(crate) const PUSH_COL_PICK: f32 = 38.0;
+pub(crate) const PUSH_COL_LOCAL: f32 = 186.0;
+pub(crate) const PUSH_COL_REMOTE: f32 = 260.0;
+pub(crate) const PUSH_COL_TRACK: f32 = 43.0;
+/// 「全选」那颗小按钮在框里的位置（nib 里 80×18）。
+pub(crate) const PUSH_SELECT_ALL: Rect = Rect::from_min_max(pos2(37.0, 184.0), pos2(117.0, 202.0));
+/// 框下面那两枚勾（101×18 / 91×18）。
+pub(crate) const PUSH_TAGS_Y: f32 = 217.0;
+pub(crate) const PUSH_FORCE_Y: f32 = 237.0;
+pub(crate) const PUSH_CHECK_X: f32 = 18.0;
+
+/// `GitPullSheet` 内容区 614×299（窗口 frame 614×331）。
+pub(crate) const PULL_W: f32 = 614.0;
+pub(crate) const PULL_H: f32 = 299.0;
+/// 三行标签的左缘与那一列值（弹出按钮/文本框）的左缘。
+pub(crate) const PULL_LABEL_X: f32 = 21.0;
+pub(crate) const PULL_FIELD_X: f32 = 172.0;
+pub(crate) const PULL_REMOTE_W: f32 = 425.0;
+pub(crate) const PULL_BRANCH_W: f32 = 342.0;
+/// 三行的顶边（从内容区往上量）。
+pub(crate) const PULL_REMOTE_Y: f32 = 19.0;
+pub(crate) const PULL_URL_Y: f32 = 46.0;
+pub(crate) const PULL_BRANCH_Y: f32 = 75.0;
+pub(crate) const PULL_INTO_Y: f32 = 102.0;
+/// 「刷新」那颗按钮（87×32）——它跑一次 `git fetch <远端>`，回来后那一列分支跟着新快照变。
+pub(crate) const PULL_REFRESH: Rect = Rect::from_min_max(pos2(513.0, 72.0), pos2(600.0, 104.0));
+/// 「选项」那只框（580×116）。
+pub(crate) const PULL_BOX: Rect = Rect::from_min_max(pos2(17.0, 127.0), pos2(597.0, 243.0));
+/// 框里四行从上到下的顶边。第三行「立即提交合并的改动」是 git 的默认行为
+/// （`--commit`），按「点了看不出区别的勾不如不摆」这条**故意不摆**（152 那一格空着），
+/// 理由写在 `git::PullOpts` 上。
+pub(crate) const PULL_OPT_LOG_Y: f32 = 172.0;
+pub(crate) const PULL_OPT_NOFF_Y: f32 = 192.0;
+pub(crate) const PULL_OPT_REBASE_Y: f32 = 222.0;
+pub(crate) const PULL_OPT_X: f32 = 37.0;
+
 // 参考图里那一行 hunk 头是**双倍行高**（29pt = 两条正文行）。这一版没跟上：差异区走的是
 // `ScrollArea::show_rows`，它只认一个统一行距（正文行量的也是 15~16pt，见 `DIFF_ROW_H`），
-// 逐行高度得自己按累计偏移做可见区间。所以按钮按 15pt 画，29 这条记在 PROCESS.md 等替换。
+// 逐行高度得自己按累计偏移做可见区间。所以按钮按 15pt 画，29 这条记在 docs/PROCESS.md 等替换。
 
 // 一帧里**行闭包实际跑了几次**（日志行 + 差异行）。为什么产品代码里要有这个数：
 // `FullOutput.shapes` 只有细分后的图形，egui 在细分阶段按 clip_rect 把屏幕外的行剪掉了，

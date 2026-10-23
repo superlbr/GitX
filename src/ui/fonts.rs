@@ -24,7 +24,7 @@ pub fn semibold_family() -> FontFamily {
     FontFamily::Name(INTER_SEMIBOLD_FACE.into())
 }
 
-/// 判据① 实测（见 PROCESS.md「Spike 结果」）：stock eframe 靠 `system_fonts` 能出汉字和彩色
+/// 判据① 实测（见 docs/PROCESS.md「Spike 结果」）：stock eframe 靠 `system_fonts` 能出汉字和彩色
 /// emoji，但 **U+FF1A「：」在 Proportional 链里是豆腐块**，而中文提交信息里最常见的就是这个字符。
 /// 所以自带一份全量 CJK 字体不是可选项。用 Noto Sans SC（SIL OFL，可随应用分发）。
 const BUNDLED: &str = "NotoSansSC-Regular.otf";

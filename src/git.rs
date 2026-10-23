@@ -101,12 +101,7 @@ fn explain_git_error(stderr: &str) -> String {
 /// used only for the initial fetch — the persisted remote always points at the
 /// real GitHub URL, so later `pull`/`push` never go through the node.
 pub fn clone_repo(clone_url: &str, remote_url: &str, dest: &str) -> Result<String> {
-    let dest = if std::path::Path::new(dest).is_absolute() {
-        dest.to_string()
-    } else {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        format!("{}/{}", home.trim_end_matches('/'), dest)
-    };
+    let dest = expand_dest(dest);
     let output = Command::new("git")
         .arg("clone")
         .arg(clone_url)
@@ -121,6 +116,32 @@ pub fn clone_repo(clone_url: &str, remote_url: &str, dest: &str) -> Result<Strin
         run_git(&dest, &["remote", "set-url", "origin", remote_url])?;
     }
     Ok(dest)
+}
+
+/// 在 `path` 新建一个空仓库（`git init`）。目录还不存在时 git 会把中间层一起建出来，
+/// 相对路径和克隆一样按主目录展开——「添加仓库」那张卡的「新建」那一档走的就是这条。
+pub fn init_repo(path: &str) -> Result<String> {
+    let dest = expand_dest(path);
+    let output = Command::new("git")
+        .arg("init")
+        .arg(&dest)
+        .output()?;
+    if !output.status.success() {
+        return Err(GitxError::Git(explain_git_error(&String::from_utf8_lossy(
+            &output.stderr,
+        ))));
+    }
+    Ok(dest)
+}
+
+/// 相对路径按主目录算（用户在那一格只打一个名字时，落点要能预期）。
+fn expand_dest(dest: &str) -> String {
+    if std::path::Path::new(dest).is_absolute() {
+        dest.to_string()
+    } else {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        format!("{}/{}", home.trim_end_matches('/'), dest)
+    }
 }
 
 /// True if the path is inside a git work tree.
@@ -506,13 +527,29 @@ fn parse_status(out: &str) -> RepoStatus {
 // Commits
 // ----------------------------------------------------------------------------
 
+/// Which commits the log walks — SourceTree's 「所有分支 ⇄ 当前分支」 switch, plus the
+/// third state its popup gets here (one named branch).
+///
+/// An enum rather than `rev: Option<&str>` + `all: bool`: those two together would ask
+/// git for `--all <rev>`, a scope no menu item can produce and no test could reach.
+/// Building it out of the type is cheaper than defending it with a guard.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Scope {
+    /// Every ref in the repo: `git log --all`.
+    All,
+    /// The current branch: ask git for nothing and let it fall back to HEAD.
+    Current,
+    /// One revision's ancestors: the name goes to git as a positional argument.
+    Rev(String),
+}
+
 pub fn commits(
     repo: &str,
     max: u32,
     author: Option<&str>,
     path: Option<&str>,
 ) -> Result<Vec<Commit>> {
-    log_commits(repo, max, author, path, false, 0, None)
+    log_commits(repo, max, author, path, false, 0, &Scope::Current)
 }
 
 /// The same list in topological order — SourceTree's 「层级顺序」 switch: a branch's
@@ -524,7 +561,7 @@ pub fn commits_topo(
     author: Option<&str>,
     path: Option<&str>,
 ) -> Result<Vec<Commit>> {
-    log_commits(repo, max, author, path, true, 0, None)
+    log_commits(repo, max, author, path, true, 0, &Scope::Current)
 }
 
 /// The next page of the log: `max` commits starting `skip` commits past the head.
@@ -532,15 +569,15 @@ pub fn commits_topo(
 /// continuous list — until someone commits, which shifts the boundary by one. That is
 /// the same trade every paginated history makes; refetching the whole log to be safe
 /// costs a full walk per page.
-pub fn commits_page(repo: &str, skip: u32, max: u32, topo: bool, rev: Option<&str>) -> Result<Vec<Commit>> {
-    log_commits(repo, max, None, None, topo, skip, rev)
+pub fn commits_page(repo: &str, skip: u32, max: u32, topo: bool, scope: &Scope) -> Result<Vec<Commit>> {
+    log_commits(repo, max, None, None, topo, skip, scope)
 }
 
-/// The history **of one revision** — the log bar's 「所有分支」 popup turned down to a
-/// single branch. `git log <rev>` walks that rev's ancestors, so commits only other
-/// branches reached drop out; that is the whole point of picking a branch there.
+/// The history **of one revision** — a branch picked out of the log bar's scope popup.
+/// `git log <rev>` walks that rev's ancestors, so commits only other branches reached
+/// drop out; that is the whole point of picking a branch there.
 pub fn commits_on(repo: &str, rev: &str, max: u32, topo: bool) -> Result<Vec<Commit>> {
-    log_commits(repo, max, None, None, topo, 0, Some(rev))
+    log_commits(repo, max, None, None, topo, 0, &Scope::Rev(rev.to_owned()))
 }
 
 /// Builds the `git log` argv. Split from the parse so a test can prove the topology
@@ -552,7 +589,7 @@ fn log_args(
     path: Option<&str>,
     topo: bool,
     skip: u32,
-    rev: Option<&str>,
+    scope: &Scope,
 ) -> Vec<String> {
     let fmt = "%H%x1f%h%x1f%an%x1f%ae%x1f%aI%x1f%s%x1f%P";
     let mut args: Vec<String> = vec![
@@ -572,12 +609,17 @@ fn log_args(
             args.push(format!("--author={}", t));
         }
     }
-    // A revision goes **before** the `--`: after it, git reads the same string as a
-    // pathspec and the log silently comes back empty.
-    if let Some(r) = rev {
-        let t = r.trim();
-        if !t.is_empty() {
-            args.push(t.to_string());
+    // The scope takes the single slot **before** the `--`: after it, git reads the same
+    // string as a pathspec and the log silently comes back empty — which is true for
+    // `--all` too, so both arms of the match sit ahead of the pathspec block.
+    match scope {
+        Scope::All => args.push("--all".into()),
+        Scope::Current => {}
+        Scope::Rev(r) => {
+            let t = r.trim();
+            if !t.is_empty() {
+                args.push(t.to_string());
+            }
         }
     }
     if let Some(p) = path {
@@ -627,9 +669,16 @@ fn log_commits(
     path: Option<&str>,
     topo: bool,
     skip: u32,
-    rev: Option<&str>,
+    scope: &Scope,
 ) -> Result<Vec<Commit>> {
-    let out = run_git(repo, &str_slice(&log_args(max, author, path, topo, skip, rev)))?;
+    let out = match run_git(repo, &str_slice(&log_args(max, author, path, topo, skip, scope))) {
+        Ok(out) => out,
+        // 刚 `git init` 出来的仓库有分支、还没有一条提交：`git log` 在这种仓库上退出 128，
+        // 说的是 `does not have any commits yet`。那是**一份空的日志**，不是错误——
+        // 当成错误的话，「新建仓库」开出来的那本永远读不出快照，界面卡在转圈上。
+        Err(e) if format!("{e}").contains("does not have any commits yet") => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
     Ok(parse_log(&out))
 }
 
@@ -1645,12 +1694,27 @@ fn fetch_rewritten(repo: &str, remote: Option<&str>, rewrite: &[String]) -> Resu
     Ok(())
 }
 
+/// 拉取卡「选项」里那三句真的改 git 参数的。
+///
+/// 第四句「立即提交合并的改动」（git 的 `--commit`）**没进这个结构**：它就是 git 的默认行为，
+/// 摆一枚怎么按都看不出区别的勾，比不摆更糟——和偏好卡「三条都真接得通才摆得上来」同一条规矩。
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+pub struct PullOpts {
+    /// 「用变基代替合并」→ `--rebase`。
+    pub rebase: bool,
+    /// 「无论是否可以快进更新都创建新的提交」→ `--no-ff`。
+    pub no_ff: bool,
+    /// 「包括被合并提交的信息内容」→ `--log`：合并提交的信息里带上被并进来的那些标题。
+    pub log: bool,
+}
+
 /// Pull, optionally through an acceleration node. Only the network half of a
 /// pull is redirected; the merge itself is local and unchanged.
 pub fn pull(
     repo: &str,
     remote: Option<&str>,
     branch: Option<&str>,
+    opts: &PullOpts,
     node: Option<&str>,
 ) -> Result<()> {
     let rewrite = match node {
@@ -1659,6 +1723,20 @@ pub fn pull(
     };
     let mut args: Vec<&str> = rewrite.iter().map(String::as_str).collect();
     args.push("pull");
+    if opts.rebase {
+        args.push("--rebase");
+    } else {
+        // 不勾变基就是**要合并**：明说。git 2.34+ 遇到分岔又不给策略时直接拒跑
+        // （"need to specify how to reconcile"），那时策略就落到了仓库配置头上，
+        // 而卡上那枚勾才是用户此刻的选择。
+        args.push("--no-rebase");
+    }
+    if opts.no_ff {
+        args.push("--no-ff");
+    }
+    if opts.log {
+        args.push("--log");
+    }
     if let Some(r) = remote {
         args.push(r);
     }
@@ -1701,33 +1779,157 @@ pub fn push(
     Ok(())
 }
 
+/// 推送卡表格里那一行的落地：`git push [-u] <远端> <本地>:<远端那一侧>`。
+///
+/// 为什么不复用 [`push`]：那一条的最后一个实参是**裸分支名**，走的是 git 自己的
+/// `push.default`；这一条要按卡上「远程分支」那一格说的算。两者唯一的公共部分
+/// 是「起一个 push 进程」，把 refspec 塞成布尔参数会让调用方读不出这次到底带没带
+/// refspec——而带 refspec 的 push 会**完全无视** `push.default`，这是那条参数的语义，
+/// 不是我们的实现细节。
+///
+/// 远端那一侧留空 = 这一行填错了，**当场拒**：拼出 `main:` 那种半截 refspec，git 的报错
+/// 是「src refspec main does not match any」，说的是左边、坏的是右边，用户看得一头雾水。
+pub fn push_ref(
+    repo: &str,
+    remote: &str,
+    local: &str,
+    remote_name: &str,
+    force: bool,
+    set_upstream: bool,
+) -> Result<()> {
+    if remote.is_empty() || local.is_empty() || remote_name.is_empty() {
+        return Err(GitxError::Other(
+            "推送必须同时指定远端、本地分支和远端分支名。".into(),
+        ));
+    }
+    let spec = format!("{local}:{remote_name}");
+    let mut args: Vec<String> = vec!["push".into()];
+    if force {
+        args.push("--force".into());
+    }
+    if set_upstream {
+        args.push("--set-upstream".into());
+    }
+    args.push(remote.into());
+    args.push(spec);
+    run_git(repo, &str_slice(&args))?;
+    Ok(())
+}
+
+/// 某一个远端上有哪些分支（`origin/main` 去掉前缀 = `main`），拉取卡「要拉取的远程分支」
+/// 那一格要的就是这个。
+///
+/// 单独一个函数而不是把 [`remote_refs`] 拿过来滤：那一条返回的是**带前缀的全名**
+/// （日志上的药丸要的就是那个样子，见它自己的注释），而 `git pull <远端> <分支>` 收的是
+/// 去掉远端名前缀的那一半——差的那一截正是这张卡会填错的地方，所以在源头就剥掉。
+/// `HEAD` 那条指针不是位置，剥完会剩一个空串，跟着滤掉（同 [`remote_refs`] 的理由）。
+pub fn remote_branches(repo: &str, remote: &str) -> Result<Vec<String>> {
+    let out = run_git(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname:lstrip=3)",
+            &format!("refs/remotes/{remote}/"),
+        ],
+    )?;
+    Ok(out
+        .lines()
+        // `lstrip=3` 把 `refs/remotes/origin/` 整段剥掉，那条默认分支指针落下来正好是
+        // 光一个 `HEAD`（不是 `origin/HEAD`）——第一版只滤 `ends_with("/HEAD")`，
+        // 于是那一格里混进一条选了就报错的空选项，是这条判据抓的。
+        .filter(|l| !l.is_empty() && *l != "HEAD" && !l.ends_with("/HEAD"))
+        .map(|l| l.to_string())
+        .collect())
+}
+
+/// 推送卡上「推送所有标签」那一句：`git push <remote> --tags`。
+///
+/// 单独一个函数而不是给 `push` 再加一枚布尔：`--tags` 推的是**另一批东西**（标签对象，
+/// 不是分支），和分支那几行没有共享的 refspec；混进同一个函数就要在里面判「这一枚布尔
+/// 在的时候其余参数都不算」，那是把两条命令塞进一个函数。
+pub fn push_all_tags(repo: &str, remote: &str) -> Result<()> {
+    run_git(repo, &["push", remote, "--tags"])?;
+    Ok(())
+}
+
 // ----------------------------------------------------------------------------
 // Stash
 // ----------------------------------------------------------------------------
 
 pub fn stash_list(repo: &str) -> Result<Vec<Stash>> {
-    let out = run_git(repo, &["stash", "list", "--format=%gd|%gs|%aI"])?;
+    let out = run_git(repo, &["stash", "list", "--format=%H|%gd|%gs|%aI"])?;
     let mut v = Vec::new();
     for line in out.lines() {
         if line.is_empty() {
             continue;
         }
-        let parts: Vec<&str> = line.splitn(3, '|').collect();
-        if parts.len() < 3 {
+        let parts: Vec<&str> = line.splitn(4, '|').collect();
+        if parts.len() < 4 {
             continue;
         }
-        let idx = parts[0]
+        let idx = parts[1]
             .trim_start_matches("stash@{")
             .trim_end_matches('}')
             .parse::<u32>()
             .unwrap_or(0);
         v.push(Stash {
             index: idx,
-            message: parts[1].to_string(),
-            date: parts[2].to_string(),
+            oid: parts[0].to_string(),
+            message: stash_message(parts[2]),
+            date: parts[3].to_string(),
         });
     }
     Ok(v)
+}
+
+/// `%gs` 自带 git 那层包装：给了 `-m` 是 `On <分支>: <说明>`，没给是
+/// `WIP on <分支>: <短 oid> <提交标题>`。侧栏只该显示说明本身。
+/// 分支名里不可能有 `:`（git 的 ref 规则），所以第一个 `": "` 就是包装与正文的分界。
+fn stash_message(raw: &str) -> String {
+    for pre in ["WIP on ", "On "] {
+        if let Some(rest) = raw.strip_prefix(pre) {
+            if let Some((_, msg)) = rest.split_once(": ") {
+                return msg.to_owned();
+            }
+        }
+    }
+    raw.to_owned()
+}
+
+/// 一条贮藏改了哪些文件。走 `stash show` 而不是 `show <oid>`：贮藏是个合并提交，
+/// `git show` 对它默认按合并提交出 `--cc`，两侧都不同的文件才露头；`stash show`
+/// 比的是它的第一父提交，也就是贮藏时的工作区。`-u` 把第三父提交里的未跟踪文件
+/// 一并算进来（用户存的是「全部改动」，不是「已跟踪的那一半」）。
+pub fn stash_diff(repo: &str, oid: &str) -> Result<Vec<DiffEntry>> {
+    let raw = run_git(repo, &["stash", "show", "--raw", "-M", "-u", oid])?;
+    let num = run_git(repo, &["stash", "show", "--numstat", "-u", oid])?;
+    Ok(parse_diff_output(&raw, &num))
+}
+
+/// 一条贮藏的补丁。不用 `git stash show -p`：它**不接受路径**（`Too many revisions
+/// specified`），而右侧那一格点单个文件要的正是路径过滤。拆成两段自己拼：
+/// - 已跟踪那半边 = `stash@{n}` 相对**第一父提交**的差异；
+/// - 未跟踪那半边住在贮藏的**第三父提交**里（`stash show -u` 内部也是这么算的）。
+///   没带 `-u` 存出来的贮藏没有第三父提交，`^3` 会让 git 报 `bad revision`——
+///   那份缺失不是错误，取不到就当没有。
+pub fn stash_patch(repo: &str, oid: &str, path: Option<&str>) -> Result<String> {
+    let mut tracked: Vec<String> =
+        vec!["diff".into(), "--no-color".into(), "-M".into(), format!("{oid}^1"), oid.into()];
+    if let Some(p) = path {
+        tracked.push("--".into());
+        tracked.push(p.into());
+    }
+    let mut out = run_git(repo, &str_slice(&tracked))?;
+    let mut untracked: Vec<String> =
+        vec!["show".into(), "--format=".into(), "--no-color".into(), format!("{oid}^3")];
+    if let Some(p) = path {
+        untracked.push("--".into());
+        untracked.push(p.into());
+    }
+    if let Ok(extra) = run_git(repo, &str_slice(&untracked)) {
+        out.push_str(&extra);
+    }
+    Ok(out)
 }
 
 pub fn stash_push(repo: &str, message: &str, include_untracked: bool) -> Result<()> {
@@ -2085,7 +2287,7 @@ mod tests {
         assert_eq!(commits.len(), 2);
         assert_eq!(commits[0].subject, "add b");
         // 翻页：`--skip=1` 就是第二页，接在第一页后面、不重叠。
-        let second = commits_page(&p, 1, 10, false, None).unwrap();
+        let second = commits_page(&p, 1, 10, false, &Scope::Current).unwrap();
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].id, commits[1].id);
     }
@@ -2220,11 +2422,30 @@ mod tests {
         assert!(err.contains("7"), "错误里没带上块号：{err}");
     }
 
-    /// 「层级顺序」这个开关只该多一条 `--topo-order`，不许顺带改掉筛选条件——    /// 否则切一次排序，用户看到的提交集合会静默变掉。
+    /// 刚 `git init` 出来、一条提交还没有的仓库：日志是**空的**，不是错误。
+    /// 当成错误，「新建仓库」那一步开出来的本子永远读不出快照，界面停在转圈上。
+    /// 反向的要一起钉：真错误（那不是仓库）必须还是错误——否则这条判据等于把
+    /// `log_commits` 的 `Err` 全咽下去，改坏任何一类失败都不会红。
+    #[test]
+    fn a_repo_without_any_commits_has_an_empty_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().to_str().unwrap().to_string();
+        git(&p, &["init", "-q", "-b", "main"]);
+        git(&p, &["config", "user.email", "t@t.com"]);
+        git(&p, &["config", "user.name", "tester"]);
+        assert!(commits(&p, 100, None, None).unwrap().is_empty(), "空仓库该读出一份空的日志");
+        assert!(
+            commits(&dir.path().join("没在这儿").to_str().unwrap().to_owned(), 100, None, None).is_err(),
+            "指向不存在的路径也当成了空日志"
+        );
+    }
+
+    /// 「层级顺序」这个开关只该多一条 `--topo-order`，不许顺带改掉筛选条件——
+    /// 否则切一次排序，用户看到的提交集合会静默变掉。
     #[test]
     fn topo_switch_only_adds_the_order_flag() {
-        let plain = log_args(10, Some("nobody"), Some("src/a.rs"), false, 0, None);
-        let topo = log_args(10, Some("nobody"), Some("src/a.rs"), true, 0, None);
+        let plain = log_args(10, Some("nobody"), Some("src/a.rs"), false, 0, &Scope::Current);
+        let topo = log_args(10, Some("nobody"), Some("src/a.rs"), true, 0, &Scope::Current);
         assert!(!plain.iter().any(|a| a == "--topo-order"), "日期序里冒出 topo 参数");
         assert_eq!(topo.iter().filter(|a| *a == "--topo-order").count(), 1);
         let without = |v: Vec<String>| {
@@ -2239,8 +2460,8 @@ mod tests {
     /// `git log --skip=0` 合法但白拼一个参数，也让「有没有下一页」的判断少了对照。
     #[test]
     fn the_page_offset_only_adds_skip() {
-        let first = log_args(3, None, None, false, 0, None);
-        let second = log_args(3, None, None, false, 3, None);
+        let first = log_args(3, None, None, false, 0, &Scope::Current);
+        let second = log_args(3, None, None, false, 3, &Scope::Current);
         assert!(!first.iter().any(|a| a.starts_with("--skip")), "第一页发了 --skip");
         assert_eq!(second.iter().filter(|a| a.starts_with("--skip")).count(), 1);
         assert!(second.contains(&"--skip=3".to_owned()));
@@ -2253,8 +2474,8 @@ mod tests {
     /// 和 `topo_switch_only_adds_the_order_flag` 同一个理由：换筛选条件不许顺带改别的参数。
     #[test]
     fn the_rev_argument_only_adds_the_rev_before_the_pathspec() {
-        let all = log_args(10, Some("nobody"), Some("src/a.rs"), false, 0, None);
-        let one = log_args(10, Some("nobody"), Some("src/a.rs"), false, 0, Some("side"));
+        let all = log_args(10, Some("nobody"), Some("src/a.rs"), false, 0, &Scope::Current);
+        let one = log_args(10, Some("nobody"), Some("src/a.rs"), false, 0, &Scope::Rev("side".into()));
         assert_eq!(one.len(), all.len() + 1, "多出来的不止那一个参数：{one:?}");
         let without: Vec<String> = one.iter().filter(|a| **a != "side").cloned().collect();
         assert_eq!(without, all, "选分支顺带改了别的参数：{all:?}");
@@ -2262,7 +2483,29 @@ mod tests {
         let at = one.iter().position(|a| a == "side").unwrap();
         assert!(at < dash, "rev 落在 `--` 后面就被当成路径了：{one:?}");
         // 空白的那一位等于没选：不给 git 传一个空参数（它会报 ambiguous argument）。
-        assert_eq!(log_args(10, None, None, false, 0, Some("  ")), log_args(10, None, None, false, 0, None));
+        assert_eq!(
+            log_args(10, None, None, false, 0, &Scope::Rev("  ".into())),
+            log_args(10, None, None, false, 0, &Scope::Current)
+        );
+    }
+
+    /// 「所有分支」那一档只多 `--all` 这一位，而且它占的正是 rev 那一格：两种范围**互斥**，
+    /// 同一条 argv 里不该同时出现 `--all` 和一个位置参数（`git log --all side` 会把 side
+    /// 之外的分支也算进去，用户在菜单上选的到底是哪一档就说不清了）。
+    /// `--all` 同样必须在 `--` 前面——落到后面 git 当它是路径，列表安静地回空。
+    #[test]
+    fn the_all_scope_adds_only_dash_all_in_the_rev_slot() {
+        let cur = log_args(10, Some("nobody"), Some("src/a.rs"), false, 0, &Scope::Current);
+        let all = log_args(10, Some("nobody"), Some("src/a.rs"), false, 0, &Scope::All);
+        assert_eq!(all.len(), cur.len() + 1, "多出来的不止 --all：{all:?}");
+        assert_eq!(all.iter().filter(|a| *a == "--all").count(), 1, "--all 发了不止一次");
+        let without: Vec<String> = all.iter().filter(|a| *a != "--all").cloned().collect();
+        assert_eq!(without, cur, "开 --all 顺带改了别的参数：{cur:?}");
+        let dash = all.iter().position(|a| a == "--").expect("带路径筛选时该有 `--`");
+        let at = all.iter().position(|a| a == "--all").unwrap();
+        assert!(at < dash, "--all 落在 `--` 后面就被当成路径了：{all:?}");
+        // 默认那一档不许偷偷带 --all：`commits()` 和 `commits_on(HEAD)` 必须是同一份列表。
+        assert!(!cur.iter().any(|a| a == "--all"), "当前分支那一档发了 --all");
     }
 
     /// 端到端：`commits_on("side")` 只走那条支线的祖先，主线独有的提交得不在列表里；
@@ -2293,6 +2536,35 @@ mod tests {
         assert_eq!(subjects(commits(&p, 50, None, None).unwrap()), main, "默认列表和当前分支的列表不一致");
         // 层级序走同一条参数：换排序不该让「按分支筛」筛出别的东西。
         assert_eq!(subjects(commits_on(&p, "side", 50, true).unwrap()), side, "topo 下支线列表变了");
+    }
+
+    /// 端到端：`Scope::All` 那条档必须真把**只有别的分支走得到**的提交取回来。
+    /// 只钉 argv 不算——`--all` 发出去但解析时丢掉，argv 判据照样绿。
+    /// 判据两边都问：`Current` 里没有「只在支线」，`All` 里两条都有；反过来「All 比 Current
+    /// 多几条」单独成立，因为多出来的可能是别的仓库对象。
+    #[test]
+    fn the_all_scope_reaches_commits_only_a_side_branch_has() {
+        let (_d, p) = init_repo();
+        let base = status(&p).unwrap().branch;
+        git(&p, &["checkout", "-q", "-b", "side"]);
+        fs::write(format!("{}/side.txt", p), "侧\n").unwrap();
+        git(&p, &["add", "-A"]);
+        git(&p, &["commit", "-q", "-m", "只在支线"]);
+        git(&p, &["checkout", "-q", base.as_str()]);
+        fs::write(format!("{}/main.txt", p), "一\n").unwrap();
+        git(&p, &["add", "-A"]);
+        git(&p, &["commit", "-q", "-m", "只在主线"]);
+
+        let subjects = |l: Vec<Commit>| -> Vec<String> { l.iter().map(|c| c.subject.clone()).collect() };
+        let cur = subjects(commits_page(&p, 0, 50, false, &Scope::Current).unwrap());
+        let all = subjects(commits_page(&p, 0, 50, false, &Scope::All).unwrap());
+        assert!(cur.contains(&"只在主线".to_owned()) && !cur.contains(&"只在支线".to_owned()), "当前分支那档串了：{cur:?}");
+        for want in ["只在主线", "只在支线"] {
+            assert!(all.contains(&want.to_owned()), "所有分支那档没有「{want}」：{all:?}");
+        }
+        // 对照：仓库里可走得到的提交总数（所有 ref），`--all` 就该给出这些。
+        let want = run_git(&p, &["rev-list", "--all", "--count"]).unwrap().trim().to_string();
+        assert_eq!(all.len().to_string(), want, "--all 的条数和仓库里的对不上：{all:?}");
     }
 
     /// 图序列是一行一行往下排的，靠的是 git 那条保证：**父提交一定排在子提交下面**。
@@ -2458,9 +2730,66 @@ mod tests {
         stash_push(&p, "wip work", true).unwrap();
         let list = stash_list(&p).unwrap();
         assert_eq!(list.len(), 1);
+        // 侧栏只显示用户写的那句。`On main: ` 是 git 的包装，`stash@{0}: ` 是列表的包装。
+        assert_eq!(list[0].message, "wip work", "贮藏说明还带着 git 那层 `On <分支>: ` 包装");
+        assert_eq!(list[0].oid.len(), 40, "没带上贮藏的提交号，点开就取不到内容");
         stash_pop(&p, 0).unwrap();
         let list = stash_list(&p).unwrap();
         assert_eq!(list.len(), 0);
+    }
+
+    /// 命令行 `git stash`（不给 `-m`）存出来的是 `WIP on <分支>: <短oid> <提交标题>`。
+    /// 剥掉包装之后剩下的仍是 git 自己那句兜底说明，不是空行。
+    #[test]
+    fn a_stash_without_a_message_falls_back_to_gits_own_wip_line() {
+        let (_d, p) = init_repo();
+        fs::write(format!("{}/a.txt", p), "changed\n").unwrap();
+        git(&p, &["stash", "push"]);
+        let list = stash_list(&p).unwrap();
+        assert!(
+            !list[0].message.starts_with("WIP on "),
+            "WIP 贮藏还带着 git 的包装：{:?}",
+            list[0].message
+        );
+        assert!(list[0].message.contains("init"), "剥完连 git 那句兜底说明都没了：{:?}", list[0].message);
+    }
+
+    /// 点开一条贮藏要看的是**整条贮藏**：`-u` 存进去的未跟踪文件也在一块补丁里。
+    #[test]
+    fn a_stash_keeps_the_untracked_files_it_was_stored_with() {
+        let (_d, p) = init_repo();
+        fs::write(format!("{}/a.txt", p), "changed\n").unwrap();
+        fs::write(format!("{}/new.txt", p), "从没进过索引\n").unwrap();
+        stash_push(&p, "带未跟踪", true).unwrap();
+        let list = stash_list(&p).unwrap();
+        let oid = &list[0].oid;
+
+        let files = stash_diff(&p, oid).unwrap();
+        let names: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        assert!(names.contains(&"new.txt"), "贮藏的改动列表里没有未跟踪文件：{names:?}");
+        assert!(names.contains(&"a.txt"), "贮藏的改动列表里没有改过的 a.txt：{names:?}");
+
+        let patch = stash_patch(&p, oid, None).unwrap();
+        assert!(patch.starts_with("diff --git "), "贮藏补丁第一行不是 diff --git：{patch:?}");
+        assert!(patch.contains("+从没进过索引"), "整份补丁里没有未跟踪文件的内容：{patch}");
+        assert!(patch.contains("+changed"), "整份补丁里没有改过的内容：{patch}");
+
+        let one = stash_patch(&p, oid, Some("new.txt")).unwrap();
+        assert!(one.contains("new.txt") && !one.contains("a.txt"), "按路径过滤那份串到别的文件了：{one}");
+    }
+
+    /// 没带 `-u` 存出来的贮藏**没有第三父提交**：`^3` 会报 `bad revision`。
+    /// 少了这一条，「未跟踪那半边取不到就忽略」会被写成「取不到就报错」，
+    /// 而最常见的普通贮藏恰好没有第三父提交。
+    #[test]
+    fn a_stash_without_untracked_files_still_has_a_patch() {
+        let (_d, p) = init_repo();
+        fs::write(format!("{}/a.txt", p), "changed\n").unwrap();
+        stash_push(&p, "只有已跟踪", false).unwrap();
+        let list = stash_list(&p).unwrap();
+        let patch = stash_patch(&p, &list[0].oid, None).unwrap();
+        assert!(patch.contains("+changed"), "普通贮藏的补丁读不出来：{patch}");
+        assert_eq!(stash_diff(&p, &list[0].oid).unwrap().len(), 1, "普通贮藏该只有一个文件");
     }
 
     #[test]
@@ -2653,6 +2982,153 @@ mod tests {
 
         push(&p, Some("origin"), Some(&branch), false, true).unwrap();
         assert_eq!(up_of(&branch), Some(format!("origin/{}", branch)));
+    }
+
+    /// 推送卡那一行可以「本地叫 main、远端叫 main2」——落地必须按卡上那格说的算，
+    /// 而不是按本地的名字。这条也是 `push_ref` 带 refspec 的那一半唯一被盯着的地方：
+    /// 不带 refspec 时 git 会推成同名分支，而**同名那一行看不出错**，只有改名那条能暴露。
+    #[test]
+    fn a_push_row_lands_under_the_name_on_the_card() {
+        let (_d, p) = init_repo();
+        let remote = tempfile::tempdir().unwrap();
+        let remote_dir = remote.path().to_str().unwrap();
+        git(remote_dir, &["init", "--bare", "-q", "upstream.git"]);
+        git(&p, &["remote", "add", "origin", &format!("{remote_dir}/upstream.git")]);
+        let branch = current_branch(&p).unwrap();
+
+        push_ref(&p, "origin", &branch, "renamed", false, true).unwrap();
+
+        let on_remote = remote_branches(&p, "origin").unwrap();
+        assert_eq!(on_remote, vec!["renamed".to_owned()], "远端上只有卡上那一格说的那个名字");
+        // `-u` 记的也是那一格：记成 `origin/main` 的话，下一次 push 会往一个远端上
+        // 并不存在的分支去比，ahead/behind 永远是假的。
+        assert_eq!(
+            branches(&p)
+                .unwrap()
+                .into_iter()
+                .find(|b| b.name == branch)
+                .and_then(|b| b.upstream),
+            Some("origin/renamed".to_owned())
+        );
+    }
+
+    /// 「远程分支」那一格被清空 = 填错了，**当场拒**，一个 git 进程都不起。
+    /// 拼成 `main:` 交给 git 会报「src refspec main does not match any」——说的是左边、
+    /// 坏的是右边，用户照着报错去查本地分支名，什么都查不到。
+    #[test]
+    fn a_push_row_with_a_blank_target_never_reaches_git() {
+        let (_d, p) = init_repo();
+        let remote = tempfile::tempdir().unwrap();
+        let remote_dir = remote.path().to_str().unwrap();
+        git(remote_dir, &["init", "--bare", "-q", "upstream.git"]);
+        git(&p, &["remote", "add", "origin", &format!("{remote_dir}/upstream.git")]);
+        let branch = current_branch(&p).unwrap();
+
+        assert!(push_ref(&p, "origin", &branch, "", false, false).is_err());
+        assert!(remote_branches(&p, "origin").unwrap().is_empty(), "被拒的那一行不该在远端留下东西");
+    }
+
+    /// 拉取卡「要拉取的远程分支」那一格按**远端**列，不是把所有远端跟踪引用摊在一张表里：
+    /// 一本仓库可以同时挂 origin 和 fork，两边的同名分支是两条不同的东西。
+    /// `refs/remotes/origin/HEAD` 是「默认分支」那条指针，不是位置——它必须在源头就被滤掉，
+    /// 否则那一格会多出一条拉不动的空选项（理由同 [`remote_refs`] 里 lstrip 那一段）。
+    #[test]
+    fn remote_branches_are_listed_per_remote_without_the_prefix() {
+        let (_d, p) = init_repo();
+        let r1 = tempfile::tempdir().unwrap();
+        let r2 = tempfile::tempdir().unwrap();
+        let (d1, d2) = (r1.path().to_str().unwrap(), r2.path().to_str().unwrap());
+        git(d1, &["init", "--bare", "-q", "a.git"]);
+        git(d2, &["init", "--bare", "-q", "b.git"]);
+        git(&p, &["remote", "add", "origin", &format!("{d1}/a.git")]);
+        git(&p, &["remote", "add", "fork", &format!("{d2}/b.git")]);
+        let branch = current_branch(&p).unwrap();
+        git(&p, &["branch", "feature/x"]);
+        push(&p, Some("origin"), Some(&branch), false, false).unwrap();
+        push(&p, Some("origin"), Some("feature/x"), false, false).unwrap();
+        push(&p, Some("fork"), Some(&branch), false, false).unwrap();
+        git(&p, &["remote", "set-head", "origin", &branch]);
+
+        assert_eq!(
+            remote_branches(&p, "origin").unwrap(),
+            // 顺序是 `for-each-ref` 给的（按引用名排），不是推送顺序——那一格是给用户挑的
+            // 列表，稳定的顺序比「推的先后」有用，判据钉的是**集合**加这个确定性。
+            vec!["feature/x".to_owned(), branch.clone()],
+            "嵌套的分支名要整个留下，只剥掉远端名前缀那一段"
+        );
+        assert_eq!(remote_branches(&p, "fork").unwrap(), vec![branch.clone()]);
+        assert!(remote_branches(&p, "没有这个远端").unwrap().is_empty());
+    }
+
+    /// 「推送所有标签」那一句得真的把标签推到远端去——它是 `--tags`，不是「顺便推一下
+    /// 当前分支」。这条也是这整批里唯一一条**盯着远端看一眼**的标签判据：
+    /// 只测本地建了标签，等于什么都没测。
+    #[test]
+    fn push_all_tags_sends_the_tags_and_only_the_tags() {
+        let (_d, p) = init_repo();
+        let remote = tempfile::tempdir().unwrap();
+        let remote_dir = remote.path().to_str().unwrap();
+        git(remote_dir, &["init", "--bare", "-q", "upstream.git"]);
+        git(&p, &["remote", "add", "origin", &format!("{remote_dir}/upstream.git")]);
+        let branch = current_branch(&p).unwrap();
+        git(&p, &["tag", "v1"]);
+        push_all_tags(&p, "origin").unwrap();
+
+        let on_remote = run_git(remote_dir, &["ls-remote", "--tags", "-q", "upstream.git"]).unwrap();
+        assert!(on_remote.contains("refs/tags/v1"), "远端上没有那个标签：{on_remote}");
+        // `--tags` 不推分支：分支那一条得留到卡上表格那一行自己落地时才走。
+        let refs_on_remote = run_git(remote_dir, &["ls-remote", "--heads", "upstream.git"]).unwrap();
+        assert!(!refs_on_remote.contains(&branch), "推标签时把分支也推上去了：{refs_on_remote}");
+    }
+
+    /// 拉取卡「选项」里那三句真的换一个 git 参数，而且**换出来的结果看得见的不同**：
+    /// 同一条分叉，`--rebase` 下面是线性历史，`--no-ff` 下面必然多一枚合并提交。
+    /// 只测 argv 不测结果是假的（契约见 docs/PROCESS.md「判据方法论」）。
+    #[test]
+    fn pull_options_change_what_lands_in_the_history() {
+        // 造一份「本地和远端各多一条」的真分叉，按给定选项拉完，数历史里有几枚合并提交。
+        // 两个临时目录要活到断言之后，所以连着仓库路径一起还回去。
+        let forked_then_pull = |rebase: bool, no_ff: bool| -> (tempfile::TempDir, tempfile::TempDir, usize) {
+            let (mine, base) = init_repo();
+            let upstream = tempfile::tempdir().unwrap();
+            let up_dir = upstream.path().to_str().unwrap();
+            git(up_dir, &["init", "--bare", "-q", "upstream.git"]);
+            git(&base, &["remote", "add", "origin", &format!("{up_dir}/upstream.git")]);
+            let branch = current_branch(&base).unwrap();
+            push(&base, Some("origin"), Some(&branch), false, true).unwrap();
+
+            // 远端那一侧由另一份工作区推进。
+            let other = tempfile::tempdir().unwrap();
+            let o = other.path().to_str().unwrap();
+            git(o, &["clone", "-q", &format!("{up_dir}/upstream.git"), "w"]);
+            git(o, &["-C", "w", "config", "user.email", "t@t.com"]);
+            git(o, &["-C", "w", "config", "user.name", "other"]);
+            fs::write(format!("{o}/w/b.txt"), "远端那条\n").unwrap();
+            git(o, &["-C", "w", "add", "."]);
+            git(o, &["-C", "w", "commit", "-q", "-m", "远端多一条"]);
+            git(o, &["-C", "w", "push", "-q"]);
+            drop(other);
+
+            // 本地也推进一条 → 到这儿才是真的分叉，合还是变基这才看得出来。
+            fs::write(format!("{base}/c.txt"), "本地那条\n").unwrap();
+            git(&base, &["add", "."]);
+            git(&base, &["commit", "-q", "-m", "本地多一条"]);
+
+            let opts = PullOpts { rebase, no_ff, log: false };
+            pull(&base, Some("origin"), Some(&branch), &opts, None).unwrap();
+            let merges = run_git(&base, &["log", "--format=%P"])
+                .unwrap()
+                .lines()
+                .filter(|l| l.split_whitespace().count() > 1)
+                .count();
+            (mine, upstream, merges)
+        };
+
+        let (m1, u1, rebase_merges) = forked_then_pull(true, false);
+        let (m2, u2, no_ff_merges) = forked_then_pull(false, true);
+        assert_eq!(rebase_merges, 0, "变基之后不该有合并提交");
+        assert!(no_ff_merges >= 1, "`--no-ff` 那一侧必须多出一枚合并提交");
+        drop((m1, u1, m2, u2));
     }
 
     /// A number without a baseline is not "in sync", and the interface must be

@@ -1,4 +1,4 @@
-//! （拆分自 main.rs；见 PROCESS.md「拆分 main.rs」。）
+//! （拆分自 main.rs；见 docs/PROCESS.md「拆分 main.rs」。）
 
 use chrono::Datelike;
 use eframe::egui::{self, Align2, Color32, FontId, Label, Rect, RichText, Sense, Stroke, TextStyle, Vec2, pos2, vec2};
@@ -73,11 +73,11 @@ pub(crate) fn ref_badges(
 /// 到底了由 `Msg::More` 用 `--skip` 再取一页。
 pub(crate) const LOG_PAGE: u32 = 500;
 
-pub(crate) fn snapshot_of(repo: &str, topo: bool, rev: Option<&str>) -> gitx::Result<Snapshot> {
+pub(crate) fn snapshot_of(repo: &str, topo: bool, scope: &git::Scope) -> gitx::Result<Snapshot> {
     // 日期序是 SourceTree 的默认；「层级顺序」把分支聚在一起，图序列读起来才是一条条分支。
     // 第一页走 `skip = 0`：核心层不发消息里那条 `--skip`（`the_page_offset_only_adds_skip` 钉过），
     // 所以这一句和原来分三条路的写法发给 git 的 argv 逐字节相同。
-    let commits = git::commits_page(repo, 0, LOG_PAGE, topo, rev)?;
+    let commits = git::commits_page(repo, 0, LOG_PAGE, topo, scope)?;
     // 车道在这里排完：这一句跑在 worker 线程上，帧里只剩「按行号取一条 GraphRow」。
     let graph = layout_graph(&commits);
     let branches = git::branches(repo)?;
@@ -117,10 +117,10 @@ pub(crate) fn append_page(snap: &mut Snapshot, more: Vec<Commit>) {
     snap.dates = snap.commits.iter().map(|c| date_label(&c.date, snap.taken_at)).collect();
 }
 
-pub(crate) fn spawn_snapshot(tx: &Sender<Msg>, repo: &str, topo: bool, rev: Option<&str>) {
-    let (tx, repo, rev) = (tx.clone(), repo.to_owned(), rev.map(str::to_owned));
+pub(crate) fn spawn_snapshot(tx: &Sender<Msg>, repo: &str, topo: bool, scope: &git::Scope) {
+    let (tx, repo, scope) = (tx.clone(), repo.to_owned(), scope.clone());
     std::thread::spawn(move || {
-        let _ = tx.send(match snapshot_of(&repo, topo, rev.as_deref()) {
+        let _ = tx.send(match snapshot_of(&repo, topo, &scope) {
             Ok(s) => Msg::Loaded { repo, snap: Box::new(s) },
             Err(e) => Msg::Failed(format!("{repo}: {e}")),
         });
@@ -145,7 +145,7 @@ pub(crate) fn spawn_file_log(tx: &Sender<Msg>, repo: &str, path: &str, seq: u64)
 pub(crate) fn spawn_history_patch(tx: &Sender<Msg>, repo: &str, oid: &str, path: &str, seq: u64, index: usize) {
     let (tx, repo, path, oid) = (tx.clone(), repo.to_owned(), path.to_owned(), oid.to_owned());
     std::thread::spawn(move || {
-        let lines = git::commit_patch(&repo, &oid, Some(&path)).map(|p| layout(&p)).unwrap_or_default();
+        let lines = git::commit_patch(&repo, &oid, Some(&path)).map(|p| layout(&p, false)).unwrap_or_default();
         let _ = tx.send(Msg::HistoryPatch { repo, seq, path, index, lines });
     });
 }
@@ -185,6 +185,7 @@ pub(crate) fn patch_of(repo: &str, target: &Target) -> gitx::Result<String> {
             Ok(text)
         }
         Target::Commit { oid, path } => git::commit_patch(repo, oid, path.as_deref()),
+        Target::Stash { oid, path } => git::stash_patch(repo, oid, path.as_deref()),
     }
 }
 
@@ -194,6 +195,8 @@ pub(crate) fn patch_label(t: &Target) -> String {
         Target::Working { staged, path: Some(p), .. } => format!("{} · {}", if *staged { "已暂存" } else { "未暂存" }, p),
         Target::Commit { oid, path: None } => format!("{} · 提交的全部改动", short(oid)),
         Target::Commit { oid, path: Some(p) } => format!("{} · {}", short(oid), p),
+        Target::Stash { oid, path: None } => format!("{} · 贮藏的全部改动", short(oid)),
+        Target::Stash { oid, path: Some(p) } => format!("{} · {}", short(oid), p),
     }
 }
 
@@ -211,7 +214,9 @@ pub(crate) fn commit_text(summary: &str, desc: &str) -> String {
 
 pub(crate) fn target_path(t: &Target) -> Option<&str> {
     match t {
-        Target::Working { path, .. } | Target::Commit { path, .. } => path.as_deref(),
+        Target::Working { path, .. } | Target::Commit { path, .. } | Target::Stash { path, .. } => {
+            path.as_deref()
+        }
     }
 }
 

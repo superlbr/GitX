@@ -1,4 +1,4 @@
-//! （拆分自 main.rs；见 PROCESS.md「拆分 main.rs」。）
+//! （拆分自 main.rs；见 docs/PROCESS.md「拆分 main.rs」。）
 
 use eframe::egui::{self, Color32, Rect, pos2, vec2};
 use gitx::models::Commit;

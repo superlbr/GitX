@@ -1,9 +1,8 @@
-//! GitX 的 egui 界面层：SourceTree 主窗口的壳，接的是**真数据**。
+//! GitX 的 egui 界面层：原生桌面外壳，接的是**真数据**。
 //!
 //! 界面模块都在 `src/ui/`；核心层是同一个包的 lib target（`gitx::`，见 `src/lib.rs`），
-//! 两者之间**没有 IPC 那一跳**——git 函数直接调（旧 Tauri 层才有那一跳）。
-//! 布局几何照 `docs/reference/sourcetree-4.2.19-repo-window.png` 量出来的数字写
-//! （见 PROCESS.md「复刻规格：SourceTree 主窗口实测几何」），常量名就是图上那四块边界。
+//! git 函数直接调，中间没有 IPC。
+//! 布局几何来自实测参考图（测量记录见 docs/PROCESS.md），常量名就是图上那四块边界。
 //! 页只有一页：上面日志，下面「文件列表 | 差异」；选日志第一行那个虚拟行就是工作区。
 
 mod ui;
