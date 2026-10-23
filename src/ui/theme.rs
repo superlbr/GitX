@@ -210,6 +210,11 @@ pub(crate) const DIFF_HEAD_BG: Color32 = Color32::from_rgb(236, 236, 236);
 pub(crate) const DIFF_HEAD_H: f32 = 30.0;
 /// 色块离差异带头左缘的距离，两张图都是 8pt。
 pub(crate) const DIFF_HEAD_PAD: f32 = 8.0;
+/// 差异区灰带右端那格搜索框。参考图有这一条，但没量到宽高（docs/PROCESS.md 登记在
+/// 「仍然没看到过的」里），`DIFF_SEARCH_W` 只按「搜索差异」四个字 + 输入余量估，
+/// 高度要能落进 `DIFF_HEAD_H`（30）且不把灰带撑高。
+pub(crate) const DIFF_SEARCH_W: f32 = 170.0;
+pub(crate) const DIFF_SEARCH_H: f32 = 20.0;
 /// 文件表里「当前文件」那一行的灰带。**(220,220,220) 量的是 2026-10-20 那张日志区
 /// 第一条选中行（y109..128，横贯整行）**——文件表那两张参考图都没有选中行，所以这一格
 /// 是「同一套未聚焦选中色搬到文件表」，不是直接在文件表里量到的。

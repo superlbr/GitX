@@ -693,6 +693,9 @@ pub struct Gitx {
     pub(crate) diff_rows: Vec<usize>,
     /// 被折叠的文件序号（`DiffLine::file`，从 1 数）。文件头本身不折叠，点了会重新展开。
     pub(crate) collapsed: std::collections::HashSet<usize>,
+    /// 差异区右上角那格搜索框里的字。空串 = 不过滤；有字时只留命中的内容行、
+    /// 它们所属的文件头，以及引入命中行的那一块 hunk 头（行号才有上下文）。
+    pub(crate) diff_search: String,
     /// 这份差异最长那行大约占多少个等宽字格（ASCII 算 1、其余算 2、制表符算 4）。
     /// 差异区要能往右滚，内容宽度不能只看窗口宽度——只在 `Msg::Patch` 落地时算一次。
     pub(crate) diff_cols: usize,

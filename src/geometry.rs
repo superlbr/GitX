@@ -29,6 +29,7 @@ use crate::viewport;
             file: None,
             diff_rows: (0..diff.len()).collect(),
             collapsed: Default::default(),
+            diff_search: String::new(),
             diff,
             diff_cols: 0,
             patch_label: "全部未暂存变更".to_owned(),
@@ -2363,6 +2364,67 @@ use crate::viewport;
         assert!(!app.collapsed.contains(&1), "再点一次没有展开");
         let t = texts(&frame(&mut app));
         assert!(t.iter().any(|(s, _)| s.contains("第三行")), "展开之后 a.txt 的内容没回来");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 差异区灰带右端那格搜索：只留命中的内容行，以及它们的文件头与 hunk 头。
+    /// 文件头/hunk 头不是装饰——没有它们，几段命中混在一起就不知道各自属于哪个文件、
+    /// 从第几行起。宽度是估的（参考图没量到这条），所以这里只测行为不测宽高。
+    #[test]
+    fn the_diff_search_keeps_only_matching_lines_with_their_context() {
+        let (mut app, dir) = open_repo("diff-search");
+        std::fs::write(dir.join("b.txt"), "b 一行\n").unwrap();
+        git_in(&dir, &["add", "b.txt"]);
+        std::fs::write(dir.join("b.txt"), "b 一行\nb 第二行\n").unwrap();
+        std::fs::write(dir.join("a.txt"), "一行\n第二行\n第三行\n").unwrap();
+
+        app.request(Target::Working { staged: false, path: None, untracked: false });
+        pump(&mut app, |a| a.diff.iter().filter(|l| l.kind == Kind::File).count() == 2);
+
+        assert!(type_into(&mut app, "搜索差异", "第三行"), "灰带上没有搜索框");
+        let t = texts(&frame(&mut app));
+        assert!(t.iter().any(|(s, _)| s.contains("第三行")), "命中的行被筛掉了");
+        assert!(!t.iter().any(|(s, _)| s.contains("b 第二行")), "没命中的行还画着");
+        assert!(t.iter().any(|(s, _)| s.contains("文件  a.txt")), "命中行的文件头没留下");
+        assert!(!t.iter().any(|(s, _)| s.contains("文件  b.txt")), "整份文件都没命中，它的头还留着");
+        assert!(t.iter().any(|(s, _)| s.starts_with("块 ")), "hunk 头被筛掉了，行号没了上下文");
+
+        // 在同一格输入框里连按三次退格清空。框里此刻写着「第三行」，而差异里也有一行
+        // `+第三行`——`locate` 取的是帧里**先画**的那块字，灰带在滚动区之前，所以点到的是框。
+        let ctx = warm(&mut app);
+        let at = locate(&ctx, &mut app, "第三行").expect("搜索框里的字找不到");
+        click_at(&ctx, &mut app, at);
+        let key = |pressed: bool| egui::Event::Key {
+            key: egui::Key::Backspace,
+            physical_key: Some(egui::Key::Backspace),
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        // 点中间落下的光标不一定在行尾，先按 End 顶到末尾；退格删到行首就停了。
+        let end = |pressed: bool| egui::Event::Key {
+            key: egui::Key::End,
+            physical_key: Some(egui::Key::End),
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        for pressed in [true, false] {
+            ctx.run_ui(raw_input(vec![end(pressed)]), |ui| app.shell(ui))
+                .textures_delta
+                .clear();
+        }
+        for _ in 0..3 {
+            for pressed in [true, false] {
+                ctx.run_ui(raw_input(vec![key(pressed)]), |ui| app.shell(ui))
+                    .textures_delta
+                    .clear();
+            }
+        }
+        assert_eq!(app.diff_search, "", "三下退格没把搜索框清空");
+        let t = texts(&frame(&mut app));
+        assert!(t.iter().any(|(s, _)| s.contains("b 第二行")), "清空搜索之后 b.txt 没回来");
+        assert!(t.iter().any(|(s, _)| s.contains("文件  b.txt")), "清空搜索之后 b.txt 的文件头没回来");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

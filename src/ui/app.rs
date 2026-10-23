@@ -51,6 +51,7 @@ impl Gitx {
             diff: Vec::new(),
             diff_rows: Vec::new(),
             collapsed: std::collections::HashSet::new(),
+            diff_search: String::new(),
             diff_cols: 0,
             patch_label: String::new(),
             seq: 0,
@@ -142,6 +143,7 @@ impl Gitx {
         self.diff.clear();
         self.diff_rows.clear();
         self.collapsed.clear();
+        self.diff_search.clear();
         self.patch_label.clear();
         // 分页从头再来：序号加一是让**上一轮**在途的页回复作废（对不上号就丢），
         // 同时把「还有下一页」重新拧成真——换仓库/换排序后那是另一份列表。
@@ -894,6 +896,9 @@ impl Gitx {
                         // 折叠状态跟着补丁重来：上一份补丁的第 3 个文件，和这一份的第 3 个文件
                         // 不是同一个文件；把折叠留着会让用户打开新差异就少了一块。
                         self.collapsed.clear();
+                        // 搜索框也清空：上一份补丁的词对着这一份多半一个字都不命中，
+                        // 留着会让人打开新差异先看到「没有匹配的行」。
+                        self.diff_search.clear();
                         self.diff_rows = (0..self.diff.len()).collect();
                         self.patch_label = label;
                         self.busy = false;
@@ -1935,9 +1940,6 @@ impl Gitx {
                 }),
             None => None,
         };
-        let lines = &self.diff;
-        let rows = &self.diff_rows;
-        let collapsed = &self.collapsed;
         // 差异区顶上一格 = 参考图那条 (236,236,236) 的灰带：状态色块 + **加粗、靠左**的文件名。
         // 左对齐是用户 2026-10-20 特别点过的一条（「描述、文件 diff 展示都是左对齐的」）。
         let head = rect_of(ui, DIFF_HEAD_H);
@@ -1954,12 +1956,42 @@ impl Gitx {
         if busy {
             p.text(head.right_center(), Align2::RIGHT_CENTER, "读取中…", FontId::proportional(11.0), MUTED);
         }
-        let r = Rect::from_min_max(pos2(x, head.min.y), pos2(head.max.x - if busy { 62.0 } else { 6.0 }, head.max.y));
+        // 搜索框固定钉在灰带右端：参考图有这条，但没量到它的宽高（见 docs/PROCESS.md），
+        // 宽度只按「搜索差异」四个字 + 输入余量估。
+        let search = Rect::from_min_max(
+            pos2(head.max.x - DIFF_SEARCH_W - 6.0, head.center().y - DIFF_SEARCH_H / 2.0),
+            pos2(head.max.x - 6.0, head.center().y + DIFF_SEARCH_H / 2.0),
+        );
+        if !busy {
+            let requery = put_left(ui, search, |ui| {
+                ui.add_sized(
+                    [DIFF_SEARCH_W, DIFF_SEARCH_H],
+                    egui::TextEdit::singleline(&mut self.diff_search)
+                        .id_salt("diff-search")
+                        .hint_text("搜索差异")
+                        .font(TextStyle::Small),
+                )
+                .changed()
+            });
+            if requery {
+                // 只在敲字那一帧重扫整份补丁；空串走「只按折叠」的便宜分支。
+                self.rebuild_diff_rows();
+            }
+        }
+        let lines = &self.diff;
+        let rows = &self.diff_rows;
+        let collapsed = &self.collapsed;
+        let r = Rect::from_min_max(
+            pos2(x, head.min.y),
+            pos2(head.max.x - if busy { 62.0 } else { DIFF_SEARCH_W + 14.0 }, head.max.y),
+        );
         put_left(ui, r, |ui| {
             ui.add(Label::new(RichText::new(label.as_str()).size(12.0).color(INK_STRONG).strong()).truncate())
         });
-        if lines.is_empty() {
-            ui.centered_and_justified(|ui| ui.label(RichText::new("没有差异").color(MUTED)));
+        // 搜索把每一行都筛掉了：整块空白会让人以为差异没取回来，得说清是「筛没了」。
+        if rows.is_empty() {
+            let msg = if lines.is_empty() { "没有差异" } else { "没有匹配的行" };
+            ui.centered_and_justified(|ui| ui.label(RichText::new(msg).color(MUTED)));
             return;
         }
         let width = ui.available_width();
@@ -2113,6 +2145,23 @@ impl Gitx {
             if !self.collapsed.remove(&f) {
                 self.collapsed.insert(f);
             }
+            self.rebuild_diff_rows();
+        }
+        if let Some(a) = hit {
+            self.act(a);
+        }
+    }
+
+    /// 按折叠与搜索重建可见行。只在状态变的那一下跑（点折叠 / 敲字 / 补丁落地），
+    /// 不在帧里扫整份补丁：2.8 万行的补丁每帧过一遍，滚动立刻掉帧。
+    ///
+    /// 搜索的可见规则：命中的内容行 + 它所属的文件头 + 引入它的那一块 hunk 头。
+    /// 文件头不是「碰巧留下」——没有它，几段命中混在一起就不知道各自在哪个文件里；
+    /// hunk 头留下是因为行号差在它身上（`@@ -12,7 +12,9 @@`），删掉就只剩一串裸行。
+    pub(crate) fn rebuild_diff_rows(&mut self) {
+        use std::collections::HashSet;
+        let q = self.diff_search.trim().to_lowercase();
+        if q.is_empty() {
             self.diff_rows = self
                 .diff
                 .iter()
@@ -2120,10 +2169,30 @@ impl Gitx {
                 .filter(|(_, l)| l.kind == Kind::File || !self.collapsed.contains(&l.file))
                 .map(|(i, _)| i)
                 .collect();
+            return;
         }
-        if let Some(a) = hit {
-            self.act(a);
+        let mut files: HashSet<usize> = HashSet::new();
+        let mut hunks: HashSet<(usize, usize)> = HashSet::new();
+        for l in &self.diff {
+            if matches!(l.kind, Kind::Add | Kind::Del | Kind::Ctx) && l.text.to_lowercase().contains(&q) {
+                files.insert(l.file);
+                if let Some(h) = l.hunk {
+                    hunks.insert((l.file, h));
+                }
+            }
         }
+        self.diff_rows = self
+            .diff
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| match l.kind {
+                Kind::File => files.contains(&l.file),
+                Kind::Hunk => hunks.contains(&(l.file, l.hunk.unwrap_or(0))),
+                _ => l.text.to_lowercase().contains(&q),
+            })
+            .filter(|(_, l)| l.kind == Kind::File || !self.collapsed.contains(&l.file))
+            .map(|(i, _)| i)
+            .collect();
     }
 
     /// 这一格差异能不能「只动一块」。返回 `(已暂存?, 路径)`——按钮的文案与动作方向全看那个
