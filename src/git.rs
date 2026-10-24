@@ -475,6 +475,10 @@ fn parse_identities(out: &str) -> Vec<String> {
 /// 复刻一份错的比多 fork 一次严重。一次 `--get-regexp '^user\.'` 就够，调用方负责缓存
 /// （见 `db::identity_cache`），所以首屏稳态不为它 fork。
 /// 拿不到（没配、或仓库读不了）返回空集而不是报错：首屏宁可少两行活动流。
+///
+/// 缓存还没落地 —— 界面现在调不出这个函数，所以稳态首屏不为它 fork。将来接聚合时
+/// 每个仓库调一次 = 每仓库多一次 fork，那就违反了「稳态 2 次」，得先把结果落到磁盘上、
+/// 并且让「命中缓存就不 fork」这条有判据。
 pub fn identities(repo: &str) -> Vec<String> {
     // 没有一条 user.* 时 git 以 1 退出，`run_git` 把它当失败 —— 这里读作「没配身份」。
     run_git(repo, &["config", "--get-regexp", "^user\\."])
@@ -520,7 +524,7 @@ const ACTIVITY_LOG_SCAN: u32 = 500;
 
 /// 首屏「最近」面板要的那一份摘要。
 ///
-/// `emails` 由调用方传进来（本机身份集，缓存见 db），所以这个函数**固定两次 fork**：
+/// `emails` 由调用方传进来（本机身份集），所以这个函数**固定两次 fork**：
 /// `status --porcelain=v2 --branch` 与一次带 `--since` 的 `log`。`since` 是绝对 RFC3339
 /// 串而不是「7 天」，判据才能拿固定日期跑。
 /// 时间窗交给 git 的 `--since` 而不是本地筛：本地筛要先有全量，一个万人仓库会被 `--max-count`
