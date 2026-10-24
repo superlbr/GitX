@@ -23,6 +23,9 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
+# 编辑器/预览工具自己生成的打包产物（docs/design-preview.html 的分享 zip），可随时重生成
+.trae-html-share-packages/
+
 # OS files
 .DS_Store
 Thumbs.db
