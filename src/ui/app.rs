@@ -525,16 +525,43 @@ impl Gitx {
                 // 这一格铺满整屏的可点矩形就是遮罩：它把这一层的命中区域撑到全屏，
                 // 卡片后面的行才点不着；点它自己也等于「关掉卡片」。
                 let (bg, bg_resp) = ui.allocate_exact_size(screen.size(), Sense::click());
-                ui.painter().rect_filled(bg, 0.0, Color32::from_black_alpha(80));
-                let p = ui.painter();
-                p.rect_filled(card, 6.0, Color32::WHITE);
-                p.rect_stroke(card, 6.0, Stroke::new(1.0, RULE), egui::StrokeKind::Middle);
+                ui.painter().rect_filled(bg, 0.0, Color32::from_black_alpha(120));
+                // `Painter` 外面套的是 Arc，clone 一份就不占着 `ui` 的借用（卡里要横跨
+                // 一整层控件，最后那两条分隔线还得回到卡底来画）。
+                let p = ui.painter().clone();
+                // 卡底 + 一圈描边 + 外面那两档渐隐的光。以前遮罩只有 80 的黑、卡只有一圈
+                // `RULE` 灰边，整张卡像浮在页面上的一块白；遮罩压深、边收重一档，再补两圈
+                // 越来越淡的描边当作投影（`card_back` 那条判据只认**有底色**的圆角矩形，
+                // 所以这里全部用空心描边，不会冒充卡底）。
+                p.rect_filled(card, CARD_R, Color32::WHITE);
+                p.rect_stroke(card, CARD_R, Stroke::new(1.0, CARD_EDGE), egui::StrokeKind::Inside);
+                p.rect_stroke(
+                    card.expand(1.0),
+                    CARD_R + 1.0,
+                    Stroke::new(1.0, Color32::from_black_alpha(26)),
+                    egui::StrokeKind::Outside,
+                );
+                p.rect_stroke(
+                    card.expand(3.0),
+                    CARD_R + 3.0,
+                    Stroke::new(2.0, Color32::from_black_alpha(12)),
+                    egui::StrokeKind::Outside,
+                );
                 let mut y = card.min.y;
+                // 标题带：字比正文大一档、压一道下沿，卡里第一行才不至于是「一行小字直接
+                // 接一片控件」。
+                p.line_segment(
+                    [
+                        pos2(card.min.x, card.min.y + MODAL_TITLE_H),
+                        pos2(card.max.x, card.min.y + MODAL_TITLE_H),
+                    ],
+                    Stroke::new(1.0, RULE),
+                );
                 put_left(
                     ui,
-                    Rect::from_min_max(pos2(card.min.x + 12.0, y), pos2(card.max.x - 12.0, y + MODAL_TITLE_H)),
+                    Rect::from_min_max(pos2(card.min.x + MODAL_PAD, y), pos2(card.max.x - MODAL_PAD, y + MODAL_TITLE_H)),
                     |ui| {
-                        ui.add(Label::new(RichText::new(m.title).size(12.5).color(INK_STRONG).strong())
+                        ui.add(Label::new(RichText::new(m.title).size(13.5).color(INK_STRONG).strong())
                             .selectable(false));
                     },
                 );
@@ -547,7 +574,7 @@ impl Gitx {
                 if let Form::AddRepo { tab, .. } = &mut m.form {
                     put_left(
                         ui,
-                        Rect::from_min_max(pos2(card.min.x + 10.0, y), pos2(card.max.x - 10.0, y + MODAL_ROW_H)),
+                        Rect::from_min_max(pos2(card.min.x + MODAL_PAD, y), pos2(card.max.x - MODAL_PAD, y + MODAL_ROW_H)),
                         |ui| {
                             ui.spacing_mut().item_spacing.x = 6.0;
                             for (label, which) in [
@@ -565,11 +592,11 @@ impl Gitx {
                 }
                 let hint = m.hint();
                 if let Some(text) = &mut m.text {
-                    let r = Rect::from_min_max(pos2(card.min.x + 10.0, y + 2.0), pos2(card.max.x - 10.0, y + MODAL_ROW_H - 2.0));
-                    let resp = ui.put(
-                        r,
-                        TextEdit::singleline(text).hint_text(hint).align(Align2::LEFT_CENTER),
+                    let r = Rect::from_min_max(
+                        pos2(card.min.x + MODAL_PAD, y + (MODAL_ROW_H - FIELD_H) / 2.0),
+                        pos2(card.max.x - MODAL_PAD, y + (MODAL_ROW_H + FIELD_H) / 2.0),
                     );
+                    let resp = card_field(ui, r, hint, text, 1);
                     if focus {
                         resp.request_focus();
                     }
@@ -579,9 +606,7 @@ impl Gitx {
                 // `card.max.y` 定位，不跟着正文行数是有意为之（卡片高度已经算进 `rows`）。
                 match &mut m.form {
                     Form::StashSave { include_untracked } => {
-                        put_left(ui, Rect::from_min_max(pos2(card.min.x + 10.0, y), pos2(card.max.x - 10.0, y + MODAL_ROW_H)), |ui| {
-                            ui.checkbox(include_untracked, "包含未跟踪文件");
-                        });
+                        pref_switch(ui, card, y, "包含未跟踪文件", include_untracked);
                     }
                     Form::Merge { branches } => {
                         for (i, b) in branches.iter().enumerate() {
@@ -594,28 +619,18 @@ impl Gitx {
                     // `card.max.y` 定位，这一格的高度已经记进 `rows()`。
                     Form::AddRepo { tab: AddTab::Clone, dest } => {
                         let r = Rect::from_min_max(
-                            pos2(card.min.x + 10.0, y + 2.0),
-                            pos2(card.max.x - 10.0, y + MODAL_ROW_H - 2.0),
+                            pos2(card.min.x + MODAL_PAD, y + (MODAL_ROW_H - FIELD_H) / 2.0),
+                            pos2(card.max.x - MODAL_PAD, y + (MODAL_ROW_H + FIELD_H) / 2.0),
                         );
-                        let _ = ui.put(
-                            r,
-                            TextEdit::singleline(dest)
-                                .hint_text("目标目录")
-                                .align(Align2::LEFT_CENTER),
-                        );
+                        let _ = card_field(ui, r, "目标目录", dest, 1);
                     }
                     // 描述那一格 + 两枚勾。行高记在 `rows()` 里（`DESC_ROWS` + 2）。
                     Form::Commit { desc, amend, push_after } => {
                         let r = Rect::from_min_max(
-                            pos2(card.min.x + 10.0, y),
-                            pos2(card.max.x - 10.0, y + MODAL_ROW_H * DESC_ROWS as f32),
+                            pos2(card.min.x + MODAL_PAD, y),
+                            pos2(card.max.x - MODAL_PAD, y + MODAL_ROW_H * DESC_ROWS as f32),
                         );
-                        let _ = ui.put(
-                            r,
-                            TextEdit::multiline(desc)
-                                .hint_text("扩展描述…")
-                                .desired_rows(DESC_ROWS),
-                        );
+                        let _ = card_field(ui, r, "扩展描述…", desc, DESC_ROWS);
                         let y = y + MODAL_ROW_H * DESC_ROWS as f32;
                         pref_switch(ui, card, y, "修正上一条提交", amend);
                         let y = y + MODAL_ROW_H;
@@ -623,23 +638,20 @@ impl Gitx {
                     }
                     // 偏好卡：页签一排 + 每页那几条。开关改一格当场落库当场生效（见 `apply_prefs`）。
                     Form::Settings { prefs, page, repos, database } => {
-                        put_left(
+                        seg_tabs(
                             ui,
-                            Rect::from_min_max(pos2(card.min.x + 12.0, y), pos2(card.max.x - 12.0, y + MODAL_ROW_H)),
-                            |ui| {
-                                ui.spacing_mut().item_spacing.x = 6.0;
-                                if ui.selectable_label(*page == PrefPage::General, RichText::new("通用").size(11.5)).clicked() {
-                                    *page = PrefPage::General;
-                                }
-                                if ui.selectable_label(*page == PrefPage::Push, RichText::new("推送与拉取").size(11.5)).clicked() {
-                                    *page = PrefPage::Push;
-                                }
-                                if ui.selectable_label(*page == PrefPage::About, RichText::new("关于").size(11.5)).clicked() {
-                                    *page = PrefPage::About;
-                                }
-                            },
+                            Rect::from_min_max(
+                                pos2(card.min.x + MODAL_PAD, y + 3.0),
+                                pos2(card.max.x - MODAL_PAD, y + MODAL_ROW_H - 3.0),
+                            ),
+                            &[
+                                ("通用", PrefPage::General),
+                                ("推送与拉取", PrefPage::Push),
+                                ("关于", PrefPage::About),
+                            ],
+                            page,
                         );
-                        let y = y + MODAL_ROW_H;
+                        let y = y + MODAL_ROW_H + MODAL_GAP;
                         match *page {
                             PrefPage::General => {
                                 // 三条**都真接得通**才摆得上来：一条点了没反应的开关比没有更糟。
@@ -661,8 +673,8 @@ impl Gitx {
                                 put_left(
                                     ui,
                                     Rect::from_min_max(
-                                        pos2(card.min.x + 10.0, y),
-                                        pos2(card.max.x - 10.0, y + MODAL_ROW_H),
+                                        pos2(card.min.x + MODAL_PAD, y),
+                                        pos2(card.max.x - MODAL_PAD, y + MODAL_ROW_H),
                                     ),
                                     |ui| {
                                         ui.spacing_mut().item_spacing.x = 6.0;
@@ -680,8 +692,8 @@ impl Gitx {
                                 put_left(
                                     ui,
                                     Rect::from_min_max(
-                                        pos2(card.min.x + 10.0, y + MODAL_ROW_H),
-                                        pos2(card.max.x - 10.0, y + MODAL_ROW_H * 2.0),
+                                        pos2(card.min.x + MODAL_PAD, y + MODAL_ROW_H),
+                                        pos2(card.max.x - MODAL_PAD, y + MODAL_ROW_H * 2.0),
                                     ),
                                     |ui| {
                                         ui.spacing_mut().item_spacing.x = 6.0;
@@ -765,16 +777,23 @@ impl Gitx {
                 }
                 // 底部那枚主按钮在最右（macOS 那套）。偏好卡没有「取消」——开关是当场落的，
                 // 说「取消」会谎报还没算的那部分能回退。
+                p.line_segment(
+                    [
+                        pos2(card.min.x, card.max.y - MODAL_FOOT_H),
+                        pos2(card.max.x, card.max.y - MODAL_FOOT_H),
+                    ],
+                    Stroke::new(1.0, RULE),
+                );
                 let cy = card.max.y - MODAL_FOOT_H / 2.0;
-                let mut right = card.max.x - 10.0;
+                let mut right = card.max.x - MODAL_PAD;
                 if !m.primary().is_empty() {
-                    let (hit, w) = hunk_button(ui, m.primary(), right, cy);
+                    let (hit, w) = card_button(ui, m.primary(), right, cy, true);
                     primary_hit = hit;
                     right -= w + 8.0;
                 }
                 let mut cancel_hit = false;
                 if !primary_closes(&m) {
-                    let (hit, _) = hunk_button(ui, "取消", right, cy);
+                    let (hit, _) = card_button(ui, "取消", right, cy, false);
                     cancel_hit = hit;
                 }
                 if cancel_hit || bg_resp.clicked() {

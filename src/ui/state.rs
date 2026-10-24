@@ -322,7 +322,8 @@ impl PushBehavior {
     }
 
     /// 表格里这一条该不该预先勾上——**五档的差别只在这儿**（不在 git 的实参上，见上面那段）。
-    pub(crate) fn picks(self, branch: &Branch) -> bool {        match self {
+    pub(crate) fn picks(self, branch: &Branch) -> bool {
+        match self {
             PushBehavior::Nothing => false,
             PushBehavior::Matching => true,
             // 「当前」这一档字面上就是**只有当前那条**：SourceTree 的说明写的是
@@ -524,12 +525,14 @@ impl Modal {
         }
     }
 
-    /// 推送那张卡。标题「推送？」逐字取自 `GitPushSheet.nib`。
+    /// 推送那张卡。标题从 `GitPushSheet.nib` 那句「推送？」改成「推送」：这张卡不是确认框，
+    /// 它是「选要推哪几条」的工作表，底下那枚主按钮写的就是同一个动词，带问号读起来像在执行。
+    /// 表头那一列仍叫「推送？」——那一格问的确实是「这条要不要推」。
     /// `rows` 与 `remote` 都由调用方从**打开那一刻**的快照与偏好算好：卡开着的时候后台
     /// 刷新不该让表换人，也不该让远端那一格自己漂走。
     pub(crate) fn push(rows: Vec<PushRow>, remote: String, prefs: &Prefs) -> Self {
         Modal {
-            title: "推送？",
+            title: "推送",
             detail: None,
             text: None,
             form: Form::Push { remote, rows, force: false, tags: prefs.push_tags },
@@ -607,8 +610,8 @@ impl Modal {
             Form::Commit { amend, .. } => if *amend { "修正并提交" } else { "提交" },
             Form::Settings { .. } => "完成",
             // 两张卡的主按钮写动词不写「确定」：nib 里那两枚按钮的文案确实是「确定 / 取消」，
-            // 但我们这张卡的标题就是「推送？」，标题带问句、按钮再是「确定」，两格合起来读不通。
-            // 「推送」「拉取」这两个词同样在那两张 nib 里，不是自己造的。
+            // 但那两张卡是工作表不是确认框，标题就叫「推送」「拉取」——按钮再写「确定」，
+            // 同一张卡上两个词指同一件事，还得多读一次。「推送」「拉取」这两个词同样在那两张 nib 里。
             Form::Push { .. } => "推送",
             Form::Pull { .. } => "拉取",
             Form::Merge { .. } => "",

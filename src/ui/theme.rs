@@ -1,6 +1,6 @@
 //! （拆分自 main.rs；见 docs/PROCESS.md「拆分 main.rs」。）
 
-use eframe::egui::{pos2, Color32, Rect};
+use eframe::egui::Color32;
 
 
 // ---- 从参考图量出来的几何（pt = @2x 截图的像素 / 2）----
@@ -242,87 +242,126 @@ pub(crate) const HIST_ROW_H: f32 = 46.0;
 pub(crate) const HIST_BLAME_ROW_H: f32 = 18.0;
 pub(crate) const HIST_PAD: f32 = 10.0;
 
-/// 模态卡那一格的尺寸。**没有参考图依据**：两张 SourceTree 截图都没拍到弹窗，
-/// 这几个数是为了「卡片里的行全是我们手摆的，高度必须自己算才能居中」而定的固定档位，
-/// 等目视那一轮（#25）再对着真弹窗调。
-pub(crate) const MODAL_W: f32 = 380.0;
-pub(crate) const MODAL_TITLE_H: f32 = 30.0;
-pub(crate) const MODAL_ROW_H: f32 = 26.0;
-pub(crate) const MODAL_FOOT_H: f32 = 34.0;
+/// 模态卡那一层的尺寸档位。**2026-10-24 起改成按内容算**：这三张卡以前各自钉死在
+/// SourceTree 那三张 nib 的窗口尺寸上（855×441 / 650×271 / 614×299），可卡里只有
+/// 两三行控件，剩下的全是一片空白——目视那一轮（用户：「提交、推送、设置窗口都好丑」）
+/// 就是这么抓出来的。复刻契约降级成脚手架之后，尺寸跟着内容走（见 `card_rect`），
+/// 这里只留**行的档位**：一行多高、脚部多高、控件多大。
+pub(crate) const MODAL_W: f32 = 420.0;
+pub(crate) const MODAL_TITLE_H: f32 = 42.0;
+pub(crate) const MODAL_ROW_H: f32 = 28.0;
+pub(crate) const MODAL_FOOT_H: f32 = 50.0;
+/// 卡内容的左右内边距。
+pub(crate) const MODAL_PAD: f32 = 16.0;
+/// 卡里两组控件之间的那道缝。
+pub(crate) const MODAL_GAP: f32 = 12.0;
+pub(crate) const CARD_R: f32 = 10.0;
+/// 输入框：高与圆角。
+pub(crate) const FIELD_H: f32 = 26.0;
+pub(crate) const FIELD_R: f32 = 6.0;
+/// 卡脚那两枚按钮：高、圆角、最小宽。
+pub(crate) const BTN_H: f32 = 26.0;
+pub(crate) const BTN_R: f32 = 7.0;
+pub(crate) const BTN_MIN_W: f32 = 64.0;
+/// 卡里一枚勾选方框见方多大（同时也是它的命中矩形：egui 的 checkbox 取
+/// `interact_size.y` 和 `icon_width` 里大的那一档，卡这一层把两者配成同一个数）。
+pub(crate) const CHK_CARD: f32 = 18.0;
 /// 提交卡里描述那一格给三行（和内联那格 `desired_rows(3)` 同一档）。
 pub(crate) const DESC_ROWS: usize = 3;
-/// 偏好卡那一格的大小：SourceTree 4.2.19
-/// `Contents/Resources/zh_CN.lproj/PreferencesWindow.nib`（英文版同一份，数值一致）里
-/// 「通用」那张窗口的**内容区实测 855×441 pt**，不是拍的。
-/// 这里记一条更正：本仓库早先按 409 摆过，那是**把标题栏 32pt 从内容区里又减了一遍**
-/// （441 − 32 = 409）——NSWindow 的 `contentRect(forFrameRect:)` 给出来的 441 已经是
-/// 去掉标题栏与工具栏之后的那一格，不该再减。测量方法见 docs/PROCESS.md
-/// 「逆向本机 SourceTree.app」那一条（nib 用 `NSNib` 实例化后读 frame）。
-/// 小窗口放不下时按屏 clamp（判据见 `the_preferences_card_fits_a_minimal_window`）。
-pub(crate) const PREF_W: f32 = 855.0;
-pub(crate) const PREF_H: f32 = 441.0;
+/// 偏好卡按**页里最多那一条**摆高度（「推送与拉取」两枚弹出 + 两枚勾 = 四行）：
+/// 换页时卡不跟着跳，这是唯一一处「不为内容收缩」的取舍，换来的是页签稳定。
+pub(crate) const SETTINGS_ROWS: usize = 4;
+pub(crate) const PREF_W: f32 = 520.0;
+
+/// 卡底那一圈描边。
+pub(crate) const CARD_EDGE: Color32 = Color32::from_rgb(0xc9, 0xcd, 0xd6);
+/// 输入框没拿焦点时的描边。
+pub(crate) const FIELD_EDGE: Color32 = Color32::from_rgb(0xd5, 0xd8, 0xde);
+/// 主按钮那枚蓝：底色、悬停、按下、焦点那一圈光晕。
+pub(crate) const ACCENT: Color32 = SELECTED;
+pub(crate) const ACCENT_HOVER: Color32 = Color32::from_rgb(0x18, 0x5e, 0xd8);
+pub(crate) const ACCENT_DOWN: Color32 = Color32::from_rgb(0x15, 0x53, 0xc2);
+/// 焦点那一圈光晕。`Color32` 的元组字段是私有的、`from_rgba_unmultiplied` 又不是 const fn，
+/// 所以这里不玩半透明，直接用那枚蓝提亮一档当晕。
+pub(crate) const ACCENT_RING: Color32 = Color32::from_rgb(0xa9, 0xc8, 0xf7);
+/// 次按钮的描边与字色。
+pub(crate) const BTN_EDGE: Color32 = Color32::from_rgb(0xd0, 0xd3, 0xd9);
+/// 页签那一排的底（未选中的那一段住在灰槽里，选中那段浮成白）。
+pub(crate) const SEG_BG: Color32 = Color32::from_rgb(0xf1, 0xf2, 0xf5);
+/// 表格表头那一条的底色。
+pub(crate) const TABLE_HEAD_BG: Color32 = Color32::from_rgb(0xf6, 0xf7, 0xf9);
 
 // ---------------------------------------------------------------- 推送卡 / 拉取卡
-// 下面每一格都是从本机那两张 nib 里读出来的**内容区坐标**（NSWindow 原点在左下，
-// 这里全部换算成我们用的「距内容区顶边多少 pt」：`顶 = 内容高 − y − 高`）。
-// 测量方法与原始数字见 docs/PROCESS.md「逆向本机 SourceTree.app」。
-// 两张卡的尺寸**不跟行数走**（`Modal::rows()` 对它们返回 0），因为那一格里每一格都量过。
+// 这两张卡的**字段、顺序、每一格叫什么**来自本机那两张 nib
+// （`GitPushSheet` / `GitPullSheet`，测量记录见 docs/PROCESS.md「逆向本机 SourceTree.app」），
+// 但**格子摆在哪**是这一版自己排的：nib 那套坐标是给一张 650×271 的空窗口排的，
+// 我们按内容收缩以后那些数就不再成立（2026-10-24）。
 
-/// `GitPushSheet` 内容区 650×271（窗口 frame 650×303，标题栏 32）。
-pub(crate) const PUSH_W: f32 = 650.0;
-pub(crate) const PUSH_H: f32 = 271.0;
-/// 「推送到仓库：」那一行的顶边。三件控件（标签 / 弹出按钮 / URL 框）同属一行，
-/// 行顶按那只 URL 框换算：nib 里 `{{253, 230}, {372, 22}}`，内容高 271 − 230 − 22 = 19。
-pub(crate) const PUSH_ROW1_Y: f32 = 19.0;
-/// 「推送到仓库：」那一行：标签 x、弹出按钮 x 与宽、右边那格显示 URL 的框。
-pub(crate) const PUSH_LABEL_X: f32 = 17.0;
-pub(crate) const PUSH_REMOTE_X: f32 = 141.0;
-pub(crate) const PUSH_REMOTE_W: f32 = 105.0;
-pub(crate) const PUSH_URL_X: f32 = 253.0;
-pub(crate) const PUSH_URL_W: f32 = 372.0;
-/// 「要推送的分支」那只框（NSBox，含标题那一条）。
-pub(crate) const PUSH_BOX: Rect = Rect::from_min_max(pos2(17.0, 45.0), pos2(633.0, 215.0));
-/// 框里的表格：列宽 38/186/260/43（表头 28pt 高、行高 16pt）——四列的宽度是 nib 里
-/// `NSTableColumn` 的实测值，行高是 `rowHeight` 的实测值。
-pub(crate) const PUSH_TABLE_X: f32 = 39.0;
-pub(crate) const PUSH_TABLE_TOP: f32 = 70.0;
-pub(crate) const PUSH_HEAD_H: f32 = 28.0;
-pub(crate) const PUSH_ROW_H: f32 = 16.0;
-pub(crate) const PUSH_COL_PICK: f32 = 38.0;
-pub(crate) const PUSH_COL_LOCAL: f32 = 186.0;
-pub(crate) const PUSH_COL_REMOTE: f32 = 260.0;
-pub(crate) const PUSH_COL_TRACK: f32 = 43.0;
-/// 「全选」那颗小按钮在框里的位置（nib 里 80×18）。
-pub(crate) const PUSH_SELECT_ALL: Rect = Rect::from_min_max(pos2(37.0, 184.0), pos2(117.0, 202.0));
-/// 框下面那两枚勾（101×18 / 91×18）。
-pub(crate) const PUSH_TAGS_Y: f32 = 217.0;
-pub(crate) const PUSH_FORCE_Y: f32 = 237.0;
-pub(crate) const PUSH_CHECK_X: f32 = 18.0;
+/// 推送卡：内容区宽 600，高度**跟分支行数走**（`push_body_h`）。
+pub(crate) const PUSH_W: f32 = 600.0;
+/// 「推送到仓库：」那一行的顶边（标签 / 弹出按钮 / URL 三件控件同一行）。
+pub(crate) const PUSH_ROW1_Y: f32 = 14.0;
+pub(crate) const PUSH_LABEL_X: f32 = 16.0;
+pub(crate) const PUSH_REMOTE_X: f32 = 132.0;
+pub(crate) const PUSH_REMOTE_W: f32 = 120.0;
+/// 那一格显示所选远端的 URL。
+pub(crate) const PUSH_URL_X: f32 = 264.0;
+pub(crate) const PUSH_URL_W: f32 = 320.0;
+/// 「要推送的分支」那一行：左边标题，右边「全选」。
+pub(crate) const PUSH_HEAD_LABEL_Y: f32 = 48.0;
+/// 表格：外框顶边（= 表头顶边）、表头高、行高、四列宽。
+/// 判据里 `push_row_box` / `push_remote_cell` 按这几个数算落点，改这里它们跟着改。
+pub(crate) const PUSH_TABLE_X: f32 = 16.0;
+pub(crate) const PUSH_TABLE_TOP: f32 = 74.0;
+pub(crate) const PUSH_HEAD_H: f32 = 26.0;
+pub(crate) const PUSH_ROW_H: f32 = 22.0;
+pub(crate) const PUSH_COL_PICK: f32 = 46.0;
+pub(crate) const PUSH_COL_LOCAL: f32 = 172.0;
+pub(crate) const PUSH_COL_REMOTE: f32 = 292.0;
+pub(crate) const PUSH_COL_TRACK: f32 = 50.0;
+/// 表格外框右缘 = 四列加起来。
+pub(crate) const PUSH_TABLE_RIGHT: f32 = PUSH_TABLE_X
+    + PUSH_COL_PICK
+    + PUSH_COL_LOCAL
+    + PUSH_COL_REMOTE
+    + PUSH_COL_TRACK;
+/// 框下面那两枚勾的顶边：框底 + 一道缝。
+pub(crate) fn push_checks_y(n: usize) -> f32 {
+    PUSH_TABLE_TOP + PUSH_HEAD_H + PUSH_ROW_H * n as f32 + MODAL_GAP
+}
+/// 推送卡正文高度（标题带与卡脚由 `card_rect` 另加）。
+pub(crate) fn push_body_h(n: usize) -> f32 {
+    push_checks_y(n) + MODAL_ROW_H
+}
 
-/// `GitPullSheet` 内容区 614×299（窗口 frame 614×331）。
-pub(crate) const PULL_W: f32 = 614.0;
-pub(crate) const PULL_H: f32 = 299.0;
-/// 三行标签的左缘与那一列值（弹出按钮/文本框）的左缘。
-pub(crate) const PULL_LABEL_X: f32 = 21.0;
-pub(crate) const PULL_FIELD_X: f32 = 172.0;
-pub(crate) const PULL_REMOTE_W: f32 = 425.0;
-pub(crate) const PULL_BRANCH_W: f32 = 342.0;
-/// 三行的顶边（从内容区往上量）。
-pub(crate) const PULL_REMOTE_Y: f32 = 19.0;
-pub(crate) const PULL_URL_Y: f32 = 46.0;
-pub(crate) const PULL_BRANCH_Y: f32 = 75.0;
-pub(crate) const PULL_INTO_Y: f32 = 102.0;
-/// 「刷新」那颗按钮（87×32）——它跑一次 `git fetch <远端>`，回来后那一列分支跟着新快照变。
-pub(crate) const PULL_REFRESH: Rect = Rect::from_min_max(pos2(513.0, 72.0), pos2(600.0, 104.0));
-/// 「选项」那只框（580×116）。
-pub(crate) const PULL_BOX: Rect = Rect::from_min_max(pos2(17.0, 127.0), pos2(597.0, 243.0));
-/// 框里四行从上到下的顶边。第三行「立即提交合并的改动」是 git 的默认行为
-/// （`--commit`），按「点了看不出区别的勾不如不摆」这条**故意不摆**（152 那一格空着），
-/// 理由写在 `git::PullOpts` 上。
-pub(crate) const PULL_OPT_LOG_Y: f32 = 172.0;
-pub(crate) const PULL_OPT_NOFF_Y: f32 = 192.0;
-pub(crate) const PULL_OPT_REBASE_Y: f32 = 222.0;
-pub(crate) const PULL_OPT_X: f32 = 37.0;
+/// 偏好卡正文高度：页签那一排 + 最多那一页的行数。
+pub(crate) fn settings_body_h() -> f32 {
+    MODAL_ROW_H + MODAL_GAP + MODAL_ROW_H * SETTINGS_ROWS as f32
+}
+
+/// 拉取卡：内容区宽 520，四行 + 「选项」那只框，正文高度固定（`PULL_BODY_H`）。
+pub(crate) const PULL_W: f32 = 520.0;
+pub(crate) const PULL_LABEL_X: f32 = 16.0;
+pub(crate) const PULL_FIELD_X: f32 = 176.0;
+pub(crate) const PULL_REMOTE_W: f32 = 328.0;
+/// 远程分支那一列窄一档，右边让给「刷新」。
+pub(crate) const PULL_BRANCH_W: f32 = 246.0;
+/// 四行的顶边：远端、它的 URL、远程分支、本地分支。
+pub(crate) const PULL_REMOTE_Y: f32 = 14.0;
+pub(crate) const PULL_URL_Y: f32 = 44.0;
+pub(crate) const PULL_BRANCH_Y: f32 = 76.0;
+pub(crate) const PULL_INTO_Y: f32 = 108.0;
+/// 「选项」那一格标题，和它下面那只框的顶/底、框里那三行开关。
+/// 第一行「立即提交合并的改动」是 git 的默认行为（`--commit`），按「点了看不出区别的勾
+/// 不如不摆」这条**故意不摆**，理由写在 `git::PullOpts` 上。
+pub(crate) const PULL_OPT_LABEL_Y: f32 = 142.0;
+pub(crate) const PULL_BOX_TOP: f32 = 168.0;
+pub(crate) const PULL_BOX_BOTTOM: f32 = 252.0;
+pub(crate) const PULL_OPT_X: f32 = 26.0;
+pub(crate) const PULL_OPT_LOG_Y: f32 = 178.0;
+pub(crate) const PULL_OPT_NOFF_Y: f32 = 202.0;
+pub(crate) const PULL_OPT_REBASE_Y: f32 = 226.0;
+pub(crate) const PULL_BODY_H: f32 = 264.0;
 
 // 参考图里那一行 hunk 头是**双倍行高**（29pt = 两条正文行）。这一版没跟上：差异区走的是
 // `ScrollArea::show_rows`，它只认一个统一行距（正文行量的也是 15~16pt，见 `DIFF_ROW_H`），

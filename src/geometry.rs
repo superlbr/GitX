@@ -2092,8 +2092,8 @@ use crate::viewport;
     // 收到卡片矩形里；按钮那一类再按整串相等（见 `click_card_button` 那段）。
 
     /// 此刻那张卡的矩形：和 `modal_layer` 用同一份 `card_rect`、同一块无头屏幕。
-    /// 卡片矩形是**算出来的**（`rows()` × 那几条常量），不是从帧里量出来的——所以判据里
-    /// 真量到形状的那条（`the_settings_card_is_the_measured_size`）不靠它，靠帧里的白底那条矩形。
+    /// 卡片矩形是**算出来的**（`rows()` × 那几条常量），不是从帧里量出来的——所以问尺寸的判据
+    /// （`the_settings_card_is_as_tall_as_its_rows` 那三条）都不靠它，靠帧里那块白底。
     fn card_now(app: &Gitx) -> Rect {
         let m = app.modal.as_ref().expect("判据要在卡上点东西，可这会儿没有打开的卡");
         card_rect(m, Rect::from_min_size(pos2(0.0, 0.0), vec2(WIN_W, WIN_H)))
@@ -4690,24 +4690,58 @@ use crate::viewport;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 偏好卡的尺寸问的是**帧里真画出来的那块白底**，不是 `PREF_W`/`PREF_H` 那两个常量——
-    /// 拿常量量常量就是让被测对象自己出尺子。那两个数来自 SourceTree 4.2.19 的
-    /// `PreferencesWindow.nib`（`keyedobjects-110000.nib` 里窗口那条 frame `{{436.5, 574}, {855, 441}}`）。
-    /// **2026-10-23 更正**：这条以前钉的是 409——那是把标题栏那 32pt 从内容区里**又减了一遍**
-    /// （441 − 32 = 409）。`NSWindow` 的 `contentRect(forFrameRect:)` 给出的 441 已经是去掉
-    /// 标题栏之后的那一格，不该再减。数字是用 `NSNib` 把那张 nib 实例化后直接读 frame 来的
-    /// （方法见 docs/PROCESS.md「逆向本机 SourceTree.app」——同一条路也推翻了「keyed archive
-    /// 里数值读不出来」那句旧记录）。
+    /// 卡脚那条分隔线到**卡自己正文最后一格文字下沿**之间的空白（pt）。
+    /// 这条数是目视那一轮（2026-10-24，用户：「提交、推送、设置窗口都好丑」）抓出来的毛病：
+    /// 三张卡各自钉死在 SourceTree 那三张 nib 的窗口尺寸上，正文只有三五行，剩下的全是空白。
+    /// 判据按「看得见的空白」问，不按常量问——拿常量量常量就是让被测对象自己出尺子。
+    ///
+    /// **只数卡底那一笔之后的文字**：模态那一层画在所有面板之后，卡自己的文字都在它后面。
+    /// 不这么裁会被遮罩底下那层蒙过去——反向变异跑出来的第一条假绿：把推送卡改回 nib 那张
+    /// 空窗口的尺寸，卡这一格里落着的状态条、暂存带那些文字比卡自己的正文低，空白读起来还是老样子。
+    fn body_void(out: &egui::FullOutput, card: Rect) -> f32 {
+        let foot = card.max.y - MODAL_FOOT_H;
+        let from = out
+            .shapes
+            .iter()
+            .position(|c| {
+                matches!(&c.shape, egui::Shape::Rect(r) if r.rect == card && r.fill != Color32::TRANSPARENT)
+            })
+            .expect("帧里没有卡底那一笔，正文文字无从定位");
+        let lowest = out.shapes[from..]
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Text(t) => {
+                    let r = t.galley.rect.translate(t.pos.to_vec2());
+                    (card.contains(r.center()) && r.max.y <= foot + 0.5).then_some(r.max.y)
+                }
+                _ => None,
+            })
+            .fold(0.0, f32::max);
+        foot - lowest
+    }
+
+    /// 偏好卡的高度**按页里最多那一页算**（四行），不是照 `PreferencesWindow.nib` 那张
+    /// 855×441 的窗口摆。老尺寸在这一条下会直接红：正文只有三行，脚前面是一整片空白。
+    /// 「换页不跳」这条取舍留给 `SETTINGS_ROWS`，所以空白的一档预算是「一行 + 一道缝」。
     #[test]
-    fn the_settings_card_is_the_measured_size() {
+    fn the_settings_card_is_as_tall_as_its_rows() {
         let mut app = filled(3, &layout(PATCH, false));
         assert!(click_tool(&mut app, 10), "工具条上没有 ⊙ 那枚");
-        let (fill, card) = card_back(&settled_frame(&mut app, 0.4)).expect("卡底那块圆角矩形没画出来");
-        assert_eq!(fill, Color32::WHITE, "卡底不是白的：{fill:?}");
-        assert_eq!((card.width(), card.height()), (855.0, 441.0), "偏好卡不是量出来的那个尺寸");
+        let out = settled_frame(&mut app, 0.4);
+        let (_, card) = card_back(&out).expect("卡底那块圆角矩形没画出来");
+        let computed = card_rect(
+            app.modal.as_ref().expect("卡没打开"),
+            Rect::from_min_size(pos2(0.0, 0.0), vec2(WIN_W, WIN_H)),
+        );
+        assert_eq!(card, computed, "帧里那块白底和布局算出来的那一格不一致");
         assert!(
-            card.min.x >= 0.0 && card.min.y >= 0.0 && card.max.x <= WIN_W && card.max.y <= WIN_H,
+            card.width() < WIN_W && card.max.x <= WIN_W && card.max.y <= WIN_H,
             "卡溢出默认窗口了：{card:?}，窗口 {WIN_W}×{WIN_H}"
+        );
+        let void = body_void(&out, card);
+        assert!(
+            void <= MODAL_ROW_H + MODAL_GAP + 1.0,
+            "卡脚前面空了 {void} pt：正文只有三行，卡却按一张空窗口的尺寸摆着"
         );
     }
 
@@ -4899,6 +4933,25 @@ use crate::viewport;
             behind: 1,
             target: oid1.clone(),
         });
+        // 这两条专为一件事：让五档「推送行为」**两两不同**。只有 `main`（上游同名）
+        // 和 `feature/x`（没上游）的话，上流/简单/当前三档算出来的勾选一模一样，
+        // 判据就杀不死「把简单写成 upstream.is_some()」这一类变异。
+        s.branches.push(Branch {
+            name: "tricky".to_owned(),
+            is_current: false,
+            upstream: Some("origin/other".to_owned()),
+            ahead: 0,
+            behind: 0,
+            target: oid1.clone(),
+        });
+        s.branches.push(Branch {
+            name: "docs".to_owned(),
+            is_current: false,
+            upstream: Some("origin/docs".to_owned()),
+            ahead: 0,
+            behind: 0,
+            target: oid1.clone(),
+        });
         s.remote_refs.extend([
             RemoteRef { name: "origin/feature/x".to_owned(), target: oid1 },
             RemoteRef { name: "fork/only-on-fork".to_owned(), target: oid0 },
@@ -4984,17 +5037,49 @@ use crate::viewport;
         click_at(&ctx, app, spot);
     }
 
+    /// 推送卡的高**跟着分支那几行走**，不是照 `GitPushSheet.nib` 那张 650×271 的空窗口摆
+    /// （那套坐标是给一张空窗口排的，行少的时候底下全是空白——2026-10-24 目视那一轮报的就是它）。
+    /// 三段各挡一种回退：
+    ///  · 帧里那块白底 == `card_rect` 算出来的那一格 → 挡「画的一方和量的一方分家」；
+    ///  · 表里少两行，卡恰好矮两行的距离 → 挡「高不看行数」（写成常量、或 `push_body_h` 里漏了 `n`）；
+    ///  · 卡脚前面那道空白 ≤ 一行 + 一道缝 → 挡「按空窗口的尺寸摆着」。
     #[test]
-    fn the_push_card_is_the_measured_size() {
+    fn the_push_card_is_as_tall_as_its_branches() {
         let mut app = with_remotes();
         assert!(click_tool(&mut app, 2), "工具条上没有「推送」那枚");
-        let (fill, card) = card_back(&settled_frame(&mut app, 0.4)).expect("推送卡的卡底没画出来");
+        let out = settled_frame(&mut app, 0.4);
+        let (fill, card) = card_back(&out).expect("推送卡的卡底没画出来");
         assert_eq!(fill, Color32::WHITE, "卡底不是白的：{fill:?}");
-        // `GitPushSheet` 内容区实测 650×271，加我们自己那一条标题带 30。
-        assert_eq!((card.width(), card.height()), (650.0, 301.0), "推送卡不是量出来的那个尺寸");
+        let computed = card_rect(
+            app.modal.as_ref().expect("卡没打开"),
+            Rect::from_min_size(pos2(0.0, 0.0), vec2(WIN_W, WIN_H)),
+        );
+        assert_eq!(card, computed, "帧里那块白底和布局算出来的那一格不一致");
         assert!(
             card.min.x >= 0.0 && card.min.y >= 0.0 && card.max.x <= WIN_W && card.max.y <= WIN_H,
             "推送卡溢出默认窗口了：{card:?}，窗口 {WIN_W}×{WIN_H}"
+        );
+        let void = body_void(&out, card);
+        assert!(
+            void <= MODAL_ROW_H + MODAL_GAP + 1.0,
+            "卡脚前面空了 {void} pt：分支只有四行，卡却按一张空窗口的尺寸摆着"
+        );
+        // 夹具是四条分支，砍掉两条 → 卡应当恰好矮 `2 * PUSH_ROW_H`。
+        let four = card.height();
+        if let Some(m) = app.modal.as_mut() {
+            if let Form::Push { rows, .. } = &mut m.form {
+                rows.truncate(2);
+            }
+        }
+        let two = card_back(&settled_frame(&mut app, 0.4))
+            .expect("改成两行之后卡底没了")
+            .1
+            .height();
+        assert_eq!(
+            four - two,
+            2.0 * PUSH_ROW_H,
+            "卡的高和分支那几行不搭：少两行只矮了 {:.1} pt",
+            four - two
         );
     }
 
@@ -5017,14 +5102,22 @@ use crate::viewport;
             "强制推送",
             "main",
             "feature/x",
+            "tricky",
+            "docs",
         ] {
             assert!(card_has(&mut app, word), "推送卡上少了这一格：{word}");
         }
         let rows = push_rows(&app);
         assert_eq!(
             rows.iter().map(|(l, _, _, r)| (l.as_str(), r.as_str())).collect::<Vec<_>>(),
-            vec![("main", "main"), ("feature/x", "feature/x")],
+            vec![("main", "main"), ("feature/x", "feature/x"), ("tricky", "tricky"), ("docs", "docs")],
             "表里每一行的远端那一侧不是预先同名"
+        );
+        // 「跟踪？」= 这条**还没有**上游。已有上游的三条不该带着勾开出来。
+        assert_eq!(
+            rows.iter().map(|(_, _, t, _)| *t).collect::<Vec<bool>>(),
+            vec![false, true, false, false],
+            "「跟踪？」那一列的初值不是「这条还没有上游」"
         );
         // 夹具里 `origin` 没有 push_url、`fork` 有：卡片跟着远端那一格换 URL。
         assert!(card_has(&mut app, "/tmp/gate-upstream.git"), "选 origin 时 URL 那格没念对");
@@ -5038,14 +5131,16 @@ use crate::viewport;
 
     /// 五档预先勾哪几条。这一档**不改 git 的实参**（卡上的推送一律带明确 refspec，
     /// 而带 refspec 的 `git push` 完全无视 `push.default`），它唯一的可见后果就在这儿。
+    /// 四条分支（`main` 上游同名 / `feature/x` 没上游 / `tricky` 上游不同名 / `docs` 上游同名
+    /// 但不是当前那条）是特意凑的：五档的勾选结果**两两不同**，少一条就有两档互相顶包。
     #[test]
     fn the_push_behavior_pref_picks_which_rows_start_checked() {
         for (behavior, expect) in [
-            (PushBehavior::Nothing, vec![false, false]),
-            (PushBehavior::Matching, vec![true, true]),
-            (PushBehavior::Upstream, vec![true, false]),
-            (PushBehavior::Simple, vec![true, false]),
-            (PushBehavior::Current, vec![true, false]),
+            (PushBehavior::Nothing, vec![false, false, false, false]),
+            (PushBehavior::Matching, vec![true, true, true, true]),
+            (PushBehavior::Upstream, vec![true, false, true, true]),
+            (PushBehavior::Simple, vec![true, false, false, true]),
+            (PushBehavior::Current, vec![true, false, false, false]),
         ] {
             let mut app = with_remotes();
             app.push_behavior = behavior;
@@ -5084,16 +5179,158 @@ use crate::viewport;
         let rows = push_rows(&app);
         assert_eq!(rows[0].1, false, "点掉第 0 行的方框没生效");
         assert_eq!(rows[1].1, true, "把没点的那一行也一起取消了");
+        assert!(
+            rows[2..].iter().all(|(_, p, _, _)| *p),
+            "点一行却把后面的行一起带走了"
+        );
     }
 
+    /// 卡脚那一条带子里，**包住**「{label}」那块文字的最小圆角矩形：底色、描边色、那一格。
+    /// 问帧里的形状而不是问常量，是因为「主按钮和取消一眼分不分得开」只有画出来才算数。
+    /// 底色取**有底的那一笔**（`rect_filled`），描边再按同一格去别处找（`rect_stroke` 是单独一笔，
+    /// 空心那枚的 `fill` 是透明的）——不按两笔分开问，「取消」那圈灰边就永远读不到。
+    /// 找不到返回 `None`：偏好卡**故意没有**「取消」那一枚（开关当场就落了，说「取消」是谎报）。
+    fn foot_button(out: &egui::FullOutput, card: Rect, label: &str) -> Option<(Color32, Color32, Rect)> {
+        let band = (card.max.y - MODAL_FOOT_H)..=card.max.y;
+        let g = out
+            .shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Text(t) => {
+                    Some((t.galley.text().to_owned(), t.galley.rect.translate(t.pos.to_vec2())))
+                }
+                _ => None,
+            })
+            .find(|(text, r)| text == label && band.contains(&r.center().y))
+            .map(|(_, r)| r)?;
+        let mut found: Vec<&egui::epaint::RectShape> = Vec::new();
+        for c in &out.shapes {
+            let mut leg = Vec::new();
+            collect_rects(&c.shape, c.clip_rect, &mut leg);
+            found.extend(leg.into_iter().map(|(r, _)| r));
+        }
+        let inside = found
+            .iter()
+            .filter(|r| r.corner_radius != egui::CornerRadius::ZERO && r.rect.contains(g.center()))
+            .collect::<Vec<_>>();
+        let btn = *inside
+            .iter()
+            .filter(|r| r.fill != Color32::TRANSPARENT)
+            .min_by_key(|r| (r.rect.width() * r.rect.height()) as i64)?;
+        let edge = inside
+            .iter()
+            .filter(|r| r.rect == btn.rect && r.stroke.color != Color32::TRANSPARENT)
+            .map(|r| r.stroke.color)
+            .next()
+            .unwrap_or(Color32::TRANSPARENT);
+        Some((btn.fill, edge, btn.rect))
+    }
+
+    /// 主按钮和「取消」得**一眼分得开**。目视那一轮（2026-10-24，用户：「提交、推送、设置窗口都好丑」）
+    /// 里两张卡脚都是两枚白底灰边的按钮，最右边那枚一点就动 git，看着和「取消」一模一样。
+    /// 三档各挡一种回退：主按钮填主题蓝（都退回白底就红这儿）、取消是白底 + 灰边、
+    /// 主按钮上的字是白的（填了蓝却忘了改字色，那四个字就读不出来）。
+    /// 偏好卡故意没有「取消」，所以那一枚只在前两张卡上问。
     #[test]
-    fn the_pull_card_is_the_measured_size() {
+    fn the_primary_button_is_the_filled_one() {
+        for (tool, word, has_cancel) in [(1usize, "拉取", true), (2, "推送", true), (10, "完成", false)] {
+            let mut app = with_remotes();
+            assert!(click_tool(&mut app, tool), "工具条上没有第 {tool} 枚");
+            let out = settled_frame(&mut app, 0.4);
+            let card = card_back(&out).expect("卡底没画出来").1;
+            let (fill, edge, btn) =
+                foot_button(&out, card, word).unwrap_or_else(|| panic!("卡脚上没有「{word}」那枚实心按钮"));
+            assert_eq!(fill, ACCENT, "{word} 卡的主按钮没填成主题蓝：{fill:?}");
+            assert_eq!(
+                edge,
+                Color32::TRANSPARENT,
+                "{word} 卡的主按钮是实心一块，不该再描一圈：{edge:?}"
+            );
+            assert!(
+                card.contains(btn.min) && card.contains(btn.max),
+                "{word} 卡的主按钮跑到卡外了：{btn:?}，卡 {card:?}"
+            );
+            let band = (card.max.y - MODAL_FOOT_H)..=card.max.y;
+            assert_eq!(
+                text_color(&out, word, band),
+                Color32::WHITE,
+                "{word} 那枚填了蓝、字却还是深色"
+            );
+            if !has_cancel {
+                continue;
+            }
+            let (cfill, cedge, cancel) = foot_button(&out, card, "取消").expect("卡脚上没有「取消」那枚");
+            assert_eq!(cfill, Color32::WHITE, "「取消」不是白底：{cfill:?}");
+            assert_eq!(cedge, BTN_EDGE, "「取消」那圈灰边没画上：{cedge:?}");
+            assert!(
+                cancel.max.x < btn.min.x,
+                "「取消」跑到主按钮右边去了：{cancel:?} vs {btn:?}"
+            );
+        }
+    }
+
+    /// 卡上那几枚勾的**格子**是方的、边长就是 `CHK_CARD`。
+    /// 这条钉的是目视那一轮里最难看的一处：全局 `spacing.interact_size.y` 是日志行高 26，
+    /// egui 的 checkbox 把格子的高度取 `max(icon_width, interact_size.y)`，于是卡上每一枚
+    /// 都是一块 18×26 的竖长条（用户原话「好丑」的那一档）。`check_row` 在**卡那一层**的
+    /// scope 里把这三档都压回 18，主窗口的行高一处都不碰。
+    /// 两张卡各量一枚：`pref_switch` 和 `modal_switch` 是两条出口，只验一半就放行另一半。
+    #[test]
+    fn the_card_checkboxes_are_small_squares() {
+        for (tool, label) in [(10usize, "启动时重新打开上一次的仓库"), (2, "推送所有标签")] {
+            let mut app = with_remotes();
+            assert!(click_tool(&mut app, tool), "工具条上没有第 {tool} 枚");
+            let out = settled_frame(&mut app, 0.4);
+            let card = card_back(&out).expect("卡底没画出来").1;
+            let band = card.min.y..=card.max.y;
+            let text = text_rect(&out, label, band.clone());
+            let mut found: Vec<(&egui::epaint::RectShape, Rect)> = Vec::new();
+            for c in &out.shapes {
+                collect_rects(&c.shape, c.clip_rect, &mut found);
+            }
+            let box_rect = found
+                .into_iter()
+                .map(|(r, _)| r.rect)
+                // 贴着那行文字左缘的那一枚小方块（`icon_spacing` 是 6pt 的缝）。
+                .find(|q| {
+                    q.width() < 30.0
+                        && q.max.x <= text.min.x
+                        && text.min.x - q.max.x < 12.0
+                        && (q.center().y - text.center().y).abs() < q.height()
+                })
+                .unwrap_or_else(|| panic!("「{label}」左边那一格勾没画出来"));
+            assert!(
+                (box_rect.width() - CHK_CARD).abs() <= 1.0 && (box_rect.height() - CHK_CARD).abs() <= 1.0,
+                "「{label}」那枚勾是 {:?}，不是 {CHK_CARD} 见方",
+                (box_rect.width(), box_rect.height())
+            );
+        }
+    }
+
+    /// 拉取卡同一条规矩：高按「四行 + 选项那只框」算，不照 `GitPullSheet.nib` 那张 614×299 摆。
+    /// 这张卡的行数是定的，所以挡「按空窗口摆」的正是最后那道空白：老尺寸底下会多出 58 pt，
+    /// 一档预算（一行 + 一道缝）拦得住。
+    #[test]
+    fn the_pull_card_is_as_tall_as_its_rows() {
         let mut app = with_remotes();
         assert!(click_tool(&mut app, 1), "工具条上没有「拉取」那枚");
-        let (fill, card) = card_back(&settled_frame(&mut app, 0.4)).expect("拉取卡的卡底没画出来");
+        let out = settled_frame(&mut app, 0.4);
+        let (fill, card) = card_back(&out).expect("拉取卡的卡底没画出来");
         assert_eq!(fill, Color32::WHITE, "卡底不是白的：{fill:?}");
-        // `GitPullSheet` 内容区实测 614×299，加标题带 30。
-        assert_eq!((card.width(), card.height()), (614.0, 329.0), "拉取卡不是量出来的那个尺寸");
+        let computed = card_rect(
+            app.modal.as_ref().expect("卡没打开"),
+            Rect::from_min_size(pos2(0.0, 0.0), vec2(WIN_W, WIN_H)),
+        );
+        assert_eq!(card, computed, "帧里那块白底和布局算出来的那一格不一致");
+        assert!(
+            card.min.x >= 0.0 && card.min.y >= 0.0 && card.max.x <= WIN_W && card.max.y <= WIN_H,
+            "拉取卡溢出默认窗口了：{card:?}，窗口 {WIN_W}×{WIN_H}"
+        );
+        let void = body_void(&out, card);
+        assert!(
+            void <= MODAL_ROW_H + MODAL_GAP + 1.0,
+            "卡脚前面空了 {void} pt：选项只有三行，卡却按一张空窗口的尺寸摆着"
+        );
     }
 
     /// 「选项」那只框里三枚勾**逐字**取自 nib（第四句「立即提交合并的改动」是 git 的默认行为，
@@ -5189,7 +5426,7 @@ use crate::viewport;
         pos2(x, y)
     }
 
-    /// 偏好卡「推送与拉取」那一页改的四条，推送卡**当场**就该读得到；闸关掉之后那枚勾
+    /// 偏好卡「推送与拉取」那一页改的五条，推送卡**当场**就该读得到；闸关掉之后那枚勾
     /// 摆都不摆。远端那一格的落点也在这条里问：当前分支没有上游时它读偏好，
     /// 偏好也没设就**留空、主按钮按不动**——宁可让人挑，不替他猜 `origin`。
     #[test]
@@ -5217,7 +5454,14 @@ use crate::viewport;
         assert!(!app.allow_force, "点了闸但 app.allow_force 没拧");
         assert!(app.push_tags, "点了「推送所有标签」但没拧");
         assert_eq!(app.default_remote, "fork", "默认远端没落到界面上");
-        assert_eq!(Prefs::load(app.conn.as_ref()), app.prefs(), "四条没一起落库");
+        // 「推送时」那一档换的是表里预先勾上哪几条（不是 git 的实参，见 `PushBehavior` 那段），
+        // 所以这一条必须在**重开的卡**上问，光读 `app.push_behavior` 只验到弹出一半。
+        click_menu_item(&mut app, "匹配 ▼", "当前");
+        assert_eq!(app.push_behavior, PushBehavior::Current, "点了「当前」那一档，app 没跟上");
+        // 那一格得把选中的这一档**念回来**：`label()` 走的是 `index()`，落库走的是 `key()`，
+        // 两条路各写各的，只读字段的话「显示成简单、存成 current」这种错看不出来。
+        assert!(card_has(&mut app, "当前 ▼"), "选了「当前」，那一格没念回这一档");
+        assert_eq!(Prefs::load(app.conn.as_ref()), app.prefs(), "五条没一起落库");
         assert!(click_card_button(&mut app, "完成"));
 
         assert!(click_tool(&mut app, 2));
@@ -5225,6 +5469,11 @@ use crate::viewport;
         assert_eq!(remote, "fork", "默认远端没成为卡上那一格的初值");
         assert!(!force, "「强制推送」不该带着勾开出来");
         assert!(tags, "「推送所有标签」那枚初值没读到偏好");
+        assert_eq!(
+            push_rows(&app).iter().map(|(_, p, _, _)| *p).collect::<Vec<bool>>(),
+            vec![false, true, false, false],
+            "偏好选了「当前」，重开的推送卡却勾了别的几条（这会儿当前是 feature/x）"
+        );
         assert!(!card_has(&mut app, "强制推送"), "闸关了，卡上那枚勾还摆着");
         assert!(card_has(&mut app, "/tmp/gate-fork-push.git"), "推送卡该念 fork 的 push_url");
         let _ = std::fs::remove_file(&db_file);

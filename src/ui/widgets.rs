@@ -270,21 +270,171 @@ pub(crate) fn modal_text(ui: &mut egui::Ui, card: Rect, y: f32, text: &str, fg: 
 
 /// 卡里可选的一行（合并挑分支用的就是它）：hover 上浅灰，点中返回 true。
 pub(crate) fn modal_row(ui: &mut egui::Ui, card: Rect, y: f32, label: &str) -> bool {
-    let r = Rect::from_min_max(pos2(card.min.x + 10.0, y), pos2(card.max.x - 10.0, y + MODAL_ROW_H));
+    let r = Rect::from_min_max(
+        pos2(card.min.x + 8.0, y),
+        pos2(card.max.x - 8.0, y + MODAL_ROW_H),
+    );
     let resp = ui.allocate_rect(r, Sense::click());
     if resp.hovered() {
-        ui.painter().rect_filled(r, 4.0, HOVER);
+        ui.painter().rect_filled(r, 6.0, HOVER);
     }
     modal_text(ui, card, y, label, INK, 12.0);
     resp.clicked()
 }
 
-/// 卡上一行开关（偏好卡与提交卡用的都是它）：整行定高 26，文字就是开关的名字。
+/// 卡上一行开关（偏好卡与提交卡用的都是它）：整行定高 `MODAL_ROW_H`，文字就是开关的名字。
 /// 走 `ui.checkbox` 而不是自己画方框 + 命中矩形：勾选状态、键盘焦点、命中范围由一个
 /// 控件说了算，判据只需盯 `changed()` 这一处。
 pub(crate) fn pref_switch(ui: &mut egui::Ui, card: Rect, y: f32, label: &str, on: &mut bool) {
-    let r = Rect::from_min_max(pos2(card.min.x + 10.0, y), pos2(card.max.x - 10.0, y + MODAL_ROW_H));
-    put_left(ui, r, |ui| ui.checkbox(on, RichText::new(label).size(11.5)).changed());
+    let r = Rect::from_min_max(
+        pos2(card.min.x + MODAL_PAD, y),
+        pos2(card.max.x - MODAL_PAD, y + MODAL_ROW_H),
+    );
+    check_row(ui, r, |ui| ui.checkbox(on, RichText::new(label).size(11.5)));
+}
+
+/// 勾选方框那一档尺寸。全局 `interact_size.y` 是 `ROW_H`（26），egui 的 checkbox 拿它当
+/// 方框见方，于是卡上每一枚勾都是一大块灰色圆角——2026-10-24 目视那一轮抓到的就是它。
+/// 每一枚勾在**自己那一格**里把它压回 `CHK_CARD`，日志/文件表那些行不受影响。
+fn check_row<T>(ui: &mut egui::Ui, rect: Rect, add: impl FnOnce(&mut egui::Ui) -> T) -> T {
+    put_left(ui, rect, |ui| {
+        let sp = ui.spacing_mut();
+        sp.interact_size.y = CHK_CARD;
+        sp.icon_width = CHK_CARD;
+        sp.icon_width_inner = CHK_CARD - 6.0;
+        sp.icon_spacing = 6.0;
+        add(ui)
+    })
+}
+
+/// 卡里一格输入框。边框自己画：egui 那套 `TextEdit` 底框按 `interact_size.y` 撑高，
+/// 焦点那条描边还会溢出文字矩形——目视抓到的「蓝边顶到卡片右缘、两格读起来像一格」
+/// 就是它。所以关掉它的 `frame`，只留文字与光标：底色在加控件**之前**铺（不能盖住字），
+/// 描边在**之后**画（焦点要拿到 `Response` 才知道）。返回那个 `Response`，调用方拿它
+/// 请求焦点（卡刚打开时让光标落在摘要那一格）。
+pub(crate) fn card_field(
+    ui: &mut egui::Ui,
+    r: Rect,
+    hint: &str,
+    text: &mut String,
+    rows: usize,
+) -> egui::Response {
+    let inner = r.shrink(1.0);
+    ui.painter().rect_filled(inner, FIELD_R, Color32::WHITE);
+    let te = if rows > 1 {
+        egui::TextEdit::multiline(text)
+    } else {
+        egui::TextEdit::singleline(text)
+    };
+    let resp = ui.put(
+        inner,
+        te.hint_text(hint)
+            .desired_width(inner.width() - 14.0)
+            .desired_rows(rows.max(1))
+            .align(if rows > 1 { Align2::LEFT_TOP } else { Align2::LEFT_CENTER })
+            .margin(egui::Margin::symmetric(7, if rows > 1 { 5 } else { 3 }))
+            .frame(egui::Frame::new().fill(Color32::TRANSPARENT)),
+    );
+    if resp.has_focus() {
+        ui.painter().rect_stroke(
+            r.expand(1.5),
+            FIELD_R + 2.0,
+            Stroke::new(2.5, ACCENT_RING),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let edge = if resp.has_focus() { ACCENT } else { FIELD_EDGE };
+    ui.painter().rect_stroke(
+        r,
+        FIELD_R,
+        Stroke::new(1.0, edge),
+        egui::StrokeKind::Inside,
+    );
+    resp
+}
+
+/// 卡脚那一枚按钮。**主**那枚实底蓝、白字，**次**那枚白底灰边——之前两枚都走
+/// `hunk_button` 那一档浅灰描边，鼠标扫过去分不清谁是「办这件事」、谁是「算了」。
+/// 返回 `(点中了没, 实际宽度)`：宽度交回去，左边那枚才知道该从哪儿起。
+/// 文字落在格子正中——判据（`locate_card` 整串相等 + 只看卡脚那一条带）认的就是它。
+pub(crate) fn card_button(
+    ui: &mut egui::Ui,
+    text: &str,
+    right: f32,
+    cy: f32,
+    primary: bool,
+) -> (bool, f32) {
+    let font = FontId::proportional(11.5);
+    let fg = if primary { Color32::WHITE } else { INK };
+    let g = ui.painter().layout_no_wrap(text.to_owned(), font.clone(), fg);
+    let w = (g.size().x + 20.0).max(BTN_MIN_W);
+    let r = Rect::from_min_max(pos2(right - w, cy - BTN_H / 2.0), pos2(right, cy + BTN_H / 2.0));
+    let resp = ui.allocate_rect(r, Sense::click());
+    let p = ui.painter();
+    let fill = if primary {
+        if resp.is_pointer_button_down_on() {
+            ACCENT_DOWN
+        } else if resp.hovered() {
+            ACCENT_HOVER
+        } else {
+            ACCENT
+        }
+    } else if resp.hovered() {
+        HOVER
+    } else {
+        Color32::WHITE
+    };
+    p.rect_filled(r, BTN_R, fill);
+    if !primary {
+        p.rect_stroke(r, BTN_R, Stroke::new(1.0, BTN_EDGE), egui::StrokeKind::Inside);
+    }
+    p.galley(r.center() - g.size() / 2.0, g, fg);
+    (resp.clicked(), w)
+}
+
+/// 卡里那一排页签：整条住在灰槽里，选中那一段浮成白、描边、字变深。
+/// `selectable_label` 的底色铺满整格又不收口，三条并排看着像三行而不是「换页」，所以自己画。
+/// 返回被选中的那一档。
+pub(crate) fn seg_tabs<T: PartialEq + Clone>(
+    ui: &mut egui::Ui,
+    r: Rect,
+    items: &[(&str, T)],
+    current: &mut T,
+) {
+    let w = r.width() / items.len() as f32;
+    ui.painter()
+        .rect_filled(r.shrink(1.0), 7.0, SEG_BG);
+    for (i, (label, value)) in items.iter().enumerate() {
+        let seg = Rect::from_min_max(
+            pos2(r.min.x + w * i as f32 + 2.0, r.min.y + 2.0),
+            pos2(r.min.x + w * (i + 1) as f32 - 2.0, r.max.y - 2.0),
+        );
+        let resp = ui.allocate_rect(seg, Sense::click());
+        if *current == *value {
+            ui.painter().rect_filled(seg, 6.0, Color32::WHITE);
+            ui.painter().rect_stroke(
+                seg,
+                6.0,
+                Stroke::new(1.0, BTN_EDGE),
+                egui::StrokeKind::Inside,
+            );
+        } else if resp.hovered() {
+            ui.painter().rect_filled(seg, 6.0, Color32::from_rgb(0xea, 0xec, 0xf0));
+        }
+        let g = ui.painter().layout_no_wrap(
+            (*label).to_owned(),
+            FontId::proportional(11.5),
+            if *current == *value { INK } else { MUTED },
+        );
+        ui.painter().galley(
+            seg.center() - g.size() / 2.0,
+            g,
+            if *current == *value { INK } else { MUTED },
+        );
+        if resp.clicked() {
+            *current = value.clone();
+        }
+    }
 }
 
 /// 主按钮（和 Enter 是同一条路）把卡上的东西变成一个动作。
@@ -373,26 +523,18 @@ pub(crate) fn primary_closes(m: &Modal) -> bool {
     matches!(m.form, Form::Settings { .. })
 }
 
-/// 一张卡摆多大。`rows()` 那套「标题 + N 行 + 脚部」适用于动作卡；偏好卡是照着
-/// SourceTree 那张窗口的实测尺寸摆的（`PREF_W`/`PREF_H`），窗口小过它就得收进屏里，
-/// 否则卡的底和右边被裁掉，开关点不着。
+/// 一张卡摆多大。**高度跟着内容走**（2026-10-24）：这三张卡以前各自钉死在本机那三张 nib 的
+/// 窗口尺寸（855×441 / 650×271 / 614×299），可里面的控件只有两三行，剩下的全是一片空白。
+/// 现在只有「行高 / 标题带 / 卡脚」这三档是常量，其余按行数算；`rows()` 那套账适用于动作卡，
+/// 推送卡按表里那几行算，偏好卡按**页里最多那一条**算（换页不让卡跳）。
 pub(crate) fn card_rect(m: &Modal, screen: Rect) -> Rect {
+    let clamp = |w: f32, h: f32| vec2(w.min(screen.width() - 40.0), h.min(screen.height() - 40.0));
+    let fits = |body: f32| MODAL_TITLE_H + body + MODAL_FOOT_H;
     let size = match m.form {
-        Form::Settings { .. } => vec2(
-            PREF_W.min(screen.width() - 40.0),
-            PREF_H.min(screen.height() - 40.0),
-        ),
-        // 这两张卡是「标题那一条（我们自己画的）+ nib 里量出来的内容区」。
-        // 内容区高度不跟行数走：那张表里每一格的坐标都是量出来的（见 theme.rs 那两组常量）。
-        Form::Push { .. } => vec2(
-            PUSH_W.min(screen.width() - 40.0),
-            (MODAL_TITLE_H + PUSH_H).min(screen.height() - 40.0),
-        ),
-        Form::Pull { .. } => vec2(
-            PULL_W.min(screen.width() - 40.0),
-            (MODAL_TITLE_H + PULL_H).min(screen.height() - 40.0),
-        ),
-        _ => vec2(MODAL_W, MODAL_TITLE_H + MODAL_ROW_H * m.rows() as f32 + MODAL_FOOT_H),
+        Form::Settings { .. } => clamp(PREF_W, fits(settings_body_h())),
+        Form::Push { ref rows, .. } => clamp(PUSH_W, fits(push_body_h(rows.len()))),
+        Form::Pull { .. } => clamp(PULL_W, fits(PULL_BODY_H)),
+        _ => clamp(MODAL_W, fits(MODAL_ROW_H * m.rows() as f32)),
     };
     Rect::from_center_size(screen.center(), size)
 }
@@ -418,9 +560,9 @@ fn cell_popup(ui: &mut egui::Ui, top: Pos2, x: f32, y: f32, w: f32, h: f32, labe
     picked
 }
 
-/// 推送卡。字段、顺序、每一格的坐标都对着 `GitPushSheet.nib` 实测的那一张表
-/// （常量在 theme.rs，测量记录在 docs/PROCESS.md）；这一层只**改表单**，
-/// 落到 git 的那一条由 `primary_action` 变出来——Enter 和鼠标共用那一个出口。
+/// 推送卡。字段与顺序来自 `GitPushSheet`（那两张 nib 的测量记录见 docs/PROCESS.md），
+/// 但**摆位按内容排**：外框跟着表里那几行长，卡高跟着外框走（见 `card_rect`）。
+/// 这一层只**改表单**，落到 git 的那一条由 `primary_action` 变出来——Enter 和鼠标共用那一个出口。
 ///
 /// 表格里的行是打开那一刻从快照钉进来的（见 `Form::Push`），所以这里只改勾与名字。
 pub(crate) fn push_card(
@@ -434,24 +576,61 @@ pub(crate) fn push_card(
     allow_force: bool,
 ) {
     let names: Vec<String> = remotes.iter().map(|r| r.name.clone()).collect();
-    modal_label(ui, top, PUSH_LABEL_X, PUSH_ROW1_Y, "推送到仓库：");
+    modal_label(ui, top, PUSH_LABEL_X, PUSH_ROW1_Y + 4.0, "推送到仓库：");
     if let Some(picked) =
-        cell_popup(ui, top, PUSH_REMOTE_X, PUSH_ROW1_Y, PUSH_REMOTE_W, 25.0, remote.as_str(), &names)
+        cell_popup(ui, top, PUSH_REMOTE_X, PUSH_ROW1_Y, PUSH_REMOTE_W, FIELD_H, remote.as_str(), &names)
     {
         *remote = picked;
     }
-    // 那一格显示的是所选远端的 URL（nib 里它是个不可编辑的说明框，`{{253,230},{372,22}}`）。
+    // 那一格显示的是所选远端的 URL（nib 里它是个不可编辑的说明框）。
     let url = remotes
         .iter()
         .find(|r| &r.name == remote)
         .map(|r| r.push_url.clone().unwrap_or_else(|| r.url.clone()))
         .unwrap_or_default();
-    modal_note(ui, top, PUSH_URL_X, PUSH_ROW1_Y, PUSH_URL_W, &url);
-    // 「要推送的分支」那只框。
-    let box_rect = PUSH_BOX.translate(top.to_vec2());
-    ui.painter().rect_stroke(box_rect, 3.0, Stroke::new(1.0, RULE), egui::StrokeKind::Middle);
-    modal_label(ui, top, PUSH_LABEL_X + 6.0, 48.0, "要推送的分支");
-    // 表头四列（nib 里 28pt 高、列宽 38/186/260/43）。
+    modal_note(ui, top, PUSH_URL_X, PUSH_ROW1_Y + 4.0, PUSH_URL_W, &url);
+
+    // 表格那一格的标题在框**外面**（左），「全选」在同一个标题行的右端——它原来孤零零浮在
+    // 一只大半空着的框底下，看着像上一行的尾巴。
+    modal_label(ui, top, PUSH_LABEL_X, PUSH_HEAD_LABEL_Y + 4.0, "要推送的分支");
+    // 「全选」把表里每一条都勾上——它只动**这一张卡**上的勾，不碰仓库。
+    if card_button(
+        ui,
+        "全选",
+        top.x + PUSH_TABLE_RIGHT,
+        top.y + PUSH_HEAD_LABEL_Y + 13.0,
+        false,
+    )
+    .0
+    {
+        for row in rows.iter_mut() {
+            row.picked = true;
+        }
+    }
+    // 外框：顶边 = 表头顶边，底边 = 最后一行的下沿，**只裹住真有的那几行**。
+    let n = rows.len();
+    let box_rect = Rect::from_min_max(
+        pos2(top.x + PUSH_TABLE_X, top.y + PUSH_TABLE_TOP),
+        pos2(top.x + PUSH_TABLE_RIGHT, top.y + push_table_bottom(n)),
+    );
+    // `Painter` 外面套的是 Arc，clone 一份就不占着 `ui` 的借用（下面要横跨好几个控件画线）。
+    let p = ui.painter().clone();
+    p.rect_filled(box_rect, 6.0, Color32::WHITE);
+    p.rect_filled(
+        Rect::from_min_max(box_rect.min, pos2(box_rect.max.x, box_rect.min.y + PUSH_HEAD_H)),
+        6.0,
+        TABLE_HEAD_BG,
+    );
+    p.line_segment(
+        [
+            pos2(box_rect.min.x, box_rect.min.y + PUSH_HEAD_H),
+            pos2(box_rect.max.x, box_rect.min.y + PUSH_HEAD_H),
+        ],
+        Stroke::new(1.0, RULE),
+    );
+    p.rect_stroke(box_rect, 6.0, Stroke::new(1.0, FIELD_EDGE), egui::StrokeKind::Inside);
+
+    // 表头四列。列宽见 theme.rs。
     let mut x = PUSH_TABLE_X;
     for (title, w) in [
         ("推送？", PUSH_COL_PICK),
@@ -459,60 +638,65 @@ pub(crate) fn push_card(
         ("远程分支", PUSH_COL_REMOTE),
         ("跟踪？", PUSH_COL_TRACK),
     ] {
-        modal_label(ui, top, x, PUSH_TABLE_TOP + 6.0, title);
+        modal_label(ui, top, x + 4.0, PUSH_TABLE_TOP + 4.0, title);
         x += w;
     }
-    ui.painter().line_segment(
-        [
-            pos2(top.x + PUSH_TABLE_X, top.y + PUSH_TABLE_TOP + PUSH_HEAD_H),
-            pos2(top.x + PUSH_TABLE_X + PUSH_COL_PICK + PUSH_COL_LOCAL + PUSH_COL_REMOTE + PUSH_COL_TRACK, top.y + PUSH_TABLE_TOP + PUSH_HEAD_H),
-        ],
-        Stroke::new(1.0, RULE),
-    );
-    // 表格那几行。行高 16 是 nib 的 `rowHeight`，四列的 x 由表头那圈加起来。
+    // 表格那几行。两列勾**在列里居中**：判据（`push_row_box`）按列正中点鼠标，
+    // 方框贴在列左缘的话那一按就落到遮罩上。
     let col_local_x = PUSH_TABLE_X + PUSH_COL_PICK;
     let col_remote_x = col_local_x + PUSH_COL_LOCAL;
     let col_track_x = col_remote_x + PUSH_COL_REMOTE;
     for (i, row) in rows.iter_mut().enumerate() {
         let y = PUSH_TABLE_TOP + PUSH_HEAD_H + PUSH_ROW_H * i as f32;
-        cell_left(ui, top, PUSH_TABLE_X, y, PUSH_COL_PICK, PUSH_ROW_H, |ui| {
-            ui.checkbox(&mut row.picked, "");
-        });
-        modal_label(ui, top, col_local_x, y, &row.local);
-        cell_left(ui, top, col_remote_x, y, PUSH_COL_REMOTE, PUSH_ROW_H, |ui| {
-            let _ = ui.add(
-                egui::TextEdit::singleline(&mut row.remote_name)
-                    .font(TextStyle::Small)
-                    .desired_width(PUSH_COL_REMOTE - 8.0),
+        let band = Rect::from_min_max(
+            pos2(top.x + PUSH_TABLE_X, top.y + y),
+            pos2(top.x + PUSH_TABLE_RIGHT, top.y + y + PUSH_ROW_H),
+        );
+        if i + 1 < n {
+            p.line_segment(
+                [
+                    pos2(band.min.x + 4.0, band.max.y),
+                    pos2(band.max.x - 4.0, band.max.y),
+                ],
+                Stroke::new(1.0, Color32::from_rgb(0xf0, 0xf1, 0xf4)),
             );
-        });
-        cell_left(ui, top, col_track_x, y, PUSH_COL_TRACK, PUSH_ROW_H, |ui| {
-            ui.checkbox(&mut row.track, "");
-        });
-    }
-    // 「全选」把表里每一条都勾上——它只动**这一张卡**上的勾，不碰仓库。
-    if cell_left(
-        ui,
-        top,
-        PUSH_SELECT_ALL.min.x,
-        PUSH_SELECT_ALL.min.y,
-        PUSH_SELECT_ALL.width(),
-        PUSH_SELECT_ALL.height(),
-        |ui| ui.button(RichText::new("全选").size(11.0)).clicked(),
-    ) {
-        for row in rows.iter_mut() {
-            row.picked = true;
         }
+        let box_x = |left: f32, w: f32| left + (w - CHK_CARD) / 2.0;
+        check_row(ui, Rect::from_min_max(pos2(top.x + box_x(PUSH_TABLE_X, PUSH_COL_PICK), band.min.y), pos2(top.x + box_x(PUSH_TABLE_X, PUSH_COL_PICK) + CHK_CARD, band.max.y)), |ui| {
+            ui.checkbox(&mut row.picked, "")
+        });
+        modal_label(ui, top, col_local_x + 4.0, y + 2.0, &row.local);
+        card_field(
+            ui,
+            Rect::from_min_max(
+                pos2(top.x + col_remote_x + 3.0, band.min.y + 1.0),
+                pos2(top.x + col_remote_x + PUSH_COL_REMOTE - 3.0, band.max.y - 1.0),
+            ),
+            "",
+            &mut row.remote_name,
+            1,
+        );
+        check_row(ui, Rect::from_min_max(pos2(top.x + box_x(col_track_x, PUSH_COL_TRACK), band.min.y), pos2(top.x + box_x(col_track_x, PUSH_COL_TRACK) + CHK_CARD, band.max.y)), |ui| {
+            ui.checkbox(&mut row.track, "")
+        });
     }
-    modal_switch(ui, top, PUSH_CHECK_X, PUSH_TAGS_Y, "推送所有标签", tags);
+    // 框下面那两枚勾。
+    let y = push_checks_y(n);
+    modal_switch(ui, top, PUSH_LABEL_X, y, "推送所有标签", tags);
     // 「允许强制推送」是偏好里的那道闸：关着的时候这一枚**摆都不摆**——
     // 摆一枚点了没用的勾等于没有闸（和偏好卡「三条都真接得通才摆上来」同一条规矩）。
     if allow_force {
-        modal_switch(ui, top, PUSH_CHECK_X, PUSH_FORCE_Y, "强制推送", force);
+        modal_switch(ui, top, PUSH_LABEL_X + 130.0, y, "强制推送", force);
     }
 }
 
-/// 拉取卡。同上，每一格对着 `GitPullSheet.nib` 的实测坐标；返回「刷新」被点了没。
+/// 表格外框的下沿（内容区坐标）。
+fn push_table_bottom(n: usize) -> f32 {
+    PUSH_TABLE_TOP + PUSH_HEAD_H + PUSH_ROW_H * n as f32
+}
+
+/// 拉取卡。字段与文案来自 `GitPullSheet`，摆位按内容排（同推送卡，见 `card_rect`）。
+/// 返回「刷新」被点了没。
 pub(crate) fn pull_card(
     ui: &mut egui::Ui,
     top: Pos2,
@@ -525,9 +709,9 @@ pub(crate) fn pull_card(
     opts: &mut git::PullOpts,
 ) -> bool {
     let names: Vec<String> = remotes.iter().map(|r| r.name.clone()).collect();
-    modal_label(ui, top, PULL_LABEL_X, PULL_REMOTE_Y + 2.0, "从仓库拉取：");
+    modal_label(ui, top, PULL_LABEL_X, PULL_REMOTE_Y + 4.0, "从仓库拉取：");
     if let Some(picked) =
-        cell_popup(ui, top, PULL_FIELD_X, PULL_REMOTE_Y, PULL_REMOTE_W, 25.0, remote.as_str(), &names)
+        cell_popup(ui, top, PULL_FIELD_X, PULL_REMOTE_Y, PULL_REMOTE_W, FIELD_H, remote.as_str(), &names)
     {
         *remote = picked;
     }
@@ -537,38 +721,47 @@ pub(crate) fn pull_card(
         .map(|r| r.url.clone())
         .unwrap_or_default();
     modal_note(ui, top, PULL_FIELD_X, PULL_URL_Y, PULL_REMOTE_W, &url);
-    modal_label(ui, top, PULL_LABEL_X, PULL_BRANCH_Y + 2.0, "要拉取的远程分支：");
+    modal_label(ui, top, PULL_LABEL_X, PULL_BRANCH_Y + 4.0, "要拉取的远程分支：");
     // 那一列的选项来自**当前那份快照**的远程跟踪引用（按选中的远端剥前缀），
     // 「刷新」跑完 fetch、新快照落地，它跟着变——所以选项不是卡打开那一刻钉死的那一批。
     let empty = "选择一个分支";
     let current = if branch.is_empty() { empty } else { branch.as_str() };
     if let Some(picked) =
-        cell_popup(ui, top, PULL_FIELD_X, PULL_BRANCH_Y, PULL_BRANCH_W, 25.0, current, branches)
+        cell_popup(ui, top, PULL_FIELD_X, PULL_BRANCH_Y, PULL_BRANCH_W, FIELD_H, current, branches)
     {
         *branch = picked;
     }
-    modal_label(ui, top, PULL_LABEL_X, PULL_INTO_Y + 2.0, "拉取到本地分支：");
+    // 「刷新」和它刷的那一列同一行、钉在同一行的右端（原来它浮在正文右上角，
+    // 离哪一格都不像）。它跑的是 `git fetch <远端>`，只动远端那一列，不改工作区。
+    let refresh = card_button(
+        ui,
+        "刷新",
+        top.x + PULL_W - MODAL_PAD,
+        top.y + PULL_BRANCH_Y + FIELD_H / 2.0,
+        false,
+    )
+    .0;
+    modal_label(ui, top, PULL_LABEL_X, PULL_INTO_Y + 4.0, "拉取到本地分支：");
     let empty2 = "选择本地分支";
     let current2 = if into.is_empty() { empty2 } else { into.as_str() };
     if let Some(picked) =
-        cell_popup(ui, top, PULL_FIELD_X, PULL_INTO_Y, PULL_BRANCH_W, 25.0, current2, locals)
+        cell_popup(ui, top, PULL_FIELD_X, PULL_INTO_Y, PULL_BRANCH_W, FIELD_H, current2, locals)
     {
         *into = picked;
     }
-    let refresh = cell_left(
-        ui,
-        top,
-        PULL_REFRESH.min.x,
-        PULL_REFRESH.min.y,
-        PULL_REFRESH.width(),
-        PULL_REFRESH.height(),
-        |ui| ui.button(RichText::new("刷新").size(11.0)).clicked(),
+    // 「选项」那只框：标题在框外，框只裹住真摆出来的那几行。
+    modal_label(ui, top, PULL_LABEL_X, PULL_OPT_LABEL_Y + 4.0, "选项");
+    let box_rect = Rect::from_min_max(
+        pos2(top.x + PULL_LABEL_X, top.y + PULL_BOX_TOP),
+        pos2(top.x + PULL_W - MODAL_PAD, top.y + PULL_BOX_BOTTOM),
     );
-    // 「选项」那只框，四行从上到下。第一行「立即提交合并的改动」没摆：它就是 git 的默认
-    // 行为，一枚怎么按都看不出区别的勾比不摆更糟（见 `git::PullOpts`）。位置仍按量来的留空。
-    let box_rect = PULL_BOX.translate(top.to_vec2());
-    ui.painter().rect_stroke(box_rect, 3.0, Stroke::new(1.0, RULE), egui::StrokeKind::Middle);
-    modal_label(ui, top, PULL_LABEL_X + 4.0, 130.0, "选项");
+    ui.painter().rect_filled(box_rect, 6.0, Color32::from_rgb(0xfb, 0xfc, 0xfd));
+    ui.painter().rect_stroke(
+        box_rect,
+        6.0,
+        Stroke::new(1.0, FIELD_EDGE),
+        egui::StrokeKind::Inside,
+    );
     modal_switch(ui, top, PULL_OPT_X, PULL_OPT_LOG_Y, "包括被合并提交的信息内容", &mut opts.log);
     modal_switch(ui, top, PULL_OPT_X, PULL_OPT_NOFF_Y, "无论是否可以快进更新都创建新的提交", &mut opts.no_ff);
     modal_switch(
@@ -591,16 +784,18 @@ fn modal_note(ui: &mut egui::Ui, top: Pos2, x: f32, y: f32, w: f32, text: &str) 
 
 /// 内容区里一格说明文字（不可点）。走 `put_left` + `Label`，和卡上其余文字同一套截断规则。
 fn modal_label(ui: &mut egui::Ui, top: Pos2, x: f32, y: f32, text: &str) {
-    cell_left(ui, top, x, y, 300.0, 18.0, |ui| {
+    cell_left(ui, top, x, y, 320.0, 18.0, |ui| {
         ui.add(Label::new(RichText::new(text).size(11.5).color(INK)).selectable(false));
     });
 }
 
 /// 内容区里一枚开关（推送卡那两枚、拉取卡那三枚用的都是它）。
 fn modal_switch(ui: &mut egui::Ui, top: Pos2, x: f32, y: f32, label: &str, on: &mut bool) {
-    cell_left(ui, top, x, y, 480.0, 18.0, |ui| {
-        ui.checkbox(on, RichText::new(label).size(11.5));
-    });
+    check_row(
+        ui,
+        cell(top, x, y, 480.0, CHK_CARD),
+        |ui| ui.checkbox(on, RichText::new(label).size(11.5)),
+    );
 }
 
 /// hunk 头右端那枚小按钮：白底、1pt 灰边、圆角 4、10.5 号灰字，**最少** 55×15
