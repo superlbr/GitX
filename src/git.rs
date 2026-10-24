@@ -380,28 +380,277 @@ pub fn unpushed_commits(repo: &str) -> Vec<String> {
 pub fn status(repo: &str) -> Result<RepoStatus> {
     let out = run_git(repo, &["status", "--porcelain=v2", "--branch"])?;
     let mut st = parse_status(&out);
-    st.stash_count = stash_list(repo)?.len() as u32;
-    st.repo_state = repo_state(repo)?;
+    // 同一把 `.git` 读完两处：这一次 fork 之外的信息全在文件系统里。
+    let gd = git_dir(repo)?;
+    st.stash_count = stash_count(&gd);
+    st.repo_state = state_at(&gd);
     Ok(st)
+}
+
+/// Locate the git directory by reading the working tree, with no subprocess.
+///
+/// `<repo>/.git` is a directory in an ordinary checkout and a one-line
+/// `gitdir: <path>` pointer in a linked worktree — and the pointer names the
+/// *per-worktree* git dir, which is exactly where that worktree's own
+/// `MERGE_HEAD` lives. Bare repositories have no `.git` at all, so the caller
+/// falls back to asking git rather than reading the wrong place.
+fn git_dir(repo: &str) -> Result<std::path::PathBuf> {
+    let dot = std::path::Path::new(repo).join(".git");
+    if dot.is_dir() {
+        return Ok(dot);
+    }
+    if let Ok(raw) = std::fs::read_to_string(&dot) {
+        if let Some(target) = raw.trim().strip_prefix("gitdir:") {
+            let target = target.trim();
+            if !target.is_empty() {
+                // git 通常写绝对路径，但相对写法确实存在，且它是**相对工作树**的。
+                let p = std::path::Path::new(target);
+                return Ok(if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    std::path::Path::new(repo).join(p)
+                });
+            }
+        }
+    }
+    Ok(std::path::PathBuf::from(
+        run_git(repo, &["rev-parse", "--absolute-git-dir"])?
+            .trim()
+            .to_string(),
+    ))
 }
 
 /// Detect an in-progress merge / cherry-pick / rebase via git-dir sentinel files.
 fn repo_state(repo: &str) -> Result<String> {
-    // `--git-dir` 是**相对当前进程 cwd** 的一截路径（通常就是 `.git`），拿它去 `exists()`
-    // 查的是壳进程所在的目录，不是被打开的那个仓库。必须问绝对路径。
-    let gd = run_git(repo, &["rev-parse", "--absolute-git-dir"])?
-        .trim()
-        .to_string();
-    let p = std::path::Path::new(&gd);
-    if p.join("MERGE_HEAD").exists() {
-        Ok("merge".into())
-    } else if p.join("CHERRY_PICK_HEAD").exists() {
-        Ok("cherry-pick".into())
-    } else if p.join("rebase-merge").exists() || p.join("rebase-apply").exists() {
-        Ok("rebase".into())
-    } else {
-        Ok("none".into())
+    Ok(state_at(&git_dir(repo)?))
+}
+
+/// `state_at` 的入参必须是**绝对** git-dir 或相对进程 cwd 能走通的路径：
+/// 拿 `--git-dir` 那种相对当前进程 cwd 的一截路径去 `exists()`，查的是壳进程所在的
+/// 目录，不是被打开的那个仓库。`git_dir` 给的两种形态都落在仓库自己的路径下。
+/// `state_at` 只是 `op_at` 的一层投影：sentinel 的读法全仓库只有一处。
+fn state_at(gd: &std::path::Path) -> String {
+    op_at(gd)
+        .map(|op| op.kind)
+        .unwrap_or_else(|| "none".into())
+}
+
+/// 贮藏条数，读 reflog 的行数，不再 fork `git stash list`。
+///
+/// git 在 `refs/stash` 被删掉时（`drop` 掉最后一条、`clear`）会连着删掉这个文件，
+/// 所以「行数」和 `stash list` 的行数在实测的每个状态下都相等 —— 判据
+/// `stash_count_matches_stash_list` 把 drop/pop/apply/gc/packed-refs 全过了一遍。
+/// 需要贮藏的说明和 oid 时（侧栏）仍然走 `stash_list`。
+fn stash_count(gd: &std::path::Path) -> u32 {
+    match std::fs::read_to_string(gd.join("logs/refs/stash")) {
+        Ok(text) => text.lines().filter(|l| !l.is_empty()).count() as u32,
+        Err(_) => 0,
     }
+}
+
+/// 本机在这家仓库里的提交身份：邮件地址集，小写、去重、保持出现的顺序。
+/// 拆成纯函数是因为 `--get-regexp` 的真实输出（全局 + 本地混在一起、一个键多行）
+/// 用嘴说不算数，得拿字面量钉住。
+fn parse_identities(out: &str) -> Vec<String> {
+    let mut emails = Vec::new();
+    for line in out.lines() {
+        // `--get-regexp` 一行是「<key> <value>」，值里可以带空格，所以只在第一个空白处
+        // 切一刀；`user.email` 之外的那些键（`user.name`、带 @ 的 `user.signingkey`）
+        // 一条都不能进来 —— 名字匹配会把别人的提交算到我头上。
+        let Some((key, value)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
+        if key != "user.email" {
+            continue;
+        }
+        let e = value.trim().to_lowercase();
+        if !e.is_empty() && !emails.contains(&e) {
+            emails.push(e);
+        }
+    }
+    emails
+}
+
+/// 问 git，不是读文件：config 的取值规则（include、条件段、覆盖顺序）我们复刻不起，
+/// 复刻一份错的比多 fork 一次严重。一次 `--get-regexp '^user\.'` 就够，调用方负责缓存
+/// （见 `db::identity_cache`），所以首屏稳态不为它 fork。
+/// 拿不到（没配、或仓库读不了）返回空集而不是报错：首屏宁可少两行活动流。
+pub fn identities(repo: &str) -> Vec<String> {
+    // 没有一条 user.* 时 git 以 1 退出，`run_git` 把它当失败 —— 这里读作「没配身份」。
+    run_git(repo, &["config", "--get-regexp", "^user\\."])
+        .map(|out| parse_identities(&out))
+        .unwrap_or_default()
+}
+
+/// git-dir 里那份「进行中的操作」，含变基的第几步。`state_at` 是它的一层投影，
+/// 两处共用同一次读取 —— 两套机制各查一遍 sentinel 时，改坏一套另一套还绿。
+fn op_at(gd: &std::path::Path) -> Option<Op> {
+    // 顺序沿用改造前的 `state_at`：merge → cherry-pick → rebase。实测变基停在冲突上时
+    // git-dir 根目录只有 `REBASE_HEAD`，没有 `CHERRY_PICK_HEAD` 也没有 `MERGE_HEAD`，
+    // 所以这个顺序不会把「变基到第 3 步」报成「正在遴选」。
+    if gd.join("MERGE_HEAD").exists() {
+        Some(Op { kind: "merge".into(), step: None, total: None })
+    } else if gd.join("CHERRY_PICK_HEAD").exists() {
+        Some(Op { kind: "cherry-pick".into(), step: None, total: None })
+    } else {
+        // 两种后端各留一份目录：`-m/--i` 走 rebase-merge，`git am` 走 rebase-apply。
+        for dir in ["rebase-merge", "rebase-apply"] {
+            let d = gd.join(dir);
+            if d.exists() {
+                return Some(Op {
+                    kind: "rebase".into(),
+                    step: read_count(&d.join("msgnum")),
+                    total: read_count(&d.join("end")),
+                });
+            }
+        }
+        None
+    }
+}
+
+/// 文件里的一个计数。读不到或不是数字就回 `None` —— 界面上那是「进行中」，
+/// 而不是「0 / 0」那根永远不动的进度条。
+fn read_count(path: &std::path::Path) -> Option<u32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// `log --since` 那条的取数上限。窗口的边界本来归 `--since` 管，这个数字只是保险丝：
+/// 时间窗内提交多于 500 条的仓库，我的提交可能被挤出活动流（一条已登记的边界）。
+const ACTIVITY_LOG_SCAN: u32 = 500;
+
+/// 首屏「最近」面板要的那一份摘要。
+///
+/// `emails` 由调用方传进来（本机身份集，缓存见 db），所以这个函数**固定两次 fork**：
+/// `status --porcelain=v2 --branch` 与一次带 `--since` 的 `log`。`since` 是绝对 RFC3339
+/// 串而不是「7 天」，判据才能拿固定日期跑。
+/// 时间窗交给 git 的 `--since` 而不是本地筛：本地筛要先有全量，一个万人仓库会被 `--max-count`
+/// 截断在窗口外面。
+pub fn recent_activity(repo: &str, emails: &[String], since: &str, max: u32) -> Result<Activity> {
+    let st = status(repo)?;
+    let gd = git_dir(repo)?;
+    let out = run_git(
+        repo,
+        &[
+            "log",
+            &format!("--since={}", since),
+            &format!("--max-count={}", ACTIVITY_LOG_SCAN),
+            &format!("--pretty=format:{}", LOG_FMT),
+        ],
+    )?;
+    // 先按身份筛、再截断：反过来（把 `--max-count` 设成 `max`）会在筛之前就把我的提交
+    // 剪掉，忙仓库里活动流会整批空掉。
+    let set: Vec<String> = emails.iter().map(|e| e.to_lowercase()).collect();
+    let mine = parse_log(&out)
+        .into_iter()
+        .filter(|c| set.contains(&c.author_email.to_lowercase()))
+        .take(max as usize)
+        .collect();
+    Ok(Activity {
+        repo: repo.to_string(),
+        branch: st.branch,
+        ahead: st.ahead,
+        behind: st.behind,
+        dirty: st.files.len() as u32,
+        stash: st.stash_count,
+        op: op_at(&gd),
+        mine,
+    })
+}
+
+/// 并发聚合的机器：`workers` 个 worker 从原子下标领任务，每读完一个仓库立刻 `emit` 一份。
+///
+/// `emit` 会被多个线程同时调到，所以要 `Sync`；它只负责「到了就交」，什么时候到由
+/// 仓库自己的快慢决定 —— 这正是首屏要的：面板一块一块长出来，不是等最慢的那个仓库一起出现。
+/// `emit` 回 `false` 表示「没人要了」，那个 worker 把手上的活儿干完就走，不再领新任务。
+/// 队列用原子下标发号，不用 `chunks` 切分：切成分片后一片卡在挂起的仓库上，
+/// 后面整片都不会开始，而并发深度会掉到「片数」。
+fn activity_fan_out(
+    items: &[RepoQuery],
+    since: &str,
+    max: u32,
+    workers: usize,
+    emit: &(dyn Fn(usize, RepoOutcome) -> bool + Sync),
+) {
+    if items.is_empty() {
+        return;
+    }
+    let next = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = items.len();
+    let n = workers.clamp(1, count);
+    std::thread::scope(|scope| {
+        for _ in 0..n {
+            let (next, items, emit) = (next.clone(), items, emit);
+            scope.spawn(move || loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if i >= count {
+                    break;
+                }
+                let q = &items[i];
+                let result = recent_activity(&q.repo, &q.emails, since, max);
+                if !emit(i, RepoOutcome { repo: q.repo.clone(), result }) {
+                    break;
+                }
+            });
+        }
+    });
+}
+
+/// 首屏一次问完所有仓库并**当场收齐**：适合只要最终结果、不关心中间过程的调用方。
+/// 想在读的过程中就往界面上填，用 `recent_activity_stream` —— 这个函数会等最慢的那个仓库。
+///
+/// `workers` 是同时在飞的最大仓库数（不是线程池常驻大小）；0 与超过仓库数都收缩到
+/// 实际需要的数量，空输入直接回空表，不 spawn 任何线程。
+/// 返回顺序和 `items` 一致 —— 面板按「最近打开」排，队列自己不能反过来。
+/// 单仓库失败只落在它那一行的 `Err` 上（错误隔离）。这里**不做超时**，而且要说清代价：
+/// 一个挂起的 `git`（凭据提示、在休眠的网络盘上、被别的进程锁住 index）会占住它那个 worker，
+/// `thread::scope` 要等所有 worker 收完，所以整个调用会跟着挂住 —— 慢仓库今天会拖住首屏，
+/// 不只是它自己那一行。修它需要先给 `run_git` 做可取消执行（超时不是加个 `recv_timeout` 就完事，
+/// 那样子进程还活着，是谎报「超时了」）。这是已登记的一步，不在这里偷做。
+pub fn recent_activity_all(
+    items: &[RepoQuery],
+    since: &str,
+    max: u32,
+    workers: usize,
+) -> Vec<RepoOutcome> {
+    // 先按序号放进各自的格子，再摊平：worker 交出来的顺序是完成顺序，不是输入顺序。
+    let slots = std::sync::Mutex::new(
+        (0..items.len())
+            .map(|_| Option::<RepoOutcome>::None)
+            .collect::<Vec<_>>(),
+    );
+    activity_fan_out(items, since, max, workers, &(|i, outcome| {
+        slots.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(outcome);
+        true
+    }));
+    slots
+        .into_inner()
+        .unwrap_or_else(|e| e.into_inner())
+        .into_iter()
+        .map(|s| {
+            s.unwrap_or_else(|| RepoOutcome {
+                repo: String::new(),
+                result: Err(GitxError::Other("该仓库的 worker 没有产出结果".into())),
+            })
+        })
+        .collect()
+}
+
+/// 同上，但每读完一个仓库就往 `tx` 塞一份，不等最慢的那个。
+/// `RepoOutcome` 里只有仓库路径，序号不给 —— 界面按路径找那一行该填哪儿，
+/// 排序仍然是它自己的「最近打开」顺序，跟谁先回来无关。
+pub fn recent_activity_stream(
+    items: &[RepoQuery],
+    since: &str,
+    max: u32,
+    workers: usize,
+    tx: &std::sync::mpsc::Sender<RepoOutcome>,
+) {
+    // 接收端已经被丢掉 = 界面那侧不再要结果（窗口关了、或新一批刷新把旧的盖掉了）。
+    // 这时候继续跑完剩下的仓库只是白添进程，所以谁先撞上发送失败，谁就退休；
+    // 其余 worker 在各自的下一次发送上同样失败，一起收摊。
+    activity_fan_out(items, since, max, workers, &(|_, outcome| {
+        tx.send(outcome).is_ok()
+    }));
 }
 
 fn map_status(c: &str) -> ChangeStatus {
@@ -583,6 +832,10 @@ pub fn commits_on(repo: &str, rev: &str, max: u32, topo: bool) -> Result<Vec<Com
 /// Builds the `git log` argv. Split from the parse so a test can prove the topology
 /// switch adds *only* that one flag — a switch that also changed the filters would
 /// silently change which commits the user sees.
+/// `git log` 那一条记录的行格式，`log_args`、`file_log`、`recent_activity` 三处共用。
+/// 分隔符用 `\x1f`（单元分隔符）：提交说明里不会出现它，而逗号、引号、tab 都会。
+const LOG_FMT: &str = "%H%x1f%h%x1f%an%x1f%ae%x1f%aI%x1f%s%x1f%P";
+
 fn log_args(
     max: u32,
     author: Option<&str>,
@@ -591,7 +844,7 @@ fn log_args(
     skip: u32,
     scope: &Scope,
 ) -> Vec<String> {
-    let fmt = "%H%x1f%h%x1f%an%x1f%ae%x1f%aI%x1f%s%x1f%P";
+    let fmt = LOG_FMT;
     let mut args: Vec<String> = vec![
         "log".into(),
         format!("--max-count={}", max),
@@ -699,7 +952,7 @@ pub fn repo_files(repo: &str, max: u32) -> Result<Vec<String>> {
 /// `--name-status` adds what each commit did to this file, which plain
 /// `git log -- <path>` does not tell us.
 pub fn file_log(repo: &str, path: &str, max: u32) -> Result<Vec<FileLogEntry>> {
-    let fmt = "%H%x1f%h%x1f%an%x1f%ae%x1f%aI%x1f%s%x1f%P";
+    let fmt = LOG_FMT;
     let fmt_arg = format!("--pretty=format:{}", fmt);
     let max_arg = format!("--max-count={}", max);
     let out = run_git(
@@ -2271,6 +2524,654 @@ mod tests {
             .files
             .iter()
             .any(|f| f.path == "b.txt" && f.worktree_status == ChangeStatus::Untracked));
+    }
+
+    /// 记账替身的日志路径，进程级、只装一次、不回收。
+    ///
+    /// 最初写成「每个测试装一个、测完删掉临时目录」，并行跑时另一个测试正好 spawn 到
+    /// 那个目录，`git` 凭空消失 —— 那是假失败，跟产品无关。装成进程级以后 PATH 不再回收，
+    /// 替身只做「记一行、然后 exec 真 git」，别的测试经过它结果一模一样；日志每行带上
+    /// 仓库路径，判据只数自己那一个仓库的行。
+    static GIT_SHIM: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+    fn git_shim_log() -> &'static std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        GIT_SHIM.get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!("gitx-git-shim-{}", std::process::id()));
+            fs::create_dir_all(&dir).unwrap();
+            let log = dir.join("calls.tsv");
+            // 真 git 的绝对路径要在此刻 PATH 还没改时扫出来，写死进替身里。
+            let real = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+                .map(|d| d.join("git"))
+                .find(|p| p.is_file())
+                .expect("找不到真 git");
+            // 只记短的那几截：整条 `$*` 可能超过一次 append 的原子长度，并行写会互相截断，
+            // 数出来的行数偏小 —— 判据就会因为巧合而变松。
+            // 每次调用记两行（开始 B / 结束 E），并发判据靠这两行的**重叠深度**来证
+            // 「真的同时在跑多个 git」；只看墙钟时间是不可重复的判据。
+            // 所以这里不能用 `exec` —— 换掉进程就没机会写 E 行了。退出码要原样传回去，
+            // 否则替身把 git 的失败吞成 0，`run_git` 的错误分支判据会跟着变绿。
+            // `sleep` 只在 `GITX_SHIM_SLEEP` 被设时发生：不然全量套件的每一次 git fork 都要
+            // 多等一档，几百次下来会白添几十秒。`GITX_SHIM_SLOW_REPO` 只拖这一个仓库的路径，
+            // 流式判据要的就是「一个仓库还在飞、另一个已经交出来了」这个可观察的瞬间。
+            let script = format!(
+                "#!/bin/sh\nprintf 'B\\t%s\\t%s\\n' \"$2\" \"$5\" >> '{}'\nif [ -n \"$GITX_SHIM_SLEEP\" ]; then sleep 0.06; fi\nif [ -n \"$GITX_SHIM_SLOW_REPO\" ] && [ \"$2\" = \"$GITX_SHIM_SLOW_REPO\" ]; then sleep 0.3; fi\n'{}' \"$@\"\nrc=$?\nprintf 'E\\t%s\\t%s\\n' \"$2\" \"$5\" >> '{}'\nexit $rc\n",
+                log.display(),
+                real.display(),
+                log.display()
+            );
+            let shim = dir.join("git");
+            fs::write(&shim, script).unwrap();
+            fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+            let mut path = std::ffi::OsString::from(dir.to_str().unwrap());
+            path.push(":");
+            path.push(std::env::var_os("PATH").unwrap());
+            std::env::set_var("PATH", path);
+            fs::write(&log, "").unwrap();
+            log
+        })
+    }
+
+    /// 此刻这个仓库还在飞几个 git（B 减 E）。流式判据用它来证「第一个结果到手的时候，
+    /// 别的仓库确实还没读完」——这是一个瞬间状态，不是墙钟时间。
+    fn shim_inflight(repo: &str) -> isize {
+        fs::read_to_string(git_shim_log())
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.split('\t').nth(1) == Some(repo))
+            .map(|l| match l.split('\t').next() {
+                Some("B") => 1,
+                Some("E") => -1,
+                _ => 0,
+            })
+            .sum()
+    }
+
+    /// 让替身只拖慢这一个仓库（其余照常快跑），好制造「一个还在飞、一个已交出来」的瞬间。
+    struct ShimSlowRepo {
+        repo: String,
+    }
+    impl Drop for ShimSlowRepo {
+        fn drop(&mut self) {
+            if std::env::var_os("GITX_SHIM_SLOW_REPO").as_deref()
+                == Some(std::ffi::OsStr::new(&self.repo))
+            {
+                std::env::remove_var("GITX_SHIM_SLOW_REPO");
+            }
+        }
+    }
+
+    impl ShimSlowRepo {
+        fn start(repo: &str) -> ShimSlowRepo {
+            std::env::set_var("GITX_SHIM_SLOW_REPO", repo);
+            ShimSlowRepo { repo: repo.to_string() }
+        }
+    }
+
+    /// `repo` 这个仓库到目前为止被 fork 了几次 git（只数开始行，一次调用一行）。
+    fn shim_calls(repo: &str) -> usize {
+        fs::read_to_string(git_shim_log())
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| {
+                let mut f = l.split('\t');
+                f.next() == Some("B") && f.next() == Some(repo)
+            })
+            .count()
+    }
+
+    /// 这批仓库**同时**在飞的最大 git 进程数：按日志出现顺序走一遍，B 加一、E 减一，
+    /// 取峰值。深度 ≥2 就是「两条 B 之间没有 E」的证据，也就是真并发 ——
+    /// 串行实现无论仓库多少个，深度永远是 1。
+    fn shim_max_inflight(repos: &[&str]) -> usize {
+        let text = fs::read_to_string(git_shim_log()).unwrap_or_default();
+        let (mut depth, mut peak) = (0isize, 0usize);
+        for line in text.lines() {
+            let mut f = line.split('\t');
+            let (tag, repo) = (f.next(), f.next());
+            if repo.is_some_and(|r| repos.contains(&r)) {
+                match tag {
+                    Some("B") => {
+                        depth += 1;
+                        peak = peak.max(depth as usize);
+                    }
+                    Some("E") => depth -= 1,
+                    _ => {}
+                }
+            }
+        }
+        peak
+    }
+
+    /// 首屏要给每个仓库出角标，稳态下只允许一次 fork：`status --porcelain=v2 --branch`
+    /// 自己就带分支、上游、ahead/behind（`# branch.ab`）和脏文件数，剩下的
+    /// 贮藏条数与进行中操作都能从 `.git` 里的文件读出来。多出来的一次就是 200 个仓库
+    /// 多出来的 200 个进程。
+    #[test]
+    fn status_is_one_git_fork_per_repo() {
+        let (_d, p) = init_repo();
+        fs::write(format!("{}/a.txt", p), "changed\n").unwrap();
+        fs::write(format!("{}/s.txt", p), "stash me\n").unwrap();
+        git(&p, &["add", "s.txt"]);
+        // 只卷走 s.txt：不带 pathspec 的 `git stash` 会把 a.txt 的改动一起收进去，
+        // 那样「脏文件数还得对」这条就没东西可对了。
+        git(&p, &["stash", "push", "-q", "-m", "keep", "--", "s.txt"]);
+        let before = shim_calls(&p);
+        let st = status(&p).unwrap();
+        assert_eq!(shim_calls(&p) - before, 1, "status 只该 fork 一次 git");
+        // 省下来的两次 fork 不能把信息一起省掉 —— 这两条才是「文件读」的正确性判据。
+        assert_eq!(st.stash_count, 1);
+        assert_eq!(st.repo_state, "none");
+        assert_eq!(st.files.len(), 1, "脏文件数还得对");
+    }
+
+    /// 读文件省下的那一次 fork，不能把定位 git-dir 读错。三种形态都对得上
+    /// `rev-parse --absolute-git-dir`：普通仓库、linked worktree（`.git` 是指针，
+    /// 而且指针指向的是**这个 worktree 自己**那份 git-dir，`MERGE_HEAD` 就在那儿）、
+    /// 以及根本没有 `.git` 的裸仓库（走回退，仍然问 git）。
+    #[test]
+    fn git_dir_matches_git_for_every_layout() {
+        let (d, p) = init_repo();
+        assert_eq!(git_dir(&p).unwrap(), std::path::Path::new(&p).join(".git"));
+
+        git(&p, &["branch", "side"]);
+        let wt = d.path().join("work");
+        git(&p, &["worktree", "add", "-q", wt.to_str().unwrap(), "side"]);
+        let wtp = wt.to_str().unwrap();
+        assert_eq!(
+            git_dir(wtp).unwrap(),
+            std::path::PathBuf::from(
+                run_git(wtp, &["rev-parse", "--absolute-git-dir"])
+                    .unwrap()
+                    .trim()
+            ),
+            "worktree 的 .git 指针必须解到它自己那份 git-dir"
+        );
+
+        // 裸仓库没有 `.git`，回退到问 git —— 慢一次，但读错目录比慢一次严重。
+        let bare = d.path().join("bare.git");
+        git(&p, &["clone", "-q", "--bare", p.as_str(), bare.to_str().unwrap()]);
+        let bp = bare.to_str().unwrap();
+        assert_eq!(
+            git_dir(bp).unwrap(),
+            std::path::PathBuf::from(run_git(bp, &["rev-parse", "--absolute-git-dir"]).unwrap().trim())
+        );
+    }
+
+    /// `.git` 指针**允许**写成相对路径（相对那个工作树），而 `git worktree add` 平时
+    /// 写的是绝对路径 —— 不手工把它改成相对的，「相对就按仓库目录解析」那一支就是
+    /// 没有主的死代码：改成按进程 cwd 解析，全模块 65 条一条都不会红。
+    ///
+    /// 断言不问「路径字符串相不相等」（相对的解出来带 `..`，同目录不同写法，比了没意义），
+    /// 问它真正影响的那件事：这个 worktree 自己那份 git-dir 里的 `MERGE_HEAD` 读得到，
+    /// 而主仓库的 sentinel 不受牵连。
+    #[test]
+    fn a_relative_gitdir_pointer_still_finds_its_own_merge_head() {
+        let (d, p) = init_repo();
+        git(&p, &["branch", "side"]);
+        let wt = d.path().join("work");
+        git(&p, &["worktree", "add", "-q", wt.to_str().unwrap(), "side"]);
+        let wtp = wt.to_str().unwrap();
+        fs::write(wt.join(".git"), "gitdir: ../.git/worktrees/work\n").unwrap();
+
+        // 夹具的诚实性检查：真 git 也得认这个相对写法，否则我是在拿一个 git
+        // 不会产出的形状测自己的解析。两边都 canonicalize —— 我解出来的路径带着 `..`，
+        // 写法不同但指同一个目录，比字符串会比出一个假失败。
+        assert_eq!(
+            std::path::Path::new(
+                run_git(wtp, &["rev-parse", "--absolute-git-dir"])
+                    .unwrap()
+                    .trim()
+            )
+            .canonicalize()
+            .unwrap(),
+            std::path::Path::new(&p)
+                .join(".git/worktrees/work")
+                .canonicalize()
+                .unwrap()
+        );
+
+        // 让 worktree 里起一次真冲突：两边把 a.txt 改成不同的内容再 merge。
+        fs::write(wt.join("a.txt"), "theirs\n").unwrap();
+        git(wtp, &["commit", "-q", "-am", "theirs"]);
+        fs::write(format!("{}/a.txt", p), "mine\n").unwrap();
+        git(&p, &["commit", "-q", "-am", "mine"]);
+        // merge 的是**主仓库那条分支**：worktree 自己就在 `side` 上，跟自己 merge 会
+        // 直接 "Already up to date" 成功，夹具里根本不会留下 MERGE_HEAD。
+        let base = run_git(&p, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let out = Proc::new("git")
+            .arg("-C")
+            .arg(wtp)
+            .args(["merge", &base])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "这次合并本该冲突");
+        // git 在 merge 冲突时留下 MERGE_HEAD，正是首屏要报「合并进行中」的那个信号。
+
+        assert_eq!(state_at(&git_dir(wtp).unwrap()), "merge", "worktree 自己的进行中操作");
+        assert_eq!(
+            state_at(&git_dir(&p).unwrap()),
+            "none",
+            "主仓库不该跟着报进行中 —— 报错了会指着一处没有冲突的地方让用户去解决"
+        );
+        assert_eq!(status(wtp).unwrap().repo_state, "merge");
+    }
+
+    /// `stash_count` 读的是 reflog 的行数，而界面显示的是 `stash list`。这两个数一旦
+    /// 分家，角标就会在用户眼前说谎。把 git 真会留下的每种状态都走一遍：攒 3 条、
+    /// drop 到只剩 1 条、pop、apply、gc、以及 `refs/stash` 被压进 packed-refs。
+    #[test]
+    fn stash_count_matches_stash_list() {
+        let (_d, p) = init_repo();
+        let check = |n: u32| {
+            let st = status(&p).unwrap();
+            assert_eq!(st.stash_count, n, "status 给的条数");
+            assert_eq!(
+                st.stash_count,
+                stash_list(&p).unwrap().len() as u32,
+                "和 stash list 必须一致"
+            );
+        };
+        check(0);
+        for i in 0..3 {
+            fs::write(format!("{}/a.txt", p), format!("v{i}\n")).unwrap();
+            git(&p, &["add", "a.txt"]);
+            git(&p, &["stash", "-q", "-m", &format!("s{i}")]);
+        }
+        check(3);
+        git(&p, &["stash", "drop", "-q", "stash@{1}"]);
+        check(2);
+        git(&p, &["stash", "pop", "-q"]);
+        check(1);
+        // pop 会把内容落回工作树，`apply` 紧接着就撞车 —— 先清干净，让 apply 走在
+        // 一个本来干净的仓库上（这才是它平时遇到的情形）。
+        git(&p, &["checkout", "-q", "--", "a.txt"]);
+        git(&p, &["stash", "apply", "-q"]);
+        check(1);
+        git(&p, &["gc", "-q", "--prune=now"]);
+        check(1);
+        git(&p, &["pack-refs", "--all"]);
+        check(1);
+        // 最后清空：reflog 文件随 `refs/stash` 一起消失，条数要归 0 而不是停在 1。
+        fs::write(format!("{}/a.txt", p), "v9\n").unwrap();
+        git(&p, &["add", "a.txt"]);
+        git(&p, &["stash", "-q", "-m", "s9"]);
+        check(2);
+        git(&p, &["stash", "clear"]);
+        let st = status(&p).unwrap();
+        assert_eq!(st.stash_count, 0, "clear 之后角标必须是 0");
+        assert!(!std::path::Path::new(&p)
+            .join(".git/logs/refs/stash")
+            .exists());
+    }
+
+    /// 在指定日期落一枚提交（改 `a.txt` 保证每枚都有内容差异）。
+    /// 时间窗的判据必须能造「窗口外」的提交，否则它测的是巧合不是规则。
+    fn commit_at(repo: &str, date: &str, name: &str, email: &str, msg: &str) {
+        let out = Proc::new("git")
+            .arg("-C")
+            .arg(repo)
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date)
+            .env("GIT_AUTHOR_NAME", name)
+            .env("GIT_AUTHOR_EMAIL", email)
+            .env("GIT_COMMITTER_NAME", name)
+            .env("GIT_COMMITTER_EMAIL", email)
+            .args(["commit", "-q", "--allow-empty", "-m", msg])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "commit {:?} 失败了: {}",
+            msg,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// 身份集的取数规则。`--get-regexp '^user\.'` 实测出来的形状是**全局 config 和本地
+    /// config 混在一起**、一个键还能好几行（`git config --add user.email`），那就是
+    /// 「一个人多身份」在真机器上的样子。名字一律不参与匹配 —— 同名太常见，拿 `dev`
+    /// 这种名字匹配会把别人的提交算到我头上。
+    #[test]
+    fn parse_identities_keeps_emails_only_and_dedups() {
+        let out = "user.name baorong\nuser.email SuperLBR@126.com\nuser.name 张三\n\
+                   user.email a@x.com\nuser.email a@x.com\n";
+        assert_eq!(
+            parse_identities(out),
+            ["superlbr@126.com", "a@x.com"],
+            "只留邮箱、统一小写、去重、保持出现顺序"
+        );
+        assert!(parse_identities("").is_empty(), "没配身份是空集，不是报错");
+        // 别的 user.* 键不能混进来（值里带 @ 的 signingkey 尤其危险）。
+        assert!(
+            parse_identities("user.signingkey 44321FA96209A48 \nuser.helper /usr/bin/gpg\n")
+                .is_empty()
+        );
+    }
+
+    /// 摘要里那几个角标 + 时间窗内的我的提交。窗口必须真挡住旧提交：夹具里造一条
+    /// 30 天前、同样属于我的提交，它要是出现在结果里，说明「7 天」这条规则没落地。
+    #[test]
+    fn activity_reports_badges_and_windowed_mine() {
+        let (_d, p) = init_repo();
+        commit_at(&p, "2026-09-20T10:00:00+08:00", "tester", "me@x.com", "很久以前我的");
+        commit_at(&p, "2026-10-20T10:00:00+08:00", "tester", "me@x.com", "我的第二新");
+        commit_at(&p, "2026-10-21T10:00:00+08:00", "别人", "other@x.com", "不是我的");
+        commit_at(&p, "2026-10-22T10:00:00+08:00", "tester", "me@x.com", "我的最新");
+
+        fs::write(format!("{}/a.txt", p), "dirty\n").unwrap();
+        fs::write(format!("{}/n.txt", p), "new\n").unwrap();
+        git(&p, &["add", "n.txt"]);
+        // 只卷走 n.txt：不带 pathspec 的 `git stash` 会把 a.txt 也收走，
+        // 那时 `dirty` 本该是 0，这条判据就白写了。
+        git(&p, &["stash", "push", "-q", "-m", "keep", "--", "n.txt"]);
+
+        let a = recent_activity(&p, &["me@x.com".to_string()], "2026-10-18T00:00:00+08:00", 5)
+            .unwrap();
+        assert!(a.branch == "master" || a.branch == "main");
+        assert_eq!(a.stash, 1);
+        assert_eq!(a.dirty, 1, "窗口里只剩 a.txt 一处改动");
+        assert!(a.op.is_none(), "没有进行中操作时不能凭空给一个");
+        let subjects: Vec<&str> = a.mine.iter().map(|c| c.subject.as_str()).collect();
+        assert_eq!(subjects, ["我的最新", "我的第二新"], "新的在前、只算我的、窗口外的不许进来");
+        assert_eq!(a.ahead, 0);
+        assert_eq!(a.behind, 0);
+    }
+
+    /// `max` 是「活动流最多给几行」，不是 git 的取数上限：先按窗口取、本地按身份筛、
+    /// 再截断。反过来写（`--max-count=max`）会在过滤前就截掉，忙仓库里我的提交会整批消失。
+    ///
+    /// 夹具必须让**最新的那几条是别人提交的**：先前只排到「我的2」在最顶，
+    /// `--max-count=1` 先截也照样拿到它，这条判据对着「先截断后过滤」的错实现全绿过。
+    #[test]
+    fn mine_log_is_filtered_before_truncated() {
+        let (_d, p) = init_repo();
+        commit_at(&p, "2026-10-20T10:00:00+08:00", "别人", "other@x.com", "别人1");
+        commit_at(&p, "2026-10-21T10:00:00+08:00", "tester", "me@x.com", "我的1");
+        commit_at(&p, "2026-10-22T10:00:00+08:00", "别人", "other@x.com", "别人2");
+        commit_at(&p, "2026-10-23T10:00:00+08:00", "tester", "me@x.com", "我的2");
+        commit_at(&p, "2026-10-24T10:00:00+08:00", "别人", "other@x.com", "最新是别人的");
+        commit_at(&p, "2026-10-25T10:00:00+08:00", "别人", "other@x.com", "别人的第二条");
+        let a = recent_activity(&p, &["me@x.com".to_string()], "2026-10-18T00:00:00+08:00", 1)
+            .unwrap();
+        assert_eq!(a.mine.len(), 1, "上限要生效");
+        assert_eq!(a.mine[0].subject, "我的2", "截的是最旧的那条，不是截掉我的最新");
+    }
+
+    /// 匹配只认邮箱，四条边都得钉：同名不同邮箱不算我的、不同名同邮箱算我的、
+    /// **两边各自的大小写**都要归一。少钉一边就是「一个值两条出口只验一半」那个坑 ——
+    /// 先前只测了传入 alias 的大小写，把提交侧的 `to_lowercase` 删掉照样全绿。
+    #[test]
+    fn identity_matching_is_by_email_not_by_name() {
+        let (_d, p) = init_repo();
+        commit_at(&p, "2026-10-20T10:00:00+08:00", "tester", "other@x.com", "同名不是我的");
+        commit_at(&p, "2026-10-21T10:00:00+08:00", "张三", "me@x.com", "换了署名但邮箱是我的");
+        commit_at(&p, "2026-10-22T10:00:00+08:00", "张三", "ME@X.COM", "提交里邮箱是大写的");
+        let a = recent_activity(&p, &["me@x.com".to_string()], "2026-10-18T00:00:00+08:00", 5)
+            .unwrap();
+        let subjects: Vec<&str> = a.mine.iter().map(|c| c.subject.as_str()).collect();
+        assert_eq!(
+            subjects,
+            ["提交里邮箱是大写的", "换了署名但邮箱是我的"],
+            "新的在前；同名不同邮箱那条不许进来"
+        );
+        // 另一边的写法：身份集给成大写，结果必须一模一样。
+        let a = recent_activity(&p, &["ME@X.COM".to_string()], "2026-10-18T00:00:00+08:00", 5)
+            .unwrap();
+        assert_eq!(a.mine.len(), 2, "邮箱比对不能区分大小写");
+    }
+
+    /// 变基停在半路时要把「第几步 / 共几步」报出来（读 `msgnum`/`end`），
+    /// 而合并、遴选给不出步数 —— 报成 `Some(0)/Some(0)` 就是画一根永远不动的进度条。
+    #[test]
+    fn op_reports_rebase_progress_and_leaves_merge_blank() {
+        // 分叉后拿两条提交去 rebase 一条冲突的提交，git 会停在 rebase-merge 目录上。
+        let (_d, p) = init_repo();
+        let base = run_git(&p, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        // work 上两枚要重放的提交：第一枚改 a.txt（和主线撞），第二枚改 x.txt。
+        git(&p, &["checkout", "-q", "-b", "work"]);
+        fs::write(format!("{}/a.txt", p), "work1\n").unwrap();
+        git(&p, &["add", "-A"]);
+        commit_at(&p, "2026-10-20T10:00:00+08:00", "tester", "me@x.com", "第一步");
+        fs::write(format!("{}/x.txt", p), "w2\n").unwrap();
+        git(&p, &["add", "-A"]);
+        commit_at(&p, "2026-10-21T10:00:00+08:00", "tester", "me@x.com", "第二步");
+        // 主线把同一个文件改成别的内容，然后**回到 work** 再变基 —— `git rebase <onto>`
+        // 重放的是当前分支的提交，站错分支这一停就停在别的地方，`end` 也就不是 2。
+        git(&p, &["checkout", "-q", &base]);
+        fs::write(format!("{}/a.txt", p), "main\n").unwrap();
+        git(&p, &["commit", "-q", "-am", "主线改了同一个文件"]);
+        git(&p, &["checkout", "-q", "work"]);
+        let out = Proc::new("git")
+            .arg("-C")
+            .arg(&p)
+            .args(["rebase", &base])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "这次变基本该停在冲突上");
+
+        let a = recent_activity(&p, &[], "2026-01-01T00:00:00+08:00", 5).unwrap();
+        let op = a.op.expect("变基停住了，摘要必须报进行中");
+        assert_eq!(op.kind, "rebase");
+        assert_eq!(
+            op.total,
+            Some(2),
+            "total 来自 .git/rebase-merge/end，实测就是被重放的提交数"
+        );
+        assert!(op.step.is_some_and(|s| s >= 1), "step 来自 msgnum，停在第几步就是几");
+
+        // 合并没有步数这个概念。
+        let (_d2, m) = merge_conflict();
+        let a = recent_activity(&m, &[], "2026-01-01T00:00:00+08:00", 5).unwrap();
+        let op = a.op.expect("冲突合并该报进行中");
+        assert_eq!((op.kind.as_str(), op.step, op.total), ("merge", None, None));
+    }
+
+    /// 变基目录在、但计数读不到（git 写到一半被打断就是这个形状）：进度只能报「进行中」，
+    /// 不能报成「0 / 5」—— 一根停在 0 的进度条比没有进度条更假。
+    #[test]
+    fn a_missing_rebase_counter_stays_blank_instead_of_zero() {
+        let (_d, p) = init_repo();
+        let dir = std::path::Path::new(&p).join(".git/rebase-merge");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("end"), "5\n").unwrap();
+        let op = recent_activity(&p, &[], "2026-01-01T00:00:00+08:00", 5)
+            .unwrap()
+            .op
+            .expect("rebase-merge 目录在就该报变基进行中");
+        assert_eq!((op.kind.as_str(), op.total), ("rebase", Some(5)));
+        assert_eq!(op.step, None, "读不到就是读不到，不许编一个 0");
+        // 数字写歪了同理：`0x3` 不是步数。
+        fs::write(dir.join("msgnum"), "0x3\n").unwrap();
+        let op = recent_activity(&p, &[], "2026-01-01T00:00:00+08:00", 5)
+            .unwrap()
+            .op
+            .unwrap();
+        assert_eq!(op.step, None, "非数字的计数一样只能回 None");
+    }
+
+    /// 成本判据：一次 status + 一次 log，**两次 fork**，身份问 config 不算在里面
+    /// （由调用方缓存）。把 `identities()` 挪进来就多一次，200 个仓库多 200 个进程。
+    #[test]
+    fn recent_activity_is_two_forks_per_repo() {
+        let (_d, p) = init_repo();
+        commit_at(&p, "2026-10-20T10:00:00+08:00", "tester", "me@x.com", "我的");
+        let before = shim_calls(&p);
+        let a = recent_activity(&p, &["me@x.com".to_string()], "2026-10-18T00:00:00+08:00", 5)
+            .unwrap();
+        assert_eq!(shim_calls(&p) - before, 2, "一次 status + 一次 log");
+        assert_eq!(a.mine.len(), 1, "fork 数省下来了还得真拿到东西");
+    }
+
+    /// 让替身在「写下 B」和「交给真 git」之间睡 60ms，把在飞的窗口撑到日志看得出来。
+    /// 环境变量是进程级的，所以这个窗口里**别的测试**的 git 也跟着慢 60ms —— 只会变慢，
+    /// 不会算错（判据只数自己仓库的行）。测完必须撤掉，不然全量套件白添几十秒。
+    struct ShimSleep;
+    impl Drop for ShimSleep {
+        fn drop(&mut self) {
+            std::env::remove_var("GITX_SHIM_SLEEP");
+        }
+    }
+
+    impl ShimSleep {
+        fn start() -> ShimSleep {
+            std::env::set_var("GITX_SHIM_SLEEP", "1");
+            ShimSleep
+        }
+    }
+
+    /// 把仓库列表变成待查项，身份统一按「本机就这一个邮箱」填 —— 聚合的判据只关心
+    /// 次数、顺序、并发和错误隔离，身份匹配本身另有专门的判据。
+    fn queries(repos: &[String]) -> Vec<RepoQuery> {
+        repos
+            .iter()
+            .map(|r| RepoQuery {
+                repo: r.clone(),
+                emails: vec!["me@x.com".to_string()],
+            })
+            .collect()
+    }
+
+    /// 聚合的成本判据：N 个仓库 = 2N 次 fork，**不多不少**。
+    /// 「每批一次」那种优化（把 log 合成一条跨仓库查询）在这里根本不成立，
+    /// 所以这条钉的是上限，不是下限。
+    #[test]
+    fn recent_activity_all_is_two_forks_per_repo() {
+        let (_d1, a) = init_repo();
+        let (_d2, b) = init_repo();
+        commit_at(&a, "2026-10-20T10:00:00+08:00", "tester", "me@x.com", "甲");
+        commit_at(&b, "2026-10-20T10:00:00+08:00", "tester", "me@x.com", "乙");
+        let repos = vec![a.clone(), b.clone()];
+        let before: Vec<usize> = repos.iter().map(|r| shim_calls(r)).collect();
+        let out = recent_activity_all(&queries(&repos), "2026-10-18T00:00:00+08:00", 5, 4);
+        assert_eq!(out.len(), 2);
+        for (i, r) in repos.iter().enumerate() {
+            assert_eq!(shim_calls(r) - before[i], 2, "{} 只该两次 fork", r);
+        }
+        // fork 省下来了还得真拿到东西：两行各属于自己的仓库。
+        assert_eq!(out[0].result.as_ref().unwrap().mine[0].subject, "甲");
+        assert_eq!(out[1].result.as_ref().unwrap().mine[0].subject, "乙");
+    }
+
+    /// 并发判据钉的是**重叠深度**，不是「墙钟时间变短」——后者在 CI 上是掷硬币。
+    /// 深度 ≥2 的意思很具体：日志里存在两条 B，中间没有对应的 E，也就是同一时刻
+    /// 确有两个 git 在跑。把它改成串行 `for`，每个仓库自己 B E B E 走完，峰值永远是 1。
+    #[test]
+    fn recent_activity_all_overlaps_its_git_forks() {
+        let (_d1, a) = init_repo();
+        let (_d2, b) = init_repo();
+        let (_d3, c) = init_repo();
+        let repos = vec![a.clone(), b.clone(), c.clone()];
+        let refs: Vec<&str> = repos.iter().map(String::as_str).collect();
+        let _sleep = ShimSleep::start();
+        let out = recent_activity_all(&queries(&repos), "2026-01-01T00:00:00+08:00", 5, 3);
+        drop(_sleep);
+        assert!(
+            shim_max_inflight(&refs) >= 2,
+            "三个仓库、三个 worker，git 却一个接一个在跑 —— 这就是串行"
+        );
+        assert!(out.iter().all(|o| o.result.is_ok()));
+    }
+
+    /// 顺序 + 错误隔离：一个仓库的路径已经不存在（挪走了、外接盘拔了），它那一行是
+    /// `Err` 且带得出仓库名，其余照常，返回顺序仍等于输入顺序。
+    /// 首屏按「最近打开」排，顺序反了面板就会把上周的仓库顶到第一行。
+    #[test]
+    fn recent_activity_all_keeps_input_order_and_isolates_a_dead_repo() {
+        let (_d1, a) = init_repo();
+        let (_d2, c) = init_repo();
+        let dead = {
+            let d = tempfile::tempdir().unwrap();
+            let p = d.path().to_str().unwrap().to_string();
+            git(&p, &["init", "-q"]);
+            drop(d); // 目录一删，这个路径就再也读不出来
+            p
+        };
+        let repos = vec![a.clone(), dead.clone(), c.clone()];
+        let out = recent_activity_all(&queries(&repos), "2026-01-01T00:00:00+08:00", 5, 3);
+        assert_eq!(out.len(), 3);
+        for (i, r) in repos.iter().enumerate() {
+            assert_eq!(out[i].repo, *r, "第 {} 行的仓库名要对得上输入", i);
+        }
+        assert!(out[0].result.is_ok());
+        assert!(out[1].result.is_err(), "读不了的仓库只能红它自己那一行");
+        assert!(out[2].result.is_ok(), "后面的仓库不能被它拖累");
+    }
+
+    /// 一个仓库都没添、以及 `workers` 被传成 0：都不许 panic，也不能凭空产出行。
+    /// 首屏那两个状态都会真的出现（空库列表、设置里把并发数拉到 0）。
+    #[test]
+    fn recent_activity_all_tolerates_empty_input_and_zero_workers() {
+        assert!(recent_activity_all(&[], "2026-01-01T00:00:00+08:00", 5, 4).is_empty());
+        let (_d, p) = init_repo();
+        let one = vec![p.clone()];
+        let before = shim_calls(&p);
+        let out = recent_activity_all(&queries(&one), "2026-01-01T00:00:00+08:00", 5, 0);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].result.is_ok());
+        assert_eq!(shim_calls(&p) - before, 2);
+    }
+
+    /// 流式聚合的判据钉的是**过程**：第一个结果到手的那一刻，慢仓库还得「在飞」
+    /// （它的 B 已写、E 未写）。这是一个瞬间状态，可在日志里数出来，不是「早了 30ms」那种
+    /// 掷硬币。把机器改成「全部跑完再一次性交」，收到第一条时慢仓库早就结束了 → 红。
+    /// 夹具：慢仓库排在**输入的第一位**，快仓库第二位 —— 否则「先回的是快仓库」这条
+    /// 会被「先交的就是先排的」巧合满足，判据杀不掉攒批。
+    #[test]
+    fn recent_activity_stream_delivers_each_repo_as_it_is_read() {
+        // 替身是「第一次被用到」才装进 PATH 的。这条判据只读日志、不调 `shim_calls`，
+        // 不先走一次就等于整场都在问真 git：环境变量设得再对也不会睡，日志也数不出东西 ——
+        // 表现是「慢仓库反而先回来」，看着像产品有 bug，其实是夹具没接上。
+        git_shim_log();
+        let (_d1, fast) = init_repo();
+        let (_d2, slow) = init_repo();
+        let _slow = ShimSlowRepo::start(&slow);
+        let items = queries(&[slow.clone(), fast.clone()]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| recent_activity_stream(&items, "2026-01-01T00:00:00+08:00", 5, 2, &tx));
+            let first = rx.recv().expect("总得交回一条");
+            assert_eq!(first.repo, fast, "先交出来的该是那个没被拖慢的仓库");
+            assert_eq!(
+                shim_inflight(&slow),
+                1,
+                "快仓库都到手了，慢仓库却已经跑完 —— 这是攒到最后一起交"
+            );
+        });
+        // 到这里 `scope` 已经把那个后台线程收干净（它撞上发送失败后自己退休），
+        // 全程没有 panic —— panic 会由 `thread::scope` 原样抛到测试里。
+    }
+
+    /// 接收端不想要了（界面那批刷新被新的盖掉、窗口关了），worker 就把手上这一个仓库
+    /// 干完然后退休，不再领新任务 —— 否则 200 个仓库的旧刷新会继续白占进程。
+    ///
+    /// 夹具：4 个仓库、2 个 worker、`rx` 一上来就丢。提前收摊时正好两个仓库被读到
+    /// （各 2 次 fork），另两个一次都不该有；改成「发不出去也照样跑完」，四个仓库全被读 → 红。
+    #[test]
+    fn recent_activity_stream_stops_when_the_receiver_is_gone() {
+        let (_d1, a) = init_repo();
+        let (_d2, b) = init_repo();
+        let (_d3, c) = init_repo();
+        let (_d4, d) = init_repo();
+        let repos = vec![a, b, c, d];
+        let items = queries(&repos);
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(rx);
+        let before: Vec<usize> = repos.iter().map(|r| shim_calls(r)).collect();
+        recent_activity_stream(&items, "2026-01-01T00:00:00+08:00", 5, 2, &tx);
+        let mut deltas: Vec<usize> = repos
+            .iter()
+            .enumerate()
+            .map(|(i, r)| shim_calls(r) - before[i])
+            .collect();
+        deltas.sort();
+        assert_eq!(deltas, vec![0, 0, 2, 2], "两个 worker 各干完手上一个仓库就该收摊");
     }
 
     #[test]

@@ -22,6 +22,57 @@ pub struct Repo {
     pub last_fetched_at: Option<String>,
 }
 
+/// 首屏「最近打开」的一行。`opened_at` 是 Unix 毫秒而不是 `added_at` 那种 RFC3339 串：
+/// 这一列要 `ORDER BY`，带本地偏移的串走的是文本序，跨时区或过夏令时就排错。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecentOpen {
+    pub path: String,
+    pub opened_at: i64,
+}
+
+/// 进行中的合并 / 遴选 / 变基。
+///
+/// `step`/`total` 只有变基给得出（读 git-dir 里的 `msgnum`/`end`），合并与遴选是
+/// `None` —— 界面必须能把「第 3 / 12 步」和「正在合并」分开说，把 `None` 显示成
+/// 「0 / 0」是谎报进度。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Op {
+    pub kind: String,
+    pub step: Option<u32>,
+    pub total: Option<u32>,
+}
+
+/// 首屏「最近」面板里一个仓库的那份摘要。字段按「角标要画什么」选，不按「git 能给什么」：
+/// `ahead`/`behind` 直接来自 `status --branch` 的 `# branch.ab`，`dirty`/`stash` 是两枚
+/// 计数角标，`mine` 是活动流的那几行。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Activity {
+    pub repo: String,
+    pub branch: String,
+    pub ahead: u32,
+    pub behind: u32,
+    pub dirty: u32,
+    pub stash: u32,
+    pub op: Option<Op>,
+    /// 时间窗内属于本机身份的提交，新的在前。
+    pub mine: Vec<Commit>,
+}
+
+/// 首屏聚合的一个待查仓库。`emails` 由调用方备好并缓存，聚合自己**不为身份多 fork**。
+#[derive(Debug, Clone)]
+pub struct RepoQuery {
+    pub repo: String,
+    pub emails: Vec<String>,
+}
+
+/// 聚合回来的一行：仓库名一定在，成没成看 `result` —— 一个仓库读不了（被删、在移动硬盘上、
+/// 权限不对）不能让整块首屏一起消失。
+#[derive(Debug)]
+pub struct RepoOutcome {
+    pub repo: String,
+    pub result: crate::Result<Activity>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileStatus {
     pub path: String,
