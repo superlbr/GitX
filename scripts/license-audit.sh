@@ -26,6 +26,14 @@ audit "NOTICE 要同时点名两个许可证" NOTICE "Apache License, Version 2.
 audit "NOTICE 要把商标划出授权范围" NOTICE "trademarks"
 audit "要在 ATTRIBUTION 里说清「本机对照图不入库」" ATTRIBUTION.md "docs/reference"
 audit "包要声明双许可" Cargo.toml 'license = "MIT OR Apache-2.0"'
+audit "新增的原生面板依赖要在 ATTRIBUTION 里点名" ATTRIBUTION.md "rfd\` 0.17.2"
+
+# `rfd` 的原生面板是**嵌套事件循环**，只在界面层的 `eframe::App::ui` 里跑。核心层一旦碰它，
+# 就等于让「跑一次 git」附带弹一个系统窗口——无头判据也立刻测不到那一层了。
+if grep -rl "rfd::" src/ 2>/dev/null | grep -v "^src/ui/" | grep -q .; then
+  printf '\033[31m✗ rfd 越过了界面层（核心层不许碰原生面板）：%s\033[0m\n' "$(grep -rl 'rfd::' src/ | grep -v '^src/ui/')"
+  failed=1
+fi
 
 # 第三方界面截图只作本机测量对照，不许被提交进仓库（.gitignore 已挡住，这里再兜一道）。
 if [ -n "$(git ls-files -- docs/reference)" ]; then

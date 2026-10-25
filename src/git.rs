@@ -685,14 +685,21 @@ fn map_status_char(c: char) -> ChangeStatus {
 
 fn parse_status(out: &str) -> RepoStatus {
     let mut branch = String::new();
+    let mut head_oid = String::new();
     let mut upstream: Option<String> = None;
     let mut ahead = 0u32;
     let mut behind = 0u32;
     let mut files = Vec::new();
 
     for line in out.lines() {
-        if let Some(rest) = line.strip_prefix("# branch.head ") {
-            branch = rest.trim().to_string();
+        if let Some(rest) = line.strip_prefix("# branch.oid ") {
+            head_oid = rest.trim().to_string();
+        } else if let Some(rest) = line.strip_prefix("# branch.head ") {
+            // 分离 HEAD 时 git 写的是字面量 `(detached)`。让它顺着 `branch` 往下传，
+            // 状态栏就印出 `(detached)`、侧栏拿它和分支名比较全都比不中（于是一枚蓝点都没有），
+            // 而用户真正想知道的「HEAD 停在哪条提交上」其实在 `# branch.oid` 那一行里。
+            let h = rest.trim();
+            branch = if h == "(detached)" { String::new() } else { h.to_string() };
         } else if let Some(rest) = line.strip_prefix("# branch.upstream ") {
             let up = rest.trim();
             if !up.is_empty() && up != "(gone)" {
@@ -765,8 +772,18 @@ fn parse_status(out: &str) -> RepoStatus {
         }
     }
 
+    // 「分离」要两条一起成立：`branch.head` 是 `(detached)`（于是 `branch` 被清成空串），
+    // 而 `branch.oid` 给的**是一个真号**。占位符这一条不能只挡 `(none)`：本机 git 2.54
+    // 在还没提交的空仓库上写的是 `# branch.oid (initial)`（旧版写 `(none)`），而空串那条
+    // 路走得通——某些 git 在 unborn 时把 `# branch.head` 写成空。只认形状（≥40 位十六进制）
+    // 就不必赌版本：赌错了的话，新仓库一打开顶着一行「分离 HEAD · (initial)」，
+    // 而用户从来没检出过任何提交。
+    let looks_like_oid = head_oid.len() >= 40 && head_oid.bytes().all(|b| b.is_ascii_hexdigit());
+    let detached_at = (branch.is_empty() && looks_like_oid).then_some(head_oid);
+
     RepoStatus {
         branch,
+        detached_at,
         upstream,
         ahead,
         behind,
@@ -1037,6 +1054,24 @@ pub fn restore_file(repo: &str, oid: &str, path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Export the tree of `oid` as a zip into `dest`.
+///
+/// `git archive` reads only the object database — the working tree, the index and
+/// HEAD stay exactly as they were, which is why the history menu offers this without
+/// a confirmation card. `dest` is an absolute path picked by the native save panel;
+/// it goes to git as one argv element (never through a shell).
+///
+/// The `cat-file` probe is not decoration: `git archive` creates `--output` **before**
+/// it resolves the revision, so a bad oid would leave a 0-byte zip on disk behind a
+/// failure toast — and the save panel would then treat that stub as an existing file.
+pub fn archive(repo: &str, oid: &str, dest: &str) -> Result<()> {
+    if run_git(repo, &["cat-file", "-e", &format!("{oid}^{{commit}}")]).is_err() {
+        return Err(GitxError::Git(format!("读不出这条提交：{oid}")));
+    }
+    run_git(repo, &["archive", "--format=zip", "--output", dest, oid])?;
+    Ok(())
+}
+
 // ----------------------------------------------------------------------------
 // Commit operations (cherry-pick / reset)
 // ----------------------------------------------------------------------------
@@ -1046,13 +1081,76 @@ pub fn cherry_pick(repo: &str, oid: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn reset(repo: &str, oid: &str, mode: &str) -> Result<()> {
-    let arg = match mode {
-        "soft" => "--soft",
-        "hard" => "--hard",
-        _ => "--mixed",
-    };
-    run_git(repo, &["reset", arg, oid])?;
+/// The three ways `git reset` moves HEAD, and the only three the menu offers.
+///
+/// An enum instead of a mode string: the old signature mapped anything it did not
+/// recognise to `--mixed`, so a typo in the caller became "unstage everything" and
+/// still returned `Ok`. With a match on the type, the fall-through cannot be built.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResetMode {
+    /// Move the branch pointer only; index and work tree keep what they hold.
+    Soft,
+    /// Move the branch and reset the index, but leave the work tree's changes alone.
+    Mixed,
+    /// Move the branch, reset the index **and** throw away the work tree's changes.
+    Hard,
+}
+
+impl ResetMode {
+    /// The three modes, in the order the card's tabs list them. One list so the tabs cannot
+    /// offer a different set from the wording the card prints under them.
+    pub const ALL: [ResetMode; 3] = [ResetMode::Soft, ResetMode::Mixed, ResetMode::Hard];
+
+    /// The argv flag. Kept in one place so the menu's labels and the git call cannot
+    /// disagree about which mode is which.
+    pub fn flag(self) -> &'static str {
+        match self {
+            ResetMode::Soft => "--soft",
+            ResetMode::Mixed => "--mixed",
+            ResetMode::Hard => "--hard",
+        }
+    }
+}
+
+pub fn reset(repo: &str, oid: &str, mode: ResetMode) -> Result<()> {
+    run_git(repo, &["reset", mode.flag(), oid])?;
+    Ok(())
+}
+
+/// The branch part of a remote-tracking ref: `origin/fix-123` → `fix-123`. Branch names may
+/// contain `/`, so this cuts at the **first** one — `origin/feature/x` belongs to `origin`
+/// and is called `feature/x`, not to `origin/feature`.
+pub fn remote_ref_tail(remote_ref: &str) -> Option<&str> {
+    remote_ref.split_once('/').map(|(_, tail)| tail)
+}
+
+/// Does a local branch by this name exist? `show-ref --verify` exits 1 for a missing ref,
+/// which is an answer rather than a failure, so only a real error (no git, no repo) escapes.
+fn local_branch_exists(repo: &str, name: &str) -> Result<bool> {
+    match run_git(repo, &["show-ref", "--verify", "--quiet", &format!("refs/heads/{name}")]) {
+        Ok(_) => Ok(true),
+        Err(GitxError::Git(_)) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Check out the remote-tracking ref the user clicked in the sidebar.
+///
+/// Not `git checkout <tail>`: that is git's DWIM, and when two remotes carry the same
+/// branch name it stops with "fatal: 'side' matched multiple (2) remote tracking branches"
+/// (measured on this machine, git 2.54) — a click that named one exact ref would fail
+/// because the *name* is ambiguous elsewhere. So reuse a local branch of that name when
+/// there is one, otherwise create it tracking exactly the ref that was clicked.
+pub fn checkout_remote_branch(repo: &str, remote_ref: &str) -> Result<()> {
+    let tail = remote_ref_tail(remote_ref).ok_or_else(|| {
+        GitxError::Git(format!("{remote_ref} 不是一条远程分支（应为「远端/分支」那种名字）"))
+    })?;
+    if local_branch_exists(repo, tail)? {
+        return checkout_branch(repo, tail);
+    }
+    // `--track` goes with `-b`: git then sets upstream in the same step, so the row the
+    // user clicked and the branch they land on stay connected.
+    run_git(repo, &["checkout", "-b", tail, "--track", remote_ref])?;
     Ok(())
 }
 
@@ -3327,6 +3425,67 @@ mod tests {
         assert!(err.contains("7"), "错误里没带上块号：{err}");
     }
 
+    /// 「归档」导的是**右键那一条**，不是 HEAD。两条都要钉：只验「导出成了」的话，
+    /// 实现写成永远 `git archive HEAD` 照样绿——那正是用户点到旧提交、拿回最新代码的那种错。
+    /// zip 里文件名是明文存的（只有内容压了），所以「含 `a.txt`、不含 `b.txt`」能直接问字节。
+    #[test]
+    fn archive_exports_the_chosen_revision_not_head() {
+        let (_dir, p) = init_repo(); // a.txt 在第一条提交里
+        fs::write(format!("{}/b.txt", p), "second\n").unwrap();
+        git(&p, &["add", "."]);
+        git(&p, &["commit", "-q", "-m", "second"]);
+        let head = run_git(&p, &["rev-parse", "HEAD"]).unwrap().trim().to_owned();
+        let first = run_git(&p, &["rev-parse", "HEAD~1"]).unwrap().trim().to_owned();
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let at_first = out_dir.path().join("first.zip");
+        let at_head = out_dir.path().join("head.zip");
+        archive(&p, &first, at_first.to_str().unwrap()).unwrap();
+        archive(&p, &head, at_head.to_str().unwrap()).unwrap();
+
+        let one = fs::read(&at_first).unwrap();
+        let two = fs::read(&at_head).unwrap();
+        assert!(one.starts_with(b"PK\x03\x04"), "导出来的不是 zip 的头（{:#?}）", &one[..4.min(one.len())]);
+        assert!(one.windows(5).any(|w| w == b"a.txt"), "第一条提交里有 a.txt，归档里却没找到");
+        assert!(!one.windows(5).any(|w| w == b"b.txt"), "归档带了 b.txt = 导的是 HEAD，不是右键那条 {first}");
+        assert!(two.windows(5).any(|w| w == b"b.txt"), "HEAD 那一版该有 b.txt");
+        assert_ne!(one, two, "两条提交导出同一个字节 = `oid` 那个参数根本没进 git 命令");
+    }
+
+    /// 归档只读对象库：跑完工作区、索引、HEAD 都得**一动没动**。
+    /// 这一条把「归档」和「检出」分开——菜单里挨着两行，走错一条就把人的工作区换了。
+    #[test]
+    fn archive_leaves_the_working_tree_alone() {
+        let (_dir, p) = init_repo();
+        fs::write(format!("{}/a.txt", p), "hello\nworking\n").unwrap();
+        let before = run_git(&p, &["rev-parse", "HEAD"]).unwrap().trim().to_owned();
+        // `tempdir()` 的返回值一丢就删目录，所以那份 TempDir 必须**存着**当锚。
+        let out_dir = tempfile::tempdir().unwrap();
+        let out = out_dir.path().join("x.zip");
+        archive(&p, &before, out.to_str().unwrap()).unwrap();
+
+        assert!(out.exists(), "归档说要导出，磁盘上没有那个文件");
+        assert_eq!(run_git(&p, &["rev-parse", "HEAD"]).unwrap().trim(), before, "归档把 HEAD 挪走了");
+        let st = status(&p).unwrap();
+        assert!(
+            st.files.iter().any(|f| f.path == "a.txt" && f.worktree_status == ChangeStatus::Modified),
+            "工作区那句未提交改动被归档顺手吃掉/暂存了：{st:?}"
+        );
+        assert_eq!(fs::read_to_string(format!("{}/a.txt", p)).unwrap(), "hello\nworking\n", "工作区文件内容被改了");
+    }
+
+    /// 非法提交号必须是错误，而且**不许留下半个文件**——不然 toast 说「没成」，
+    /// 磁盘上却躺着一份空 zip，下次同名还被保存面板当成已存在。
+    #[test]
+    fn an_unreadable_revision_is_an_error_and_writes_nothing() {
+        let (_dir, p) = init_repo();
+        let out_dir = tempfile::tempdir().unwrap();
+        let out = out_dir.path().join("bad.zip");
+        let err = archive(&p, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", out.to_str().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("deadbeef"), "错误里没带上那个提交号：{err}");
+        assert!(!out.exists(), "失败了却留下一个文件：{out:?}");
+    }
+
     /// 刚 `git init` 出来、一条提交还没有的仓库：日志是**空的**，不是错误。
     /// 当成错误，「新建仓库」那一步开出来的本子永远读不出快照，界面停在转圈上。
     /// 反向的要一起钉：真错误（那不是仓库）必须还是错误——否则这条判据等于把
@@ -4453,5 +4612,257 @@ mod tests {
         let err = checkout_branch(&p, "nope").unwrap_err().to_string();
         assert!(err.contains("没有匹配到这些路径"), "{}", err);
         assert!(err.contains("pathspec"));
+    }
+
+    /// 检出「一条提交」而不是「一条分支」时，`# branch.head` 那一行写的是字面量
+    /// `(detached)`，真正有用的信息在 `# branch.oid`。两处都不许丢，而且分工要清楚：
+    /// `branch` 必须是**空的**（界面拿它当分支名显示，也拿它和侧栏的分支比；把
+    /// `(detached)` 顺着这条路交出去，等于把 git 的内部词汇端给用户，还让侧栏一枚
+    /// 蓝点都点不中），那条号则完整地留在 `detached_at` 里。
+    #[test]
+    fn detached_head_is_not_reported_as_a_branch() {
+        let (_d, p) = init_repo();
+        fs::write(format!("{}/b.txt", p), "b\n").unwrap();
+        git(&p, &["add", "b.txt"]);
+        git(&p, &["commit", "-q", "-m", "second"]);
+        let first = run_git(&p, &["rev-parse", "HEAD~1"]).unwrap().trim().to_string();
+        git(&p, &["checkout", "-q", &first]);
+        let st = status(&p).unwrap();
+        assert_eq!(st.branch, "", "分离时不许把 `(detached)` 当分支名交出去");
+        assert_eq!(st.detached_at.as_deref(), Some(first.as_str()), "分离在哪条提交上必须说得出全号");
+    }
+
+    /// 刚 `git init`、一条提交都没有的仓库**不是**分离 HEAD：`# branch.head` 那里写的
+    /// 就是那条还没名字的分支（实测 git 2.54 给 `main`），`# branch.oid` 给的是占位符
+    /// （实测 `(initial)`，旧版 git 写 `(none)`）。它该说的话是「你在一条还没提交的
+    /// 分支上」，不是「HEAD 脱离了分支」。
+    ///
+    /// 这一条只验「没被叫成分离」；占位符那一挡本身另有夹具（下面的 `parse_status`
+    /// 直测），因为 git 在真的分离时绝不会送占位符 —— 拿仓库当夹具碰不到那一支。
+    #[test]
+    fn a_fresh_empty_repo_is_not_called_detached() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().to_str().unwrap().to_string();
+        git(&p, &["init", "-q"]);
+        let st = status(&p).unwrap();
+        assert!(st.detached_at.is_none(), "空仓库不是分离 HEAD，它是没提交");
+        assert!(!st.branch.is_empty(), "空仓库仍要报出自己在哪条分支上");
+    }
+
+    /// 占位符那一挡只能拿文本当夹具：分离 + 占位符这个组合 git 自己不会产生（HEAD 里
+    /// 塞一个解析不出来的号，`git status` 直接 `fatal: bad object HEAD`，连表头都不印），
+    /// 但**解析层不该知道这件事**——它面对的是一份可能被别的 git 版本、被别人手写的
+    /// `.git/HEAD` 喂进来的文本。
+    ///
+    /// 两条出口都得验，只验一半等于没验：占位符要被拒，真号要被认。把形状检查退回
+    /// `!head_oid.is_empty()`，第一条立刻红；把整条判据删了，第二条红。
+    #[test]
+    fn parse_status_reads_only_a_real_oid_as_detached() {
+        let oid = "b43eb9bcd42c1ec86b17875fbea452a0ce0683f9";
+        // `# branch.head` 空串这一支也要过同一道形状检查：某些 git 在 unborn 时
+        // 把分支名写成空，那时占位符不许冒充一条提交。
+        for placeholder in ["(initial)", "(none)", ""] {
+            let st = parse_status(&format!("# branch.oid {placeholder}\n# branch.head (detached)\n"));
+            assert_eq!(
+                st.detached_at, None,
+                "占位符 {placeholder:?} 不是一条提交，不能报成分离"
+            );
+            assert_eq!(st.branch, "", "`(detached)` 不许当分支名");
+        }
+        let st = parse_status(&format!("# branch.oid {oid}\n# branch.head (detached)\n"));
+        assert_eq!(st.detached_at.as_deref(), Some(oid), "分离时那条号要原样交出去");
+        // 长而非法的号**过不了**形状检查（`is_ascii_hexdigit` 才是判据，长度只是顺带）：
+        // 把形状检查换成 `!head_oid.is_empty()`，这一条先红。
+        let st = parse_status("# branch.oid zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n# branch.head (detached)\n");
+        assert_eq!(st.detached_at, None, "非十六进制的号不认");
+        // 短号：长度这一挡要单独有出口，否则「只查十六进制」的改动测不出来。
+        let st = parse_status("# branch.oid b43eb9b\n# branch.head (detached)\n");
+        assert_eq!(st.detached_at, None, "七位缩写不是完整号");
+    }
+
+    /// 分离之后检出分支是常态动作（状态栏那句「回到 main」走的就是这条路）。它必须把
+    /// 两条一起翻回去：`detached_at` 落回 `None`、`branch` 重新有名字。少了这一条，
+    /// 日志已经换回链子，状态栏却还挂着「分离 HEAD」。
+    #[test]
+    fn checking_out_a_branch_clears_the_detached_state() {
+        let (_d, p) = init_repo();
+        let name = run_git(&p, &["symbolic-ref", "--short", "-q", "HEAD"]).unwrap().trim().to_string();
+        fs::write(format!("{}/b.txt", p), "b\n").unwrap();
+        git(&p, &["add", "b.txt"]);
+        git(&p, &["commit", "-q", "-m", "second"]);
+        let first = run_git(&p, &["rev-parse", "HEAD~1"]).unwrap().trim().to_string();
+        git(&p, &["checkout", "-q", &first]);
+        assert!(status(&p).unwrap().detached_at.is_some(), "夹具自己得先真的分离");
+        git(&p, &["checkout", "-q", &name]);
+        let st = status(&p).unwrap();
+        assert!(st.detached_at.is_none(), "回到分支后不许还报着那条号");
+        assert_eq!(st.branch, name);
+    }
+
+    /// Fixture for the three reset modes: one commit **on top of** `base` that adds `b.txt`,
+    /// plus an unstaged edit to `a.txt`. The three modes differ in exactly three things —
+    /// the branch pointer, the index, the work tree — and this fixture has one of each, so a
+    /// test can tell them apart instead of only telling "moved" from "didn't".
+    fn reset_fixture() -> (tempfile::TempDir, String, String) {
+        let (dir, p) = init_repo();
+        let base = run_git(&p, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        fs::write(format!("{}/b.txt", p), "b\n").unwrap();
+        git(&p, &["add", "b.txt"]);
+        git(&p, &["commit", "-q", "-m", "second"]);
+        fs::write(format!("{}/a.txt", p), "脏的\n").unwrap();
+        (dir, p, base)
+    }
+
+    #[test]
+    fn a_soft_reset_moves_the_branch_and_keeps_the_index_staged() {
+        let (_d, p, base) = reset_fixture();
+        reset(&p, &base, ResetMode::Soft).unwrap();
+        assert_eq!(run_git(&p, &["rev-parse", "HEAD"]).unwrap().trim(), base, "分支指针没挪");
+        let st = status(&p).unwrap();
+        assert!(
+            st.files.iter().any(|f| f.path == "b.txt" && f.staged),
+            "软重置该把「加 b.txt」留在暂存区：{:?}",
+            st.files.iter().map(|f| (&f.path, f.staged)).collect::<Vec<_>>()
+        );
+        assert_eq!(fs::read_to_string(format!("{}/a.txt", p)).unwrap(), "脏的\n", "软重置不许碰工作区");
+    }
+
+    #[test]
+    fn a_mixed_reset_unstages_but_leaves_the_work_tree_dirty() {
+        let (_d, p, base) = reset_fixture();
+        reset(&p, &base, ResetMode::Mixed).unwrap();
+        assert_eq!(run_git(&p, &["rev-parse", "HEAD"]).unwrap().trim(), base);
+        let st = status(&p).unwrap();
+        assert!(
+            st.files.iter().all(|f| !f.staged),
+            "混合重置该把暂存区清空：{:?}",
+            st.files.iter().map(|f| (&f.path, f.staged)).collect::<Vec<_>>()
+        );
+        assert_eq!(fs::read_to_string(format!("{}/a.txt", p)).unwrap(), "脏的\n");
+        assert!(
+            st.files.iter().any(|f| f.path == "a.txt" && f.worktree_status == ChangeStatus::Modified),
+            "工作区那笔改动要在状态里看得见，不然界面上一片干净、东西却在"
+        );
+        assert!(std::path::Path::new(&format!("{}/b.txt", p)).exists(), "混合重置不该删掉磁盘上的文件");
+    }
+
+    /// The one mode that destroys work: both the added file and the unstaged edit have to
+    /// actually disappear, and `status` has to say so — the card's wording promises this.
+    #[test]
+    fn a_hard_reset_throws_away_the_work_tree_and_the_index() {
+        let (_d, p, base) = reset_fixture();
+        reset(&p, &base, ResetMode::Hard).unwrap();
+        assert_eq!(run_git(&p, &["rev-parse", "HEAD"]).unwrap().trim(), base);
+        assert_eq!(fs::read_to_string(format!("{}/a.txt", p)).unwrap(), "hello\n", "硬重置没把 a.txt 还原");
+        assert!(!std::path::Path::new(&format!("{}/b.txt", p)).exists(), "硬重置该删掉那条提交里加的 b.txt");
+        assert!(status(&p).unwrap().files.is_empty(), "硬重置之后状态里不该还剩东西");
+    }
+
+    /// `origin/feature/x` belongs to `origin` and is called `feature/x` — cutting at the
+    /// **last** `/` would call it `x` and create a branch that tracks the right ref under
+    /// the wrong name.
+    #[test]
+    fn a_remote_ref_splits_at_its_first_slash() {
+        assert_eq!(remote_ref_tail("origin/feature/x"), Some("feature/x"));
+        assert_eq!(remote_ref_tail("origin/main"), Some("main"));
+        assert_eq!(remote_ref_tail("origin"), None, "没有斜杠就不是一条远程分支");
+    }
+
+    #[test]
+    fn checking_out_a_remote_ref_creates_a_local_branch_tracking_it() {
+        let (_d, p) = init_repo();
+        git(&p, &["checkout", "-q", "-b", "side"]);
+        fs::write(format!("{}/s.txt", p), "侧\n").unwrap();
+        git(&p, &["add", "s.txt"]);
+        git(&p, &["commit", "-q", "-m", "side one"]);
+        let remote = tempfile::tempdir().unwrap();
+        let r = remote.path().to_str().unwrap();
+        git(r, &["init", "-q", "--bare", "."]);
+        git(&p, &["remote", "add", "origin", r]);
+        git(&p, &["push", "-q", "-u", "origin", "side"]);
+        // 本地那条 `side` 正是 push 时建的；要验"没有本地同名分支"那一路，得先删掉它。
+        git(&p, &["checkout", "-q", "-"]);
+        git(&p, &["branch", "-D", "side"]);
+        git(&p, &["fetch", "-q", "origin"]);
+        assert!(!branches(&p).unwrap().iter().any(|b| b.name == "side"), "夹具该没有本地 side");
+
+        checkout_remote_branch(&p, "origin/side").unwrap();
+        let st = status(&p).unwrap();
+        assert_eq!(st.branch, "side", "点的是 origin/side，落到的却是 {}", st.branch);
+        assert_eq!(
+            run_git(&p, &["rev-parse", "--abbrev-ref", "side@{upstream}"]).unwrap().trim(),
+            "origin/side",
+            "新建的本地分支没跟在那条远程分支上"
+        );
+    }
+
+    /// A local branch of that name already answers the click. Repointing it at the remote ref
+    /// would move a branch the user may not have wanted touched, so the existing one wins.
+    #[test]
+    fn checking_out_a_remote_ref_reuses_the_local_branch_of_that_name() {
+        let (_d, p) = init_repo();
+        let local_head = run_git(&p, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        let remote = tempfile::tempdir().unwrap();
+        let r = remote.path().to_str().unwrap();
+        git(r, &["init", "-q", "--bare", "."]);
+        git(&p, &["remote", "add", "origin", r]);
+        // 远端那条 `side` 是**另推上去的**一条提交：本地同名分支指 main、远端那条指别的号，
+        // 两条同名的东西才分得开谁赢了。
+        git(&p, &["checkout", "-q", "-b", "far"]);
+        fs::write(format!("{}/o.txt", p), "远端的\n").unwrap();
+        git(&p, &["add", "o.txt"]);
+        git(&p, &["commit", "-q", "-m", "far side"]);
+        let other = run_git(&p, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        git(&p, &["push", "-q", "origin", "far:side"]);
+        git(&p, &["checkout", "-q", "--detach"]);
+        git(&p, &["branch", "-D", "far"]);
+        git(&p, &["branch", "side", &local_head]);
+        assert_eq!(other, run_git(&p, &["rev-parse", "origin/side"]).unwrap().trim(), "夹具自己没生效：远端那条 ref 没建起来");
+
+        checkout_remote_branch(&p, "origin/side").unwrap();
+        assert_eq!(status(&p).unwrap().branch, "side");
+        assert_eq!(
+            run_git(&p, &["rev-parse", "HEAD"]).unwrap().trim(),
+            local_head,
+            "本地已经有同名分支，不该被挪去远端那条号上"
+        );
+        assert_ne!(other, local_head, "夹具自己没生效：远端那条和本地那条是同一个号，那这条路什么都验不到");
+    }
+
+    /// git's own DWIM refuses here — measured on this machine, git 2.54: "fatal: 'side'
+    /// matched multiple (2) remote tracking branches". The fixture asserts that refusal, so
+    /// this test cannot quietly degenerate into the previous one.
+    #[test]
+    fn an_ambiguous_name_checks_out_the_ref_that_was_clicked() {
+        let (_d, p) = init_repo();
+        let base = run_git(&p, &["symbolic-ref", "--short", "-q", "HEAD"]).unwrap().trim().to_string();
+        git(&p, &["checkout", "-q", "-b", "side"]);
+        fs::write(format!("{}/s.txt", p), "侧\n").unwrap();
+        git(&p, &["add", "s.txt"]);
+        git(&p, &["commit", "-q", "-m", "side one"]);
+        let remote = tempfile::tempdir().unwrap();
+        let r = remote.path().to_str().unwrap();
+        git(r, &["init", "-q", "--bare", "."]);
+        // 同一个裸仓库挂在两个名字下：两条远程分支指同一个号，但**名字**歧义这件事照旧。
+        git(&p, &["remote", "add", "origin", r]);
+        git(&p, &["push", "-q", "origin", "side"]);
+        git(&p, &["checkout", "-q", &base]);
+        git(&p, &["branch", "-D", "side"]);
+        git(&p, &["remote", "add", "second", r]);
+        git(&p, &["fetch", "-q", "second"]);
+        assert!(
+            remote_refs(&p).unwrap().iter().filter(|x| x.name.ends_with("/side")).count() == 2,
+            "夹具自己没生效：两条远程分支没都到位，那 DWIM 本来就无从歧义"
+        );
+
+        let dwim = run_git(&p, &["checkout", "side"]);
+        assert!(dwim.is_err(), "夹具自己没生效：这一版 git 的 DWIM 没歧义，那这条只是在验一条不存在的坑");
+        checkout_remote_branch(&p, "second/side").unwrap();
+        assert_eq!(status(&p).unwrap().branch, "side");
+        assert_eq!(
+            run_git(&p, &["rev-parse", "--abbrev-ref", "side@{upstream}"]).unwrap().trim(),
+            "second/side",
+            "点的是 second/side，上游却记到别处去了"
+        );
     }
 }

@@ -106,6 +106,11 @@ pub(crate) enum Action {
     /// 它要过确认卡、落地后还要把「修正上一条」那枚勾去掉，和普通提交不是同一条路。
     Amend(String),
     Checkout(String),
+    /// 侧栏「远端」点开之后那一条：**切到它对应的本地分支**。本地没有同名分支就建一条
+    /// 跟踪它的（见 `git::checkout_remote_branch`）。带的是**整条远程 ref 名**
+    /// （`origin/main`）而不是尾巴 `main`——两条远端各有一条同名分支时，只有全名说得清
+    /// 用户点的是哪一条。
+    CheckoutRemote(String),
     Fetch,
     /// 只问一个远端：侧栏「远端」那一栏右键用的，`Fetch` 是全抓。
     FetchRemote(String),
@@ -161,6 +166,37 @@ pub(crate) enum Action {
     /// 提交完立刻推送。会先落地提交再推：推送失败时报错，但提交**已经在**，不回滚
     /// （回滚一条已经落地的提交比留着它危险得多）。
     CommitAndPush { msg: String, amend: bool },
+    /// 把这条提交的树导成一份 zip。落哪儿由**原生存盘面板**问，所以这条动作不直接带路径：
+    /// 它在 `act` 里只把 `pending_dialog` 立起来，面板在下一帧的 `ui()` 里跑
+    /// （见 `Dialog`）。`git archive` 只读对象库，不动工作区，所以不过确认卡。
+    Archive(String),
+    /// 把**当前分支**挪到历史里那条提交上。哪一档由卡上那排页签定（见 `Form::Reset`）。
+    /// 它不进 `needs_confirm`：开它的那张卡本身就是那一句「先问一下」——三档摆在你面前、
+    /// 每一档写明丢什么，再叠一层确认只会让人以为第一下已经落了。
+    Reset { oid: String, mode: git::ResetMode },
+}
+
+/// 等在一帧之外跑的**原生面板**。为什么不当场就弹：`land()` 是在 `Panel::show` 的闭包跑完
+/// 之后调的，但 `act()` 还会从卡片的按钮那条路进来，而 `rfd` 的面板是**嵌套事件循环**——
+/// 在 egui 正画一帧的途中拉起它，等于让同一个窗口在两个循环里跑。所以点一下只立个牌子，
+/// 面板统一在 `eframe::App::ui` 的最前面、`shell()` 之前消费掉。
+/// 判据也正因为这条才测得到：无头帧直接调 `shell()`，一辈子碰不到 `rfd`。
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) enum Dialog {
+    /// 导出 `oid` 那一版。`name` 是**建议文件名**（`仓库名-短号.zip`），面板里用户可以改。
+    Archive { repo: String, oid: String, name: String },
+    /// 选一个目录，填进「添加仓库」那张卡的某一格。
+    PickFolder { field: FolderField },
+}
+
+/// 「浏览…」填的是哪一格。两格分开列是因为克隆那一档有**两个**文本框：
+/// 主输入是源地址，目标目录在第二格——合成一个枚举值就会填错格子。
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) enum FolderField {
+    /// 「打开已有」/「新建仓库」那两档的唯一主输入。
+    Main,
+    /// 「克隆到本地」那档的「目标目录」。
+    CloneDest,
 }
 
 /// 推送卡表格里被勾中的那一条，落地时变成一次 `git push <远端> <本地>:<远端那一侧>`。
@@ -217,6 +253,9 @@ pub(crate) enum Form {
     Push { remote: String, rows: Vec<PushRow>, force: bool, tags: bool },
     /// 拉取那张卡（照 `GitPullSheet`）：远端 / 远程分支 / 拉取到哪条本地分支，加「选项」那三句。
     Pull { remote: String, branch: String, into: String, opts: git::PullOpts },
+    /// 把当前分支重置到某条提交。`mode` 是卡上那排页签**当前选中**的那一档，
+    /// 打开时给的是 git 自己的默认（混合）——不动工作区那一档，猜错也不会丢东西。
+    Reset { oid: String, mode: git::ResetMode },
 }
 
 /// 推送卡表格的一行。
@@ -490,6 +529,18 @@ impl Modal {
         Modal { title: "合并到当前分支", detail: None, text: None, form: Form::Merge { branches } }
     }
 
+    /// 「把当前分支重置到这条提交」那张卡。标题里的「当前分支」不是顺手写的：`git reset`
+    /// 挪的是**你现在站着的那条**，不是右键那条提交所在的分支——这一句说不清，用户会以为
+    /// 自己在改别条分支。`subject` 是打开那一刻那条提交的话，卡开着时日志翻页不该让它换内容。
+    pub(crate) fn reset(oid: String, subject: String) -> Self {
+        Modal {
+            title: "重置当前分支",
+            detail: Some(format!("把当前分支挪到：{subject}")),
+            text: None,
+            form: Form::Reset { oid, mode: git::ResetMode::Mixed },
+        }
+    }
+
     pub(crate) fn confirm(title: &'static str, detail: String, then: Action) -> Self {
         Modal { title, detail: Some(detail), text: None, form: Form::Confirm { then: Some(then) } }
     }
@@ -566,6 +617,8 @@ impl Modal {
             // 两张卡没有「主输入」那一格：远端和分支都是弹出按钮，「远程分支」那一列的
             // 改名框在表格里面自己带提示，不占这张卡的 `hint`。
             Form::Push { .. } | Form::Pull { .. } => "",
+            // 重置卡没有文本框：要挑的只有三档页签，那一句「会丢什么」是卡自己写的。
+            Form::Reset { .. } => "",
         }
     }
 
@@ -580,6 +633,10 @@ impl Modal {
             Form::AddRepo { tab, .. } => n += 1 + usize::from(*tab == AddTab::Clone),
             // 描述那格按三行数（和内联那一格一样高），再加「修正」「提交后推送」两枚勾。
             Form::Commit { .. } => n += DESC_ROWS + 2,
+            // 重置卡：页签一行 + 说明一行 + 「丢什么」一行，加 `detail` 那行共四行。
+            // 说明和「丢什么」两行**固定占位**，不随档位长短增减——换一档卡片跳一下，
+            // 看着就像按下去了。
+            Form::Reset { .. } => n += 3,
             // 偏好卡自己按量来的尺寸摆，不数行；`rows()` 对它只管标题和脚部那两条。
             Form::Settings { .. } => return 0,
             // 推送/拉取两张卡同一条理由：它们的框是从 nib 量出来的（650×271 / 614×299），
@@ -616,6 +673,9 @@ impl Modal {
             Form::Pull { .. } => "拉取",
             Form::Merge { .. } => "",
             Form::Confirm { .. } => "确定",
+            // 动词 + 对象：这一按改的是分支指针，光写「重置」和卡上那排页签读起来
+            // 像「重置这个选择」。
+            Form::Reset { .. } => "重置分支",
         }
     }
 }
@@ -678,6 +738,9 @@ pub(crate) enum Msg {
     /// 克隆回来的只有「成了在哪」或者「为什么没成」，没有快照——成了之后由 `add_repo`
     /// 自己去开那个仓库（它会再发一次 `Msg::Loaded`）。
     Cloned(std::result::Result<String, String>),
+    /// 归档成了，`String` 是落地的那个路径。失败那一路共用 `Msg::Failed`（它已经把
+    /// `busy` 落回来、也把原文进了 toast），这里只管成功那一条。
+    Archived(String),
 }
 
 pub struct Gitx {
@@ -768,6 +831,18 @@ pub struct Gitx {
     pub(crate) modal: Option<Modal>,
     /// 卡刚打开的那一帧要把光标送进文本框；之后再抢焦点就该由用户自己决定。
     pub(crate) modal_focus: bool,
+    /// 下一帧的 `ui()` 要拉起的原生面板。`take()` 消费，所以一次点击最多弹一个面板；
+    /// 判据 `a_headless_frame_never_consumes_the_pending_dialog` 钉的就是「立起来但**不在绘制帧里被消费**」
+    /// ——那条边界同时保证了无头测试一辈子碰不到 `rfd`，不会在 CI 里弹出真面板。
+    pub(crate) pending_dialog: Option<Dialog>,
+    /// 最后一次**在分支上**时看到的那条分支名。分离 HEAD 之后 `status.branch` 是空的，
+    /// 而用户要的那句「回去」恰恰只有得出去才知道：状态栏靠它画「回到 main」那一格
+    /// （判据 `going_back_from_a_detached_head_reattaches_to_the_branch`）。
+    pub(crate) last_branch: String,
+    /// 侧栏「远端」里**展开着**的那几条的名字。只记名字、不记下面的分支：分支列表归快照，
+    /// 抓取之后新快照落地，展开着的那条自己就把新的分支摆出来。
+    /// 存在 `Gitx` 而不是数据库：这是这一次看仓库时的临时状态，重启又铺开一堆分支不是用户要的。
+    pub(crate) remote_open: Vec<String>,
     pub(crate) tx: Sender<Msg>,
     pub(crate) rx: Receiver<Msg>,
 }

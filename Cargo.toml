@@ -26,6 +26,10 @@ thiserror = "1"
 chrono = { version = "0.4", features = ["serde"] }
 # 界面层
 eframe = "0.37"
+# 原生「选目录 / 存盘」面板（「添加仓库」的浏览… 与历史右键的归档）。许可 MIT，
+# 已在 NOTICE/ATTRIBUTION 里署名。**只在 `src/ui/` 里用**：核心层（lib target）
+# 不许碰它——那条边界靠「`src/git.rs` 里 grep 不到 rfd」和编译单元本身一起守。
+rfd = "0.17.2"
 
 # 彩色 emoji（COLR/PNG 位图）需要 vello_cpu 的字形光栅化，默认不开。
 [dependencies.epaint]

@@ -73,11 +73,27 @@ pub(crate) fn ref_badges(
 /// 到底了由 `Msg::More` 用 `--skip` 再取一页。
 pub(crate) const LOG_PAGE: u32 = 500;
 
+/// 「当前分支」那一档在**分离 HEAD** 时无枝可依。那时 `git log` 不带位置参数就是从 HEAD
+/// 往回走：`main` 上更新的那几条**从 HEAD 不可达**，于是整段从日志里消失。那是 git 的
+/// 可达性，不是取数取错了——但用户右键点的明明是「检出这个提交」，一转头历史没了，
+/// 界面又没处可回，看着就是软件吞了他的提交。所以分离这一档改成 `--all`。
+/// 取首屏和翻下一页**都过这一位**：两处各写一遍，翻页就会取回一条收窄过的链子。
+pub(crate) fn eff_scope(scope: &git::Scope, detached: bool) -> git::Scope {
+    if detached && *scope == git::Scope::Current {
+        git::Scope::All
+    } else {
+        scope.clone()
+    }
+}
+
 pub(crate) fn snapshot_of(repo: &str, topo: bool, scope: &git::Scope) -> gitx::Result<Snapshot> {
+    // 状态先取：只为了问一句「这会儿是不是分离的」。
+    let status = git::status(repo)?;
+    let scope = eff_scope(scope, status.detached_at.is_some());
     // 日期序是 SourceTree 的默认；「层级顺序」把分支聚在一起，图序列读起来才是一条条分支。
     // 第一页走 `skip = 0`：核心层不发消息里那条 `--skip`（`the_page_offset_only_adds_skip` 钉过），
     // 所以这一句和原来分三条路的写法发给 git 的 argv 逐字节相同。
-    let commits = git::commits_page(repo, 0, LOG_PAGE, topo, scope)?;
+    let commits = git::commits_page(repo, 0, LOG_PAGE, topo, &scope)?;
     // 车道在这里排完：这一句跑在 worker 线程上，帧里只剩「按行号取一条 GraphRow」。
     let graph = layout_graph(&commits);
     let branches = git::branches(repo)?;
@@ -92,7 +108,7 @@ pub(crate) fn snapshot_of(repo: &str, topo: bool, scope: &git::Scope) -> gitx::R
     let badges = ref_badges(&commits, &branches, &tags, &remote_refs);
     let dates = commits.iter().map(|c| date_label(&c.date, taken_at)).collect();
     Ok(Snapshot {
-        status: git::status(repo)?,
+        status,
         commits,
         branches,
         tags,
@@ -256,14 +272,19 @@ pub(crate) fn mark(s: &ChangeStatus) -> &'static str {
     }
 }
 
-/// 状态色块的底色 + 字母。参考图里**改动那枚写的是 `…` 不是 `M`**——照它。
-/// 没量到的那几种落灰底，字母沿用 `mark`（见 `BADGE_*` 那一段注释）。
+/// 状态色块的底色 + 字母，全部按 DESIGN.md §3.2 那六档（白字 11px、12pt、圆角 3）。
+/// 旧那三枚（琥珀底白 `…`、玫瑰 `R`、紫 `?`）是 SourceTree 参考图量的，`…` 这个字母
+/// 随之一作废——spec 写的是 `M`。剩下两档（复制、未知）spec 没列，落「说不清就用辅助灰」，
+/// 字母沿用 `mark`。
 pub(crate) fn badge_of(s: &ChangeStatus) -> (Color32, &'static str) {
     match s {
-        ChangeStatus::Modified => (BADGE_MOD, "…"),
+        ChangeStatus::Modified => (BADGE_MOD, "M"),
+        ChangeStatus::Added => (BADGE_ADD, "A"),
+        ChangeStatus::Deleted => (BADGE_DEL, "D"),
         ChangeStatus::Renamed => (BADGE_REN, "R"),
         ChangeStatus::Untracked => (BADGE_UNK, "?"),
-        other => (BADGE_NONE, mark(other)),
+        ChangeStatus::Unmerged => (BADGE_CONF, "!"),
+        other => (BADGE_UNK, mark(other)),
     }
 }
 
@@ -302,7 +323,7 @@ pub(crate) fn check_box(ui: &mut egui::Ui, x: f32, cy: f32, checked: bool) -> bo
         p.line_segment([f(0.42, 0.72), f(0.78, 0.30)], s);
     } else {
         p.rect_filled(r, 3.0, Color32::WHITE);
-        p.rect_stroke(r, 3.0, Stroke::new(1.0, CHK_EDGE), egui::StrokeKind::Middle);
+        p.rect_stroke(r, 3.0, Stroke::new(1.0, BORDER_STRONG), egui::StrokeKind::Middle);
     }
     ui.allocate_rect(r, Sense::click()).clicked()
 }
@@ -337,10 +358,10 @@ pub(crate) fn file_row(ui: &mut egui::Ui, path: &str, st: &ChangeStatus, current
     let p = ui.painter();
     let (fill, glyph) = badge_of(st);
     let badge = Rect::from_min_size(pos2(rect.min.x + icon_x, rect.center().y - BADGE_S / 2.0), Vec2::splat(BADGE_S));
-    p.rect_filled(badge, 4.0, fill);
-    p.text(badge.center(), Align2::CENTER_CENTER, glyph, FontId::proportional(10.5), Color32::WHITE);
+    p.rect_filled(badge, BADGE_R, fill);
+    p.text(badge.center(), Align2::CENTER_CENTER, glyph, FontId::proportional(11.0), Color32::WHITE);
     if !tail.is_empty() {
-        p.text(rect.right_center(), Align2::RIGHT_CENTER, tail, FontId::proportional(11.0), MUTED);
+        p.text(rect.right_center(), Align2::RIGHT_CENTER, tail, FontId::proportional(11.0), TEXT_SECONDARY);
     }
     let right = rect.max.x - if tail.is_empty() { 0.0 } else { 76.0 };
     let text = Rect::from_min_max(pos2(rect.min.x + name_x, rect.min.y), pos2(right, rect.max.y));

@@ -19,6 +19,9 @@ use crate::viewport;
 /// 一个壳，数据可选填。填了就能钉排版，不填就是空态分支。
     fn shell(snap: Option<Snapshot>, diff: Vec<DiffLine>) -> Gitx {
         let (tx, rx) = channel();
+        // 先问一句「有没有数据」：`snap` 下面就要被移进结构体，那之后再 `snap.as_ref()`
+        // 是借一个已经搬走的值（编译不过，不是风格问题）。
+        let has_data = snap.is_some();
         Gitx {
             conn: None,
             repos: Vec::new(),
@@ -42,6 +45,8 @@ use crate::viewport;
             topo: false,
             scope: git::Scope::Current,
             show_remote: true,
+            // 侧栏「远端」默认全收着：展开状态是看仓库时的临时状态，夹具不该凭空摆一个开着的。
+            remote_open: Vec::new(),
             // 夹具没有数据库（`conn: None`），这一格只影响 `open()` 之后要不要再去摸上一次那本；
             // 默认按 `Gitx::new` 里 `Prefs::load(None)` 的结果填 true，免得夹具自己造一个新默认。
             restore_last: true,
@@ -68,6 +73,10 @@ use crate::viewport;
             hist_seq: 0,
             modal: None,
             modal_focus: false,
+            pending_dialog: None,
+            // 夹具没有真的走过 `Msg::Loaded`，这一位按「快照里那条分支就是最后一次看到的
+            // 分支」填：有数据 = `main`，空态壳 = 空串（和 `repo` 同一条件）。
+            last_branch: if has_data { "main".to_owned() } else { String::new() },
             tx,
             rx,
         }
@@ -152,6 +161,9 @@ use crate::viewport;
         let snap = Snapshot {
             status: RepoStatus {
                 branch: "main".to_owned(),
+                // 夹具走的是「在分支上」那一条；分离那一档由判据自己摆上来（要钉的正是
+                // 状态栏换了写法之后的样子），不在公共夹具里替它做主。
+                detached_at: None,
                 upstream: Some("origin/main".to_owned()),
                 ahead: 2,
                 behind: 0,
@@ -278,12 +290,14 @@ use crate::viewport;
         frame_events(app, Vec::new())
     }
 
-    /// 顶部两条带（标题带 + tab 条）里**任何两块文字都不许交叠**。
+    /// 顶栏那 46pt 里**任何两块文字都不许交叠**。
     /// 上一批的重叠就是这么量出来的：`书签 ▼` 压在 `⤴` 上、`添加仓库` 压在 `≡` 上，
     /// 目视只看到「顶部栏有点乱」，说不清是谁压了谁。
-    /// 仓库给到 6 个、提示给到 30 字，是为了把两条带都塞满——空列表那帧什么都压不到。
+    /// 仓库给到 6 个、提示给到 30 字，是为了把这一条塞满——空列表那帧什么都压不到。
+    /// §2 写了「窗口收窄时溢出收进 `»` 菜单」，**那一档还没实现**；tab 组超出宽度会被面板
+    /// 裁掉（预览稿 `.tabs{min-width:0}` 也是这个行为），裁掉不算压住。
     #[test]
-    fn the_top_bands_have_no_overlapping_widgets() {
+    fn the_header_has_no_overlapping_widgets() {
         let mut app = filled(3, &layout(PATCH, false));
         for i in 0..6 {
             app.repos.push(Repo {
@@ -302,12 +316,15 @@ use crate::viewport;
             .filter_map(|c| match &c.shape {
                 egui::Shape::Text(t) => {
                     let r = t.galley.rect.translate(t.pos.to_vec2());
-                    (r.center().y <= TOP_H).then(|| (t.galley.text().to_owned(), r))
+                    (r.center().y <= HEADER_H).then(|| (t.galley.text().to_owned(), r))
                 }
                 _ => None,
             })
             .collect();
-        assert!(items.len() > 20, "顶部两带只认出 {} 块文字，这一帧大概什么都没画", items.len());
+        // 探针：这一条至少得认出 6 枚 tab + 1 枚幽灵 + 11 枚图标 + 分支名 + 计数 = 20 块文字。
+        // 以前是 `> 20`：那时 11 枚按钮**各带一个中文标签**（图标在上、中文在下），整条带有 30 几块。
+        // §4.1 把顶栏收成纯图标之后文字数掉了十块，阈值跟着 spec 走，不是放松判据。
+        assert!(items.len() >= 20, "顶栏只认出 {} 块文字（6 tab + 幽灵 + 11 图标 + 分支 + 计数），这一帧大概什么都没画", items.len());
         let mut bad = Vec::new();
         for i in 0..items.len() {
             for j in (i + 1)..items.len() {
@@ -321,7 +338,7 @@ use crate::viewport;
         assert!(bad.is_empty(), "顶部栏重叠：\n{}", bad.join("\n"));
     }
 
-    /// tab 条点一枚 = 开那个仓库。这一条是 #23 的全部行为：列表摊成 tab，点就是开。
+    /// 顶栏的胶囊 tab 点一枚 = 开那个仓库。这一条是 #23 的全部行为：列表摊成 tab，点就是开。
     #[test]
     fn a_repo_tab_opens_that_repo() {
         let mut app = filled(3, &layout(PATCH, false));
@@ -350,7 +367,7 @@ use crate::viewport;
     fn scroll_log(dy: f32) -> (Vec<(String, f32)>, Vec<(String, f32)>) {
         let ctx = egui::Context::default();
         style(&ctx);
-        let over_log = pos2((SIDEBAR_W + WIN_W) / 2.0, (TOP_H + (WIN_H - STATUS_H - STAGING_H)) / 2.0);
+        let over_log = pos2((SIDEBAR_W + WIN_W) / 2.0, (HEADER_H + (WIN_H - STATUS_H - STAGING_H)) / 2.0);
         let hover = vec![egui::Event::PointerMoved(over_log)];
         let raw = |time: f64, events: Vec<egui::Event>| egui::RawInput {
             screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(WIN_W, WIN_H))),
@@ -470,7 +487,7 @@ use crate::viewport;
             .collect()
     }
 
-    /// 虚拟行那枚**空心环**的圆心：白底 + MUTED 灰边。提交是车道色实心点，两者一眼分得开。
+    /// 虚拟行那枚**空心环**的圆心：白底 + `RING_GREY` 灰边。提交是车道色实心点，两者一眼分得开。
     fn rings(out: &egui::FullOutput) -> Vec<Pos2> {
         out.shapes
             .iter()
@@ -500,6 +517,52 @@ use crate::viewport;
             .unwrap_or_else(|| panic!("y {y:?} 里没有以「{label}」开头的文字"))
     }
 
+    /// 这一块文字用的**字号**。§4.1「图标按钮……图标 14px」这种数在形状层问不到：
+    /// 画出来的只有一块 galley，尺寸只能回它 `font_id.size`。
+    fn text_size(out: &egui::FullOutput, label: &str, y: std::ops::RangeInclusive<f32>) -> f32 {
+        out.shapes
+            .iter()
+            .find_map(|c| match &c.shape {
+                egui::Shape::Text(t) => {
+                    let r = t.galley.rect.translate(t.pos.to_vec2());
+                    let in_band = t.galley.text().starts_with(label)
+                        && r.center().y >= *y.start()
+                        && r.center().y <= *y.end();
+                    in_band.then(|| t.galley.job.sections.first().map(|s| s.format.font_id.size))
+                }
+                _ => None,
+            })
+            .flatten()
+            .unwrap_or_else(|| panic!("y {y:?} 里没有以「{label}」开头的文字"))
+    }
+
+    /// 这一块文字用的**字面名**（`inter-semibold` 那类命名字族；默认字族返回 `proportional`）。
+    /// §6 那条「强调改走字重、不再走更深一档的灰」要问的就是这个：只换颜色也能让
+    /// `text_color` 那条绿，字面没动等于没落地。
+    fn text_family(out: &egui::FullOutput, label: &str, y: std::ops::RangeInclusive<f32>) -> String {
+        out.shapes
+            .iter()
+            .find_map(|c| match &c.shape {
+                egui::Shape::Text(t) => {
+                    let r = t.galley.rect.translate(t.pos.to_vec2());
+                    let in_band = t.galley.text().starts_with(label)
+                        && r.center().y >= *y.start()
+                        && r.center().y <= *y.end();
+                    in_band.then(|| {
+                        t.galley.job.sections.first().map(|s| match &s.format.font_id.family {
+                            // 命名字族给出的是注册时那个名字（`inter-semibold`）；四种自带
+                            // 字族退成 `Proportional` 这类调试名，判据只认前者等于「没换字面」。
+                            egui::FontFamily::Name(n) => n.to_string(),
+                            other => format!("{other:?}"),
+                        })
+                    })
+                }
+                _ => None,
+            })
+            .flatten()
+            .unwrap_or_else(|| panic!("y {y:?} 里没有以「{label}」开头的文字"))
+    }
+
     /// 这一帧画出的**所有文字块**（内容 + 左上角）。行距、行序这类判据只能问它们。
     fn texts(out: &egui::FullOutput) -> Vec<(String, Pos2)> {
         out.shapes
@@ -515,7 +578,7 @@ use crate::viewport;
     /// 判据里别再抄 78/95/96 这种数字：这一批把行距从 21 改成 26，抄过数字的三条全红了。
     fn head_band(out: &egui::FullOutput) -> std::ops::RangeInclusive<f32> {
         let r = text_rect(out, "图表", 55.0..=(WIN_H - STATUS_H - STAGING_H));
-        (r.center().y - HEADER_H / 2.0)..=(r.center().y + HEADER_H / 2.0)
+        (r.center().y - LOG_HEAD_H / 2.0)..=(r.center().y + LOG_HEAD_H / 2.0)
     }
 
     /// 日志数据区的 y 带：表头下沿一直到暂存带上沿。
@@ -625,18 +688,30 @@ use crate::viewport;
         }
     }
 
+    /// 四块带的**底色与边界**逐条对 §2 那张示意图（`docs/DESIGN.md` §2 + 预览稿 CSS）。
+    /// 名字里的「measured_reference」是上一代：那批数是从 SourceTree 截图量的。
+    /// S6-2 起顶栏只有一条 46pt（旧的 52+24 两条带合并，§6 迁移表第一行），
+    /// 顶栏和状态栏的底色也从"比内容区暗一格的灰"改成 `BG_WINDOW` 白 + 1px 分隔线。
+    /// PROCESS 的改名对照记在 S6-2 那一节，历史台账里的旧名字不动。
     #[test]
-    fn bands_match_the_measured_reference() {
+    fn bands_match_the_design_spec() {
         let r = rects(&frame(&mut blank()));
         let bottom = WIN_H - STATUS_H;
         let staging_top = bottom - STAGING_H;
-        // 工具栏：横贯顶部的一条 55pt。
-        assert_eq!(band(&r, Rect::from_min_max(pos2(0.0, 0.0), pos2(WIN_W, TOOLBAR_H))), TOOLBAR_BG, "工具栏带");
-        // tab 条：紧贴工具栏下面那条 24pt，把书签摊成一排。
-        assert_eq!(band(&r, Rect::from_min_max(pos2(0.0, TOOLBAR_H), pos2(WIN_W, TOP_H))), TOOLBAR_BG, "tab 条带");
-        // 侧栏：从两条顶带下沿一直贯穿到状态栏顶。SourceTree 的左栏是全高的，
-        // 这一条也正是 2026-10-15「双左栏合一」被推翻的落点。
-        assert_eq!(band(&r, Rect::from_min_max(pos2(0.0, TOP_H), pos2(SIDEBAR_W, bottom))), SIDEBAR_BG, "侧栏带");
+        // 顶栏：横贯顶部的一条 46pt，白底（§2「HEADER 46pt … 白底 + 下 1px 分隔线」）。
+        // 字面值写在这儿，不是拿 `BG_WINDOW` 自比——把顶栏涂成别的灰也照样得红。
+        assert_eq!(
+            band(&r, Rect::from_min_max(pos2(0.0, 0.0), pos2(WIN_W, HEADER_H))),
+            Color32::from_rgb(0xFF, 0xFF, 0xFF),
+            "顶栏带（§2 BG_WINDOW）"
+        );
+        // 侧栏：从顶带下沿一直贯穿到状态栏顶，灰底取 §3.1 的 `BG_SIDEBAR` `#F7F8FA`
+        // （旧那枚 `#F1F1F3` 是参考图量的，S6-3 起作废；这里同样写**字面值**，不比常量）。
+        assert_eq!(
+            band(&r, Rect::from_min_max(pos2(0.0, HEADER_H), pos2(SIDEBAR_W, bottom))),
+            Color32::from_rgb(0xF7, 0xF8, 0xFA),
+            "侧栏带（§3.1 BG_SIDEBAR）"
+        );
         // 暂存带：侧栏右边、贴着状态栏上沿的一条 245pt；带内再切 435pt 文件表 + 差异区。
         assert_eq!(band(&r, Rect::from_min_max(pos2(SIDEBAR_W, staging_top), pos2(WIN_W, bottom))), Color32::WHITE, "暂存带");
         assert_eq!(
@@ -649,11 +724,16 @@ use crate::viewport;
             Color32::WHITE,
             "差异区"
         );
-        // 状态栏：贴着窗底的 26pt 灰条，暂存带和侧栏都为它让了位。
-        assert_eq!(band(&r, Rect::from_min_max(pos2(0.0, bottom), pos2(WIN_W, WIN_H))), TOOLBAR_BG, "状态栏带");
+        // 状态栏：贴着窗底，**也是白底**（§2「STATUS：白底 + 上 1px 分隔线」）。
+        // 这一条以前断言的是灰（`TOOLBAR_BG`）——那枚 token 已经随 §6 删掉了。
+        assert_eq!(
+            band(&r, Rect::from_min_max(pos2(0.0, bottom), pos2(WIN_W, WIN_H))),
+            Color32::from_rgb(0xFF, 0xFF, 0xFF),
+            "状态栏带（§2 BG_WINDOW）"
+        );
         // 日志带 = 谁都没要走的那块。
         assert_eq!(
-            band(&r, Rect::from_min_max(pos2(SIDEBAR_W, TOP_H), pos2(WIN_W, staging_top))),
+            band(&r, Rect::from_min_max(pos2(SIDEBAR_W, HEADER_H), pos2(WIN_W, staging_top))),
             Color32::WHITE,
             "日志带"
         );
@@ -666,144 +746,314 @@ use crate::viewport;
         assert!(r.len() > 4, "整帧只有 {} 个色块，多半是某个面板没跑", r.len());
     }
 
-    /// 侧栏里的一块文字。`text_rect` 只按 y 带筛，而「工作区」「搜索」「main」这些词
-    /// 在工具栏和暂存带里也有，所以这里两维都筛：工具栏下面、左缘落在侧栏里的才算。
-    fn side_text(out: &egui::FullOutput, label: &str) -> Rect {
-        // 上界让到状态栏顶：状态栏左边也写着「main ↑2」，按绘制顺序排在侧栏**之前**，
-        // 不卡 y 就会先撞上它（那行贴着窗底，不属于侧栏）。
-        all_text_rects(out, TOP_H..=(WIN_H - STATUS_H), &[label])
-            .into_iter()
-            .filter(|(_, r)| r.min.x < SIDEBAR_W)
-            .map(|(_, r)| r)
-            .next()
+    /// 侧栏这一带的**数**本身：S6-3a 换锚时定下的十四枚，逐个对 §2/§3.4 的字面值。
+    /// 下面那批帧判据问的是「画出来对不对」，这一条问的是「常量还是不是 spec 那两个数」——
+    /// 缺了它，把 `SIDEBAR_W` 改成 200 只会让帧判据跟着一起挪，谁都不红。
+    #[test]
+    fn the_sidebar_numbers_are_the_design_md_values() {
+        assert_eq!(SIDEBAR_W, 188.0, "§2 侧栏宽 188");
+        assert_eq!((SIDE_INSET, SIDE_VPAD), (8, 12), "§3.5 面板内边距：横 8 竖 12");
+        assert_eq!((SIDE_GROUP_X, SIDE_TEXT_X), (16.0, 24.0), "§2.1 两列：组头 8+8、子项再缩进 8");
+        assert_eq!((SIDE_GROUP_H, SIDE_ROW_H), (26.0, 26.0), "§2 子项行高 26；组头 §2 没给，自拍同档");
+        assert_eq!(
+            (SIDE_PILL_L, SIDE_PILL_R, SIDE_PILL_RAD),
+            (4.0, 184.0, 6),
+            "§2 选中药丸：圆角 6（§3.5），左右各让 4 为自拍"
+        );
+        assert_eq!((SIDE_GROUP_FONT, SIDE_ITEM_FONT, SIDE_COUNT_FONT), (11.0, 13.0, 11.0), "§3.4 辅助 11 / 正文 13");
+        assert_eq!((SIDE_DOT_X, SIDE_DOT_R), (12.0, 3.5), "§2「蓝点」没给尺寸，沿用旧档 7pt 直径");
+        assert_eq!(SIDE_COUNT_X, 172.0, "计数右缘 = 面板右 188 − 16；§2 只说「右对齐」，离边多远是自拍");
+        assert_eq!(BG_SIDEBAR, Color32::from_rgb(0xF7, 0xF8, 0xFA), "§3.1 BG_SIDEBAR");
+        assert_eq!(SIDE_FILTER_H, 34.0, "§2 底置筛选框 26 + 上间距 8（和 §4.2 的 30 撞车，取 §2，见 DESIGN.md §7）");
+    }
+
+    /// §3.1 那批灰/蓝/差异 token 的**字面值**判据。上面各带的帧判据全是拿常量去比常量，
+    /// 少了这一条就意味着：把 `TEXT_SECONDARY` 从 `#59636E` 挪成别的灰，全绿。
+    #[test]
+    fn the_grey_and_status_tokens_are_the_design_md_values() {
+        assert_eq!(BG_WINDOW, Color32::from_rgb(0xFF, 0xFF, 0xFF), "§3.1 BG_WINDOW");
+        assert_eq!(BG_SIDEBAR, Color32::from_rgb(0xF7, 0xF8, 0xFA), "§3.1 BG_SIDEBAR");
+        assert_eq!(BG_HOVER, Color32::from_rgb(0xEF, 0xF1, 0xF4), "§3.1 BG_HOVER");
+        assert_eq!(BG_INSET, Color32::from_rgb(0xF0, 0xF1, 0xF3), "§3.1 BG_INSET");
+        assert_eq!(BORDER_SUBTLE, Color32::from_rgb(0xE5, 0xE7, 0xEB), "§3.1 BORDER_SUBTLE");
+        assert_eq!(BORDER_STRONG, Color32::from_rgb(0xD0, 0xD5, 0xDD), "§3.1 BORDER_STRONG");
+        assert_eq!(TEXT_PRIMARY, Color32::from_rgb(0x1F, 0x23, 0x28), "§3.1 TEXT_PRIMARY（取代 INK 38,38,38）");
+        assert_eq!(TEXT_SECONDARY, Color32::from_rgb(0x59, 0x63, 0x6E), "§3.1 TEXT_SECONDARY");
+        assert_eq!(TEXT_MUTED, Color32::from_rgb(0x8B, 0x94, 0x9E), "§3.1 TEXT_MUTED");
+        assert_eq!(ACCENT, Color32::from_rgb(0x09, 0x69, 0xDA), "§3.1 ACCENT");
+        assert_eq!(ACCENT_SOFT, Color32::from_rgb(0xE8, 0xF1, 0xFD), "§3.1 ACCENT_SOFT");
+        assert_eq!(ACCENT_LINE, Color32::from_rgb(0xB9, 0xD6, 0xF9), "§3.1 ACCENT_LINE");
+        assert_eq!(ACCENT_INK, Color32::from_rgb(0x05, 0x50, 0xAE), "§3.1 ACCENT_INK");
+        assert_eq!(
+            (ADD_BG, ADD_FG, DEL_BG, DEL_FG),
+            (
+                Color32::from_rgb(0xE6, 0xF4, 0xEA),
+                Color32::from_rgb(0x1A, 0x7F, 0x37),
+                Color32::from_rgb(0xFC, 0xEB, 0xEA),
+                Color32::from_rgb(0xCF, 0x22, 0x2E),
+            ),
+            "§3.1 差异两行"
+        );
+    }
+
+    /// §3.2 六枚状态色块 + 见方 12 + 圆角 3 的字面值。旧的三枚（琥珀/玫瑰/紫）是参考图量的，
+    /// `badge_of` 里「没量到就落灰底」那一条出口已经跟着 `BADGE_NONE` 一起删了——所以这里
+    /// 必须六枚全钉：少钉一枚，就等于让那一枚重新变成"没人看着的自拍值"。
+    #[test]
+    fn the_status_badges_are_the_design_md_six_colors() {
+        assert_eq!(
+            (BADGE_MOD, BADGE_ADD, BADGE_DEL),
+            (
+                Color32::from_rgb(0xD2, 0x99, 0x22),
+                Color32::from_rgb(0x1A, 0x7F, 0x37),
+                Color32::from_rgb(0xCF, 0x22, 0x2E),
+            ),
+            "§3.2 修改/新增/删除"
+        );
+        assert_eq!(
+            (BADGE_REN, BADGE_UNK, BADGE_CONF),
+            (
+                Color32::from_rgb(0x82, 0x50, 0xDF),
+                Color32::from_rgb(0x6E, 0x76, 0x81),
+                Color32::from_rgb(0xFB, 0x85, 0x00),
+            ),
+            "§3.2 重命名/未跟踪/冲突"
+        );
+        assert_eq!((BADGE_S, BADGE_R), (12.0, 3.0), "§3.2 见方 12（旧 14 作废）、§3.5 圆角 3");
+    }
+
+    /// 差异区那格文件标题带的**旧数**（高 30、底 (236,236,236)、色块离左缘 8）——这一带还没换锚，
+    /// §2 给的是另一档（见 `DESIGN.md` §7 的 STAGING/STATUS 欠账），S6-5 迁它的时候连同
+    /// 这一条一起改。留着这条是因为它原来的判据在我这次误删里没了：数还得有人钉，
+    /// 只是钉在"当前值"而不是"spec 值"上。
+    #[test]
+    fn the_diff_head_band_is_still_on_its_pre_spec_numbers() {
+        assert_eq!(
+            (DIFF_HEAD_H, DIFF_HEAD_BG, DIFF_HEAD_PAD),
+            (30.0, Color32::from_rgb(236, 236, 236), 8.0),
+            "S6-5 之前这三位不许静默漂移；要改就连着 §7 的欠账一起改"
+        );
+    }
+
+    /// 侧栏那一栏里的一块文字（含它的落笔颜色/字号/字族）。`text_color` 那几个只按 y 带筛，
+    /// 而「main」「3」这些词在顶栏、状态栏、日志里也有，所以这里 **x 也要筛**：
+    /// 左缘落在 `SIDEBAR_W` 里面、y 在顶栏和状态栏之间才算侧栏的。
+    /// 字族按 `text_family` 同一套退路：命名字族给出注册名（`inter-medium`），
+    /// 其余打成调试名（`Proportional`），判据只认前者等于「真换了字面」。
+    fn side_galley(out: &egui::FullOutput, label: &str) -> (Color32, f32, String, Rect) {
+        out.shapes
+            .iter()
+            .find_map(|c| match &c.shape {
+                egui::Shape::Text(t) => {
+                    let r = t.galley.rect.translate(t.pos.to_vec2());
+                    let hit = t.galley.text().starts_with(label)
+                        && r.min.x < SIDEBAR_W
+                        && r.center().y > HEADER_H
+                        && r.center().y < WIN_H - STATUS_H;
+                    hit.then(|| {
+                        let s = t.galley.job.sections.first().expect("galley 没有 section");
+                        let family = match &s.format.font_id.family {
+                            egui::FontFamily::Name(n) => n.to_string(),
+                            other => format!("{other:?}"),
+                        };
+                        (s.format.color, s.format.font_id.size, family, r)
+                    })
+                }
+                _ => None,
+            })
             .unwrap_or_else(|| panic!("侧栏里没有「{label}」"))
     }
 
-    /// 图标格（参考图 x 18..38）里有没有墨。圆、线段、方框三种都算——侧栏图标全是线描。
-    fn icon_ink(out: &egui::FullOutput, cy: f32) -> usize {
-        let (l, r) = (SIDE_ICON_X - 10.0, SIDE_ICON_X + 10.0);
-        let hit = |x0: f32, x1: f32, y0: f32, y1: f32| x0 >= l - 0.01 && x1 <= r + 0.01 && y0 >= cy - 12.0 && y1 <= cy + 12.0;
+    /// 分组头右边那枚计数：和标题同一行、右缘最接近 `SIDE_COUNT_X` 的一块文字。
+    /// 按**右缘**找而不是按内容找：计数就是 "0"/"1"/"2"，按内容筛会把行号、徽标数字全捞进来。
+    /// 返回 `(颜色, 字号, 文字, 矩形)`——第三个是**内容**，和 `side_galley` 的位置不同：
+    /// 这一条要拿它对上"这一组有几条"，字族反而没人问。
+    fn side_count(out: &egui::FullOutput, cy: f32) -> (Color32, f32, String, Rect) {
+        let mut best: Option<(f32, (Color32, f32, String, Rect))> = None;
+        for c in &out.shapes {
+            if let egui::Shape::Text(t) = &c.shape {
+                let r = t.galley.rect.translate(t.pos.to_vec2());
+                if r.min.x >= SIDEBAR_W || (r.center().y - cy).abs() > 6.0 {
+                    continue;
+                }
+                let d = (r.max.x - SIDE_COUNT_X).abs();
+                if d < 1.0 && best.as_ref().map_or(true, |(b, _)| d < *b) {
+                    let s = t.galley.job.sections.first().expect("galley 没有 section");
+                    best = Some((d, (s.format.color, s.format.font_id.size, t.galley.text().to_owned(), r)));
+                }
+            }
+        }
+        best.unwrap_or_else(|| panic!("侧栏 y={cy} 那一行右缘 {SIDE_COUNT_X} 上没有计数")).1
+    }
+
+    /// 分组头左边的**空槽**（x < `SIDE_GROUP_X`）里有没有"有形状的墨"——圆、线段、带描边的方框。
+    /// §2 明写分组头**无图标**，也没有折叠三角。填充矩形（药丸）不算，那种只出现在子项行。
+    fn gutter_ink(out: &egui::FullOutput, cy: f32) -> usize {
+        let hit = |_x0: f32, x1: f32, y0: f32, y1: f32| {
+            x1 <= SIDE_GROUP_X + 0.01 && y0 >= cy - 12.0 && y1 <= cy + 12.0
+        };
         out.shapes
             .iter()
             .filter(|c| match &c.shape {
                 egui::Shape::Circle(d) => hit(d.center.x - d.radius, d.center.x + d.radius, d.center.y - d.radius, d.center.y + d.radius),
-                egui::Shape::LineSegment { points, .. } => hit(points[0].x.min(points[1].x), points[0].x.max(points[1].x), points[0].y.min(points[1].y), points[0].y.max(points[1].y)),
-                egui::Shape::Rect(q) => hit(q.rect.min.x, q.rect.max.x, q.rect.min.y, q.rect.max.y),
+                egui::Shape::LineSegment { points, .. } => hit(
+                    points[0].x.min(points[1].x),
+                    points[0].x.max(points[1].x),
+                    points[0].y.min(points[1].y),
+                    points[0].y.max(points[1].y),
+                ),
+                egui::Shape::Rect(q) => q.stroke.width > 0.0 && hit(q.rect.min.x, q.rect.max.x, q.rect.min.y, q.rect.max.y),
                 _ => false,
             })
             .count()
     }
 
-    /// 侧栏常量表：这七个数是这一批从参考图上量的**唯一**落点。布局判据全比常量，
-    /// 所以常量本身必须由这条钉住——上一批 M2 抓到过「常量和自己比」：改常量什么都不红。
+    /// 侧栏的两列：**分组头起在 16、子项起在 24**（§2.1 的 8 内边距 + 8 缩进）。
+    /// 旧判据是「九条标签全起在同一列 x=41」——那是参考图量的，§2 换成了两列网格。
     #[test]
-    fn the_sidebar_constants_are_the_measured_reference_numbers() {
-        assert_eq!((SIDE_TEXT_X, SIDE_ICON_X), (41.0, 28.0), "文字列 x=41、图标格 18..38 的中心 28");
-        assert_eq!((SIDE_CAT_H, SIDE_HEAD_H), (47.0, 30.0), "分类行 47pt、「工作区」那条 30pt");
-        assert_eq!((SIDE_PILL_L, SIDE_PILL_R), (10.0, 129.5), "药丸 x 10..129.5");
-        assert_eq!((SIDE_DOT_X, SIDE_DOT_R), (29.5, 3.5), "蓝点圆心 29.5、直径 7");
-        // 颜色也得钉：M5 把蓝点改成纯黑，**一条都没红**——判据按常量筛圆，常量改了筛子跟着改。
-        assert_eq!(
-            (SIDE_DOT_C, SIDE_PILL_BG, SIDE_ICON_C, SIDE_LABEL_C, SIDE_INK),
-            (
-                Color32::from_rgb(36, 93, 184),
-                Color32::from_rgb(204, 208, 205),
-                Color32::from_rgb(69, 81, 108),
-                Color32::from_rgb(164, 167, 165),
-                Color32::from_rgb(61, 62, 61),
-            ),
-            "侧栏五档颜色不是参考图量到的那五个值"
-        );
-    }
-
-    /// 2026-10-20 这批新画的几格（差异带头、状态色块、tab 条）的数比**字面值**，理由和上一条
-    /// 一样：几何判据全比常量，常量自己没被钉过就是「常量和自己比」。
-    /// 上面每个数的出处写在常量注释里（哪张图、哪一段 y/x 范围）。
-    /// `TAB_H` 不在这里——SourceTree 把书签放在**另一个窗口**，这 24pt 没有参考图可对，
-    /// 它是用户诉求（tab 展示仓库列表）落地时定的，跟着 `ROW_H` 那类自定尺寸走。
-    #[test]
-    fn the_diff_header_constants_are_the_measured_reference_numbers() {
-        assert_eq!(DIFF_HEAD_H, 30.0, "差异区那格文件标题带：两张参考图都是 30pt");
-        assert_eq!(DIFF_HEAD_BG, Color32::from_rgb(236, 236, 236), "同一条带的底色");
-        assert_eq!(DIFF_HEAD_PAD, 8.0, "带里色块离左缘的距离");
-        assert_eq!(BADGE_S, 14.0, "状态色块 14×14");
-        assert_eq!(
-            (BADGE_MOD, BADGE_REN, BADGE_UNK),
-            (
-                Color32::from_rgb(238, 197, 91),
-                Color32::from_rgb(163, 115, 122),
-                Color32::from_rgb(101, 73, 129),
-            ),
-            "三枚状态色块的颜色不是参考图量到的那三个"
-        );
-    }
-
-    /// 侧栏九条标签**全部**起在参考图量到的 x=41：分类不缩进、子项也不缩进，
-    /// 图标和圆点住在 18..38 那一格。我们原来是「标题 5、子项 20」两档缩进。
-    #[test]
-    fn the_sidebar_labels_all_start_at_the_measured_column() {
+    fn the_sidebar_texts_sit_on_the_8_16_grid() {
         let out = frame(&mut loaded());
-        for label in ["工作区", "文件状态", "历史", "搜索", "分支", "main", "标签", "远端", "已贮藏"] {
-            assert_eq!(side_text(&out, label).min.x, SIDE_TEXT_X, "「{label}」没起在文字列上");
+        for label in ["工作区", "分支", "标签", "远端", "已贮藏"] {
+            assert_eq!(side_galley(&out, label).3.min.x, SIDE_GROUP_X, "「{label}」是分组头，该起在 16");
+        }
+        for label in ["文件状态", "历史", "搜索", "main"] {
+            assert_eq!(side_galley(&out, label).3.min.x, SIDE_TEXT_X, "「{label}」是子项，该起在 24");
         }
     }
 
-    /// 分类行 47pt 一条；两个分类之间夹着一条子项时，差的正是 47 + 26。
-    /// 这里**抄的是实测字面量**而不是常量：上一批 M2 抓到过「拿常量和自己比」——
-    /// 把 47 改成 26，比常量的那条照样绿，只有钉死数字的才会红。
+    /// §2/§3.4 的两档字级与配色：分组头 11px `TEXT_SECONDARY`、子项 13px `TEXT_PRIMARY`。
     #[test]
-    fn the_sidebar_category_rows_step_by_47pt() {
+    fn the_sidebar_font_ranks_are_the_spec_two_steps() {
         let out = frame(&mut loaded());
-        let c = |l: &str| side_text(&out, l).center().y;
-        let near = |a: f32, b: f32| (a - b).abs() < 0.6;
-        assert!(near(c("远端") - c("标签"), 47.0), "标签→远端 = {}，参考图量的是 47", c("远端") - c("标签"));
-        assert!(near(c("已贮藏") - c("远端"), 47.0), "远端→已贮藏 = {}，参考图量的是 47", c("已贮藏") - c("远端"));
-        assert!(near(c("标签") - c("分支"), 47.0 + 26.0), "分支→标签中间只有一条 main 子项，应该是 73：实际 {}", c("标签") - c("分支"));
+        for label in ["工作区", "分支", "标签", "远端", "已贮藏"] {
+            let (color, size, _, _) = side_galley(&out, label);
+            assert_eq!((size, color), (11.0, Color32::from_rgb(0x59, 0x63, 0x6E)), "分组头「{label}」不是 §3.4 的 11px 次要档");
+        }
+        for label in ["文件状态", "历史", "搜索", "main"] {
+            let (color, size, _, _) = side_galley(&out, label);
+            assert_eq!((size, color), (13.0, Color32::from_rgb(0x1F, 0x23, 0x28)), "子项「{label}」不是 §3.4 的 13px 正文档");
+        }
     }
 
-    /// 选中那一条铺的灰色药丸：参考图 x 10..129.5、高 = 行高 26。
+    /// §2 分组头右边那枚计数：11px `TEXT_MUTED`（比组头再淡一档，颜色自拍）、右缘贴 172，
+    /// **报的是这一组有几条**。夹具里给「标签」塞两条，那一档就得写 2——
+    /// 写死一个数的实现对这条杀不死（假绿一族「只验一半」）。
     #[test]
-    fn the_selected_sidebar_row_is_the_measured_pill() {
+    fn the_sidebar_group_headers_carry_a_right_aligned_count() {
+        let mut app = loaded();
+        // 夹具默认 1 分支 / 0 标签 / 0 远端 / 0 贮藏：全是 0 和 1，分不清"数出来的"和"写死的"。
+        let oid = "0".repeat(40);
+        app.snap.as_mut().unwrap().tags = vec![
+            Tag { name: "v1.0".to_owned(), target: oid.clone(), annotated: false },
+            Tag { name: "v1.1".to_owned(), target: oid, annotated: false },
+        ];
+        let out = frame(&mut app);
+        for (title, want) in [("工作区", "3"), ("分支", "1"), ("标签", "2")] {
+            let row = side_galley(&out, title).3;
+            let (color, size, text, rect) = side_count(&out, row.center().y);
+            assert_eq!(text.trim(), want, "「{title}」那组的计数写了「{text}」，应该是 {want} 条");
+            assert_eq!((size, color), (11.0, Color32::from_rgb(0x8B, 0x94, 0x9E)), "计数不是 11px 辅助档");
+            assert!((rect.max.x - SIDE_COUNT_X).abs() < 1.0, "计数右缘 {:+.1}，§2 说的右对齐落在 {SIDE_COUNT_X}", rect.max.x);
+        }
+    }
+
+    /// §2：分组头**无图标**（也没有折叠三角）。上一批这条是反的——"每个分类都带一枚图标"，
+    /// 图标是照着参考图那五枚线描画的；换锚之后 spec 明写不要，那批线描整个删掉。
+    #[test]
+    fn the_sidebar_group_headers_are_iconless_and_triangleless() {
         let out = frame(&mut loaded());
-        let (_, rect, radius) = rounded(&out)
+        for label in ["工作区", "分支", "标签", "远端", "已贮藏"] {
+            let cy = side_galley(&out, label).3.center().y;
+            assert_eq!(gutter_ink(&out, cy), 0, "「{label}」左边那格还有墨：§2 的分组头无图标、无折叠三角");
+        }
+    }
+
+    /// 行距：**分组头 26 + 子项 26**（§2）。这里抄的是字面量而不是常量——上一批 M2 抓到过
+    /// 「拿常量和自己比」：把 26 改成别的，比常量的那条照样绿，只有钉死数字的才会红。
+    /// 分支→标签中间只有一条 `main`，所以差 52 = 26 + 26；标签→远端之间没有子项，差 26。
+    #[test]
+    fn the_sidebar_rows_step_by_26pt() {
+        let out = frame(&mut loaded());
+        let c = |l: &str| side_galley(&out, l).3.center().y;
+        let near = |a: f32, b: f32| (a - b).abs() < 0.6;
+        assert!(near(c("远端") - c("标签"), 26.0), "标签→远端 = {}，§2 的行高是 26", c("远端") - c("标签"));
+        assert!(near(c("已贮藏") - c("远端"), 26.0), "远端→已贮藏 = {}，§2 的行高是 26", c("已贮藏") - c("远端"));
+        assert!(near(c("标签") - c("分支"), 52.0), "分支→标签中间只有一条 main 子项，应该是 52：实际 {}", c("标签") - c("分支"));
+    }
+
+    /// §2 的选中态：子项选中时铺一枚**浅蓝**药丸（`ACCENT_SOFT`、圆角 6、x 4..184、高 = 行高 26），
+    /// 罩在选中的那一条上。旧的那枚是灰色 `#CCD0CD`、x 10..129.5、圆角 5——参考图量的，作废。
+    #[test]
+    fn the_selected_sidebar_row_wears_the_accent_pill() {
+        let out = frame(&mut loaded());
+        let pills: Vec<_> = rounded(&out)
             .into_iter()
-            .find(|(fill, _, _)| *fill == SIDE_PILL_BG)
-            .expect("这一帧没有 SIDE_PILL_BG 的色块，侧栏药丸没画出来");
-        assert_eq!(rect.min.x, SIDE_PILL_L, "药丸左缘不是参考图的 10");
-        assert_eq!(rect.max.x, SIDE_PILL_R, "药丸右缘不是参考图的 129.5");
-        assert_eq!(rect.height(), ROW_H, "药丸高不是行高");
-        assert_ne!(radius, egui::CornerRadius::ZERO, "参考图那枚药丸是圆的，不是直角");
-        let row = side_text(&out, "文件状态");
+            .filter(|(fill, rect, _)| *fill == Color32::from_rgb(0xE8, 0xF1, 0xFD) && rect.max.x <= SIDEBAR_W + 0.5)
+            .collect();
+        assert_eq!(pills.len(), 1, "侧栏里该只有一枚浅蓝药丸（选中的那一条）：{pills:?}");
+        let (_, rect, radius) = pills[0];
+        assert_eq!((rect.min.x, rect.max.x), (SIDE_PILL_L, SIDE_PILL_R), "药丸左右缘不是 4..184");
+        assert_eq!(rect.height(), SIDE_ROW_H, "药丸高 {}，应该等于 §2 的子项行高 26", rect.height());
+        assert_eq!(radius.nw, SIDE_PILL_RAD, "§3.5 行/药丸的圆角是 6");
+        let row = side_galley(&out, "文件状态").3;
         assert!((rect.center().y - row.center().y).abs() < 0.6, "药丸没罩住选中的那一条");
     }
 
-    /// 每个分类都带一枚图标，子项不带（当前分支那颗蓝点是圆点，不住在图标格里）。
+    /// §2「底置筛选输入框 26pt」——**画出来**的那一格高 26、并贴着侧栏下沿。
+    /// `the_sidebar_numbers_are_the_design_md_values` 钉的是 `SIDE_FILTER_H = 8 + 26` 这个数，
+    /// 这一条钉的是"预算扣完真摆出一个 26 高的框"。两句都不许只靠自己：
+    /// 反向变异实测（2026-10-25）——把 `app.rs` 那句 `SIDE_FILTER_H - SIDE_FILTER_GAP` 的减法去掉
+    /// 只有这一条红（框成 34 高，常量还是 34，数字判据照样绿）；
+    /// 把 `SIDE_FILTER_H` 里那个 26 改成 24 则**两条一起红**（这里的 26 也是字面量，不跟常量走）。
     #[test]
-    fn every_sidebar_category_has_an_icon() {
+    fn the_sidebar_filter_box_is_26_tall_and_sits_at_the_bottom() {
         let out = frame(&mut loaded());
-        for label in ["工作区", "分支", "标签", "远端", "已贮藏"] {
-            assert!(icon_ink(&out, side_text(&out, label).center().y) > 0, "「{label}」那一行的图标格 18..38 是空的");
-        }
-        assert_eq!(icon_ink(&out, side_text(&out, "搜索").center().y), 0, "子项行里冒出了图标");
+        let boxes: Vec<Rect> = out
+            .shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Rect(r) if r.rect.max.x <= SIDEBAR_W && r.rect.min.y > WIN_H - STATUS_H - 60.0 => Some(r.rect),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(boxes.len(), 1, "侧栏最底下应该只有一格输入框：{boxes:?}");
+        let b = boxes[0];
+        assert_eq!(b.height(), 26.0, "§2 的底置筛选框高 26（实测 {}", b.height());
+        assert!(
+            (WIN_H - STATUS_H - SIDE_VPAD as f32 - b.max.y).abs() < 0.6,
+            "框没贴在侧栏下沿的内边距上：底 {} 而窗口内边距该落在 {}",
+            b.max.y,
+            WIN_H - STATUS_H - SIDE_VPAD as f32
+        );
     }
 
-    /// 当前分支前面那颗点是**蓝**的，落在 x=29.5。原来我们画的是黑色「●」字符，跟着文字列走。
+    /// §2「当前分支 = 蓝点 + 中黑字」：点画在文字列左边的空槽（x=12）、走主色 `ACCENT`，
+    /// 文字用真字重 `inter-medium`。旧实现画的是 (36,93,184) 那颗参考图蓝、而且和灰色药丸
+    /// 同时出现（选中=当前混成一档），现在两件事拆开：药丸跟选中走，蓝点跟当前分支走。
     #[test]
-    fn the_current_branch_is_marked_with_the_measured_blue_dot() {
+    fn the_current_branch_wears_the_accent_dot_and_medium_ink() {
         let out = frame(&mut loaded());
-        let cy = side_text(&out, "main").center().y;
+        let (_, _, family, row) = side_galley(&out, "main");
+        assert_eq!(family, "inter-medium", "当前分支没走 §2 的「中黑字」（真字重 medium）");
         let dots: Vec<Pos2> = out
             .shapes
             .iter()
             .filter_map(|c| match &c.shape {
-                egui::Shape::Circle(d) if d.fill == SIDE_DOT_C => Some(d.center),
+                egui::Shape::Circle(d) if d.fill == Color32::from_rgb(0x09, 0x69, 0xDA) => Some(d.center),
                 _ => None,
             })
             .collect();
         assert!(
-            dots.iter().any(|p| (p.x - SIDE_DOT_X).abs() < 0.01 && (p.y - cy).abs() < 0.6),
-            "当前分支前面没有落在 x={SIDE_DOT_X} 的蓝点：{dots:?}"
+            dots.iter().any(|p| (p.x - SIDE_DOT_X).abs() < 0.01 && (p.y - row.center().y).abs() < 0.6),
+            "当前分支前面没有落在 x={SIDE_DOT_X} 的主色圆点：{dots:?}"
         );
+        // 非当前的子项行（「搜索」）不许也长出蓝点：一个值两条出口只验一半是假绿。
+        let search = side_galley(&out, "搜索").3;
+        assert!(!dots.iter().any(|p| (p.y - search.center().y).abs() < 0.6), "「搜索」那一行也画了蓝点");
+        // 字重同一条路：反向变异实测——把 `side_row` 里那句 `if current` 拆掉、给每一行都上
+        // `medium`，上面「main 是 inter-medium」照样绿（它只验了一条出口）。这一条补上另一半。
+        let (_, _, search_family, _) = side_galley(&out, "搜索");
+        assert_ne!(search_family, "inter-medium", "「搜索」不是当前分支也中了中黑字：字重没按「当前」分流");
     }
 
     /// 提示（`note`）现在是底部 toast：悬在状态栏上方、水平居中、8 秒自己消失。
@@ -880,15 +1130,16 @@ use crate::viewport;
     /// 而上移。这条把「谁在窗底」钉死。
     #[test]
     fn the_status_bar_bands_the_bottom_edge() {
-        // 常量自己先钉住：26 是行节奏（= ROW_H）挑的、不是量出来的，哪天有了带状态栏的
-        // 参考图，改这里 + theme 注释，别让「量不到」滑成「随手改」。
-        assert_eq!(STATUS_H, 26.0, "状态栏高度：参考图裁掉了，按行节奏定的 26");
+        // §2 给状态栏记的是 **24pt**；那一档跟 S6-5（暂存带 + 状态栏）一起换，这里仍是
+        // 按行节奏定的 26。先把**数**钉在这儿，改的人就得同时改这条和 theme 的注释。
+        assert_eq!(STATUS_H, 26.0, "状态栏高度：§2 是 24，等 S6-5 落地；现在是按行节奏定的 26");
         let out = frame(&mut blank());
         let bottom = WIN_H - STATUS_H;
+        // 白底（§2「STATUS：白底 + 上 1px 分隔线」）。以前这里是 `TOOLBAR_BG` 那枚灰。
         assert_eq!(
             band(&rects(&out), Rect::from_min_max(pos2(0.0, bottom), pos2(WIN_W, WIN_H))),
-            TOOLBAR_BG,
-            "状态栏带"
+            Color32::from_rgb(0xFF, 0xFF, 0xFF),
+            "状态栏带（§2 BG_WINDOW）"
         );
         let staging_top = bottom - STAGING_H;
         assert_eq!(
@@ -934,8 +1185,8 @@ use crate::viewport;
             .into_iter()
             .filter(|(c, _, _)| *c == BADGE_MOD)
             .map(|(_, r, _)| r)
-            .find(|r| head.contains_rect(*r) && near(r.width(), BADGE_S) && near(r.height(), BADGE_S))
-            .expect("灰带里没有那枚状态色块（14×14，琥珀底）");
+            .find(|r| head.contains_rect(*r) && near(r.width(), 12.0) && near(r.height(), 12.0))
+            .expect("灰带里没有那枚状态色块（§3.2：12×12，改动那枚是琥珀底）");
         assert!(
             near(badge.min.x - head.min.x, DIFF_HEAD_PAD),
             "色块离带左缘 {}pt，参考图两张都是 {DIFF_HEAD_PAD}",
@@ -949,10 +1200,11 @@ use crate::viewport;
             badge.max.x
         );
         assert!(label.max.x <= head.max.x + 0.01, "文件名溢出灰带：右缘 {}", label.max.x);
+        // 预览稿 `.dp`（差异区顶上那条）取 `--text-secondary`，不是正文黑、也不是旧那枚近黑。
         assert_eq!(
             text_color(&out, "未暂存 · src/loose.rs", head.min.y..=head.max.y),
-            INK_STRONG,
-            "灰带里的文件名不是那近黑色"
+            Color32::from_rgb(0x59, 0x63, 0x6E),
+            "灰带里的文件名不是 §3.1 那枚次要灰"
         );
     }
 
@@ -961,7 +1213,8 @@ use crate::viewport;
     /// 以及两侧区间各自按 `start,count` 算（旧 8,4 → 8-11，新 8,5 → 8-12；把 count 当末行号就是 8-4/8-5）。
     #[test]
     fn a_hunk_row_reads_as_a_block_number_and_line_range() {
-        let t = texts(&frame(&mut loaded()));
+        let out = frame(&mut loaded());
+        let t = texts(&out);
         let hit = t.iter().find(|(s, _)| s.contains("块 1： 行 8-11（新 8-12）"));
         assert!(
             hit.is_some(),
@@ -969,6 +1222,17 @@ use crate::viewport;
             t.iter().map(|(s, _)| s).filter(|s| s.contains("行") || s.contains("@@")).collect::<Vec<_>>()
         );
         assert!(t.iter().all(|(s, _)| !s.contains("@@")), "帧里还留着原始的 @@ 头");
+        // §3.1 把 hunk 头的文字记在**辅助**那一档（预览稿 `.hk` 同色）。以前这条只问内容、
+        // 不问颜色：反向变异实测把 `src/ui/app.rs` 那句 `.color(TEXT_MUTED)` 换成 `TEXT_PRIMARY`，
+        // 全量 156 条全绿。历史面板那一格的颜色由
+        // `the_file_history_lists_the_commits_that_touched_the_file` 钉，这里钉主差异区这一格。
+        // `texts()` 给的是落笔点（左上），band 往下多留一行高，免得把行中心算漏。
+        let y = hit.unwrap().1.y;
+        assert_eq!(
+            text_color(&out, "块 1", (y - 2.0)..=(y + DIFF_ROW_H)),
+            Color32::from_rgb(0x8B, 0x94, 0x9E),
+            "hunk 头的文字没走 §3.1 的辅助档"
+        );
     }
 
     /// 差异区**一行 git 文件头都不许有**。参考图 `sourcetree-4.2.19-repo-window.png`：
@@ -1036,7 +1300,7 @@ use crate::viewport;
         // 先找到那一行本身（底色带），再问带里的两枚按钮。
         let row = rects(&out)
             .into_iter()
-            .filter(|(c, _)| *c == Color32::from_rgb(240, 244, 241))
+            .filter(|(c, _)| *c == Color32::from_rgb(0xF0, 0xF1, 0xF3))
             .map(|(_, r)| r)
             .find(|r| r.min.x > SIDEBAR_W + FILES_W - 1.0)
             .expect("差异区里没有 hunk 头那一条带");
@@ -1060,15 +1324,16 @@ use crate::viewport;
         }
     }
 
-    /// 上面那条用的字面量，得有个地方钉住它们是参考图量到的数——否则改常量把画的那头挪走，
-    /// 只有几何判据红，没人知道「本来该是多少」。
+    /// 上面那条用的字面量，得有个地方钉住它们是**量来 / 规定**的数——否则改常量把画的那头挪走，
+    /// 只有几何判据红，没人知道「本来该是多少」。hunk 按钮那几枚还是参考图量的
+    /// （§2 只说「命中 28pt」，那一档跟着差异带落地时再换）；`BG_INSET` 这枚现在归 DESIGN.md §3.1。
     #[test]
     fn the_hunk_button_constants_are_the_measured_reference_numbers() {
         assert_eq!((HUNK_BTN_W, HUNK_BTN_H), (55.0, 15.0), "参考图那两枚按钮 55×15");
         assert_eq!((HUNK_BTN_GAP, HUNK_BTN_EDGE), (9.0, 9.0), "两枚之间 9pt、离带右缘 9pt");
         assert_eq!(HUNK_BTN_STROKE, Color32::from_rgb(228, 232, 229), "1pt 描边");
         assert_eq!(HUNK_BTN_FG, Color32::from_rgb(109, 110, 109), "按钮上的灰字");
-        assert_eq!(HUNK_BG, Color32::from_rgb(240, 244, 241), "hunk 头那条带的底色");
+        assert_eq!(BG_INSET, Color32::from_rgb(240, 241, 243), "hunk 头那条带的底色（§3.1 BG_INSET）");
     }
 
     /// 已暂存那一格只有「取消暂存区块」，**没有**「放弃区块」：索引里的东西不会被这一格丢掉。
@@ -1152,7 +1417,7 @@ use crate::viewport;
             .into_iter()
             .filter(|(_, r, _)| {
                 (r.width() - r.height()).abs() < 1.0
-                    && r.width() > 13.0
+                    && r.width() > 11.5
                     && r.width() < 15.0
                     && r.min.x > SIDEBAR_W
                     && r.min.x < SIDEBAR_W + FILES_W
@@ -1167,7 +1432,8 @@ use crate::viewport;
                 .filter(|(_, r)| (r.center().y - name.center().y).abs() < 1.0)
                 .collect();
             assert!(!row.is_empty(), "「{path}」这一行左边没有方框：{squares:?}");
-            // 这一行该有一枚方框 + 一枚状态图标，两枚都是 13.5 见方，所以只能按 x 分档问。
+            // 这一行该有一枚方框（13.5）+ 一枚状态色块（§3.2 的 12pt），两枚尺寸不同档，
+            // 但都落在 11.5..15 这一筛里，所以只能按 x 分档问。
             let at = |x: f32| row.iter().any(|(_, r)| near(r.min.x - SIDEBAR_W, x));
             assert!(at(25.0), "「{path}」的方框不在离面板左缘 25 这一档（参考图 x 165）：{row:?}");
             assert!(at(47.0), "「{path}」的状态图标不在离面板左缘 47 这一档（参考图 x 188）：{row:?}");
@@ -1215,9 +1481,10 @@ use crate::viewport;
     /// 上面两条只认底色（`rounded()` 按「底色非透明」筛），删掉 `check_box` 里 `rect_stroke`
     /// 那行它们照样绿，所以描边单独问一次。
     ///
-    /// 这条钉的是「有没有」，钉不住颜色：变异实测把 `CHK_EDGE` 从 (190,190,190) 改成 (120,120,120)
-    /// 全绿——`rects()`/`rounded()` 只看 `fill`，而两张参考截图里一枚未勾选的方框都没有，
-    /// 这个灰是估的，等有真样本再钉数值。
+    /// 描边的**颜色**以前问不到（`rects()`/`rounded()` 只看 `fill`）。DESIGN.md §3.1 给了
+    /// 「控件描边」这一档之后就能问了：`stroked()` 连颜色一起返回，下面按中心点配对来问。
+    /// 反向变异两条：删掉 `rect_stroke` 那行 = 第一圈断言红；把它的颜色换成别的灰 =
+    /// 第二条红（旧写法换颜色全绿，那是一处登记过的假绿）。
     #[test]
     fn an_unchecked_box_has_a_border_and_a_checked_one_does_not() {
         let out = frame(&mut loaded());
@@ -1231,21 +1498,29 @@ use crate::viewport;
                 .map(|(_, r, _)| r)
                 .collect()
         };
-        let borders: Vec<Rect> =
-            stroked(&out).into_iter().map(|(_, r)| r).filter(|r| is_box(r) && in_pane(r)).collect();
+        let borders: Vec<(Color32, Rect)> = stroked(&out)
+            .into_iter()
+            .filter(|(_, r)| is_box(r) && in_pane(r))
+            .collect();
         let (white, blue) = (filled(Color32::WHITE), filled(CHK_BLUE));
         assert_eq!((white.len(), blue.len()), (3, 2), "这一帧该有三枚未勾选（未暂存分类标题 + 两行文件）和两枚勾上（已暂存分类标题 + 一行文件）的方框");
         for w in &white {
             assert!(
-                borders.iter().any(|b| (b.center() - w.center()).length() < 1.0),
+                borders.iter().any(|(_, b)| (b.center() - w.center()).length() < 1.0),
                 "{w:?} 这枚白方框没有描边，铺在白面板上等于没画"
             );
         }
         for b in &blue {
             assert!(
-                !borders.iter().any(|s| (s.center() - b.center()).length() < 1.0),
+                !borders.iter().any(|(_, s)| (s.center() - b.center()).length() < 1.0),
                 "{b:?} 这枚勾上的方框是实心的，参考图没有边框"
             );
+        }
+        // §3.1「输入框 / 按钮 / 未勾选方框的描边」= `BORDER_STRONG` #D0D5DD，字面值写在这儿。
+        let edge = Color32::from_rgb(0xD0, 0xD5, 0xDD);
+        assert_eq!(borders.len(), white.len(), "方框描边的枚数和白底方框对不上：{borders:?}");
+        for (c, r) in &borders {
+            assert_eq!(*c, edge, "{r:?} 那枚未勾选方框的描边不是 §3.1 那一档");
         }
     }
 
@@ -1280,12 +1555,12 @@ use crate::viewport;
                 "「{path}」离面板左缘 {}，没有方框那一栏该收到 28.5（和分类标题同列）",
                 name.min.x - SIDEBAR_W
             );
-            // 这一行只该有一枚方块大的东西：**状态色块**，在方框那一档（+8）。
+            // 这一行只该有一枚方块大的东西：**状态色块**（§3.2 的 12pt），在方框那一档（+8）。
             let squares: Vec<(Color32, Rect)> = rounded(&out)
                 .into_iter()
                 .filter(|(_, r, _)| {
                     (r.width() - r.height()).abs() < 1.0
-                        && r.width() > 13.0
+                        && r.width() > 11.5
                         && r.width() < 15.0
                         && r.min.x > SIDEBAR_W
                         && r.min.x < SIDEBAR_W + FILES_W
@@ -1300,9 +1575,11 @@ use crate::viewport;
         }
     }
 
-    /// 窗口缩到**地板尺寸**时，不许有任何两块看得见的文字互相压着。尺寸从 `MIN_W`/`MIN_H`
-    /// 起步：把这两个常量往下调，这一条立刻红（765 那一档实测「main ↑2 ↓0」压住 ⊕ 1.9pt）。
-    /// 它钉的是「布局开始撞车的宽度」和「窗口允许的宽度」是同一个数，不是常量自己比大小。
+    /// 窗口缩到**地板尺寸**时，不许有任何两块看得见的文字互相压着。
+    /// **它守的是"地板窗口不撞字"，不守 `MIN_W` 这个数**——2026-10-25 实测：`MIN_W` 降到 800
+    /// 这一条还是绿的，760 才红（旧顶栏带中文标签时是 765 撞；S6-2 换成 §4.1 的 28pt 纯图标之后
+    /// 让出了约 40pt 的空档）。所以 860 由 `the_header_numbers_are_the_design_md_values` 的
+    /// 字面值钉，这一条只负责"地板那一帧是干净的"。别把这两条的职责混着写。
     #[test]
     fn no_visible_text_overlaps_at_the_smallest_allowed_window() {
         let mut app = many_unstaged(24);
@@ -1336,51 +1613,188 @@ use crate::viewport;
     /// 地板这条线必须真的交给窗口，不然上面那条只是在测一个没人用的常量。
     /// `viewport()` 拆成函数就是为了让判据读得到——无头画布管不了窗口约束。
     #[test]
-    fn the_window_itself_is_floored_at_the_measured_size() {
+    fn the_window_itself_is_floored_at_the_spec_size() {
         let v = viewport();
         assert_eq!(v.min_inner_size, Some(vec2(MIN_W, MIN_H)), "窗口的地板没交给窗口系统：{:?}", v.min_inner_size);
-        assert_eq!(v.inner_size, Some(vec2(WIN_W, WIN_H)), "窗口不是按参考图的尺寸开的：{:?}", v.inner_size);
+        assert_eq!(v.inner_size, Some(vec2(WIN_W, WIN_H)), "窗口不是按 §2 那张预览稿的尺寸开的：{:?}", v.inner_size);
     }
 
-    /// 参考图那一行 52pt 里同时有红绿灯、仓库名、11 枚按钮 —— 它**就是标题栏**。
+    /// §2 那条 46pt 的带里同时有红绿灯、仓库 tab、分支、动作按钮 —— 它**就是标题栏**。
     /// 所以窗口必须配成"内容铺到标题栏底下、系统标题不画"，否则我们是在标题栏下面
-    /// 又画一条带，窗口顶上白占 28pt，而且仓库名会被红绿灯压住。
+    /// 又画一条带，窗口顶上白占一条，而且第一枚 tab 会被红绿灯压住。
     /// 这三条开关在 `egui::ViewportBuilder` 上是可读字段（eframe 把它们映射给 winit 的
     /// macOS 扩展），所以这条判据读的是配置对象，不是帧。
     #[test]
     fn the_toolbar_band_is_the_window_titlebar() {
         let v = viewport();
         assert_eq!(v.titlebar_shown, Some(false), "标题栏还单独占一条：内容没铺到标题栏底下");
-        assert_eq!(v.fullsize_content_view, Some(true), "内容没开 full-size：工具栏会在标题栏下面另起一行");
-        assert_eq!(v.title_shown, Some(false), "系统标题还在画：会和我们左对齐的仓库名撞成两个标题");
+        assert_eq!(v.fullsize_content_view, Some(true), "内容没开 full-size：顶栏会在标题栏下面另起一行");
+        assert_eq!(v.title_shown, Some(false), "系统标题还在画：会和我们左对齐的仓库 tab 撞成两个标题");
     }
 
-    /// 红绿灯由操作系统画在 x 20..72、y 20..32（两张参考图都是这个数），盖在我们内容上面。
-    /// 所以那一行的左边 72pt 里**不许有任何文字**，仓库名必须从量出来的 91.5pt 起。
+    /// 红绿灯是操作系统画的，占 x 20..72（§2 + 预览稿 `.lights`：三枚 12pt 圆、间距 8），
+    /// 盖在我们内容上面。所以顶栏左边 **92pt 里不许有任何东西**，第一枚胶囊 tab 从 92 起。
     #[test]
     fn nothing_is_drawn_under_the_traffic_lights() {
-        // 带高单独钉一次：52 是两张参考图逐行扫底色扫出来的（y0..51 是 244,249,246，
-        // y52 是 202,206,203 的分隔线）。不写这一句的话 `TOOLBAR_H` 改成多少都没人管 ——
-        // 下面所有断言都拿它当尺子，那是**常量自比**，不算判据。
-        assert_eq!(TOOLBAR_H, 52.0, "参考图标题栏那一条实测 52pt");
-        let out = frame(&mut loaded());
+        // 带高 `HEADER_H = 46` 由 `the_header_numbers_are_the_design_md_values` 钉字面值；
+        // 下面所有断言拿它当尺子，所以那条不能省。
+        let mut app = loaded();
+        // 夹具默认**没往书签列表里放仓库**（`repos` 是空的），所以这里补一本：
+        // 这一条要钉的是"左组第一枚 tab 起在 92"，没有 tab 就只剩那枚幽灵按钮，钉不到点上。
+        app.repos.push(Repo {
+            id: None,
+            path: "/other".to_owned(),
+            name: "comic".to_owned(),
+            added_at: None,
+            last_fetched_at: None,
+        });
+        let out = frame(&mut app);
         let vis = visible_texts(&out);
         assert!(vis.len() > 40, "这一帧大概什么都没画");
         let under: Vec<&String> = vis
             .iter()
-            .filter(|(_, r)| r.min.y < TOOLBAR_H && r.min.x < TRAFFIC_RIGHT)
+            .filter(|(_, r)| r.min.y < HEADER_H && r.min.x < TRAFFIC_RIGHT)
             .map(|(s, _)| s)
             .collect();
         assert!(under.is_empty(), "红绿灯底下有文字：{under:?}");
-        let name = vis
-            .iter()
-            .find(|(s, _)| s.ends_with(" (Git)"))
-            .expect("仓库名没画出来");
+        // 左组第一项现在是**仓库胶囊 tab**（以前是「xxx (Git)」那行标题；§2 删了标题，
+        // tab 自己就是仓库名）。胶囊的底从 92 起，里面的字再让 11 的内边距（`.tab{padding:3px 11px}`）。
+        let tab = vis.iter().find(|(s, _)| **s == *"comic").expect("顶栏没有第一枚仓库 tab");
         assert!(
-            (name.1.min.x - TITLE_LEFT).abs() < 1.0,
-            "仓库名左沿 {:+.1}pt，量出来应该是 {TITLE_LEFT}pt",
-            name.1.min.x
+            (tab.1.min.x - 103.0).abs() < 1.0,
+            "第一枚 tab 的文字左沿 {:+.1}pt，应该是 inset 92 + 内边距 11 = 103",
+            tab.1.min.x
         );
+    }
+
+    /// §2 的胶囊 tab：选中那一枚**铺主色浅底 + 深字 + 真字重**，高 26、圆角 = 半高、
+    /// 底从 inset 92 起；未选中的**不铺底**，只落次要灰字。
+    /// 反向变异的靶子：把 `repo_tab` 的 `fill` 换回旧的 `Color32::WHITE`（顶栏同色，等于没选中）、
+    /// 把 `CornerRadius::same(TAB_PILL_R)` 换成 `ZERO`（变方角）、把 `ACCENT_INK` 换成
+    /// `TEXT_PRIMARY`、把 `semibold_family()` 摘掉——这四处分各红一条。
+    #[test]
+    fn the_active_repo_tab_is_an_accent_capsule() {
+        let mut app = loaded();
+        // 夹具的 `repos` 是空的（`self.repo` 只指着 `/fixture`）：补两本，第一本对上当前仓库，
+        // 这样"选中那一枚"和"未选中那一枚"在同一帧里都有。
+        app.repos.push(Repo { id: None, path: "/fixture".to_owned(), name: "gitx".to_owned(), added_at: None, last_fetched_at: None });
+        app.repos.push(Repo { id: None, path: "/other".to_owned(), name: "comic".to_owned(), added_at: None, last_fetched_at: None });
+        let out = frame(&mut app);
+        let band = 0.0..=HEADER_H;
+        let pills: Vec<(Color32, Rect, egui::CornerRadius)> = rounded(&out)
+            .into_iter()
+            .filter(|(_, r, _)| r.min.y >= 0.0 && r.max.y <= HEADER_H)
+            .collect();
+        assert_eq!(pills.len(), 1, "顶栏铺底的胶囊只该有选中那一枚（未选中不铺底）：{pills:?}");
+        let (fill, rect, radius) = pills[0];
+        assert_eq!(fill, Color32::from_rgb(0xE8, 0xF1, 0xFD), "选中胶囊的底色不是 §3.1 的 ACCENT_SOFT");
+        assert!((rect.height() - 26.0).abs() < 1.0, "胶囊高 {}，§2 写的是 26", rect.height());
+        assert!((rect.min.x - 92.0).abs() < 1.0, "第一枚胶囊的左沿 {}，§2 的红绿灯 inset 是 92", rect.min.x);
+        assert_eq!(radius.nw, 13, "圆角不是半高（§2 的 999 就是胶囊）");
+        assert_eq!(text_color(&out, "gitx", band.clone()), Color32::from_rgb(0x05, 0x50, 0xAE), "选中的仓库名不是 §3.1 的 ACCENT_INK");
+        assert_eq!(text_family(&out, "gitx", band.clone()), "inter-semibold", "选中的仓库名没走真字重（§3.4 的 600）");
+        assert_eq!(text_color(&out, "comic", band), Color32::from_rgb(0x59, 0x63, 0x6E), "未选中的仓库名不是 §3.1 的次要档");
+    }
+
+    /// §4.1：顶栏那组动作按钮是**纯图标**的 28×28、图标 14px、整组贴右沿让 12。
+    /// 反向变异：把 `icon_button` 里旧的中文标签画回去 → 「顶栏还写着『提交』」红；
+    /// 把 `ICON_PX` 改回 13 → 字号那条红；把 `ICON_BTN`(28) 或 `ICON_BTN_GAP`(2) 改了 →
+    /// 中心距那条红；把 `HEADER_RIGHT` 从 12 改回旧的 21 → 贴右沿那条红。
+    ///
+    /// **标签那一条第一版是假绿，变异当场被抓**：它按 `all_text_rects` 筛带（中心点在 0..=46
+    /// 才算顶栏），而 28 的按钮框正好占满内容高（`46 − 9 − 9`），标签画在框底下时中心落在 47——
+    /// 越了带、屏幕上却照样看得见。现在按 `min.y < HEADER_H` 筛，并先钉「筛子收满了东西」。
+    #[test]
+    fn the_action_group_is_icon_only_and_flush_right() {
+        let out = frame(&mut loaded());
+        // 「顶栏里」= 文字矩形**起在** 46pt 那条线上面。按中心点筛会漏：28 的按钮框正好占满
+        // 内容高（46 − 9 − 9），标签画在框底下时中心落在 47，越了带却照样看得见。
+        let in_header: Vec<String> = visible_texts(&out)
+            .iter()
+            .filter(|(_, r)| r.min.y < HEADER_H)
+            .map(|(s, _)| s.clone())
+            .collect();
+        // 先钉这条筛子**确实在收东西**（11 枚图标 + 分支名 + 计数），否则下面的空命中
+        // 可能只是"什么都没筛到"的假绿。
+        assert!(in_header.len() >= 12, "顶栏只筛出 {} 块文字，这条判据的筛子没生效", in_header.len());
+        for (_, label, _) in TOOLS.iter() {
+            assert!(
+                !in_header.iter().any(|t| t.starts_with(label)),
+                "顶栏还写着「{label}」：§4.1 的按钮是纯图标，中文归 tooltip"
+            );
+        }
+        let band = 0.0..=HEADER_H;
+        // ⊙ = 最右那枚（设置）。图标 14px（§4.1）。
+        assert_eq!(text_size(&out, "⊙", band.clone()), 14.0, "图标的字号不是 §4.1 的 14px");
+        let last = all_text_rects(&out, band.clone(), &["⊙"]).into_iter().next().expect("顶栏没有 ⊙ 那枚图标").1;
+        // 28 的命中框贴右沿让 12 → 框中心在 1050 − 12 − 14 = 1024，图标画在框正中。
+        assert!((last.center().x - 1024.0).abs() < 1.0, "最右一枚图标的中心 x={}，应该贴右沿让 12", last.center().x);
+        // 相邻两枚的中心距 = 28 + 2（`.btns{gap:2}`）。⊙ 左边那枚是 ▣。
+        let prev = all_text_rects(&out, band.clone(), &["▣"]).into_iter().next().expect("顶栏没有 ▣ 那枚图标").1;
+        assert!((last.center().x - prev.center().x - 30.0).abs() < 1.0, "按钮间距不是 28+2：{}", last.center().x - prev.center().x);
+    }
+
+    /// §2 的分支那一格（`.branch-chip`）：分支名 12px 次要灰，`↑n ↓m` 同字号走正文档 + 真字重。
+    /// `main` 这一帧在顶栏、侧栏、状态栏**三处**都出现，`↑2 ↓0` 也在顶栏和状态栏各一处——
+    /// 所以这三条全按 y 带筛，只问顶栏那 46pt。
+    #[test]
+    fn the_branch_chip_reads_name_then_counts() {
+        let out = frame(&mut loaded());
+        let band = 0.0..=HEADER_H;
+        assert_eq!(text_color(&out, "main", band.clone()), Color32::from_rgb(0x59, 0x63, 0x6E), "分支名不是 §3.1 的次要档");
+        assert_eq!(text_size(&out, "main", band.clone()), 12.0, "分支名不是 §2 的 12px");
+        assert_eq!(text_color(&out, "↑2 ↓0", band.clone()), Color32::from_rgb(0x1F, 0x23, 0x28), "↑↓ 计数不是 §3.1 的正文档");
+        assert_eq!(text_family(&out, "↑2 ↓0", band), "inter-semibold", "↑↓ 计数没走真字重（§3.4：数字归 600 那档）");
+    }
+
+    /// §2 那句「白底 + 下 1px 分隔线」：顶栏和内容区之间只有**一条** `BORDER_SUBTLE` 的
+    /// 横线，横贯整窗、贴着带的下沿。底色那条判据（`bands_match_the_design_spec`）问的是
+    /// "带是不是白的"，问不到这条线——删掉 `toolbar` 末尾那句 `line_segment`，
+    /// 只有这一条会红。
+    #[test]
+    fn the_header_divides_itself_with_a_1px_line() {
+        let out = frame(&mut blank());
+        let lines: Vec<f32> = out
+            .shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::LineSegment { points, stroke }
+                    if stroke.color == BORDER_SUBTLE && stroke.width == 1.0
+                        && (points[0].y - points[1].y).abs() < 0.01
+                        && points[0].y < HEADER_H
+                        && points[0].x <= 1.5
+                        && points[1].x >= WIN_W - 1.5 => Some(points[0].y),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines.len(), 1, "顶栏下沿该有且只有一条横贯整窗的分隔线：{lines:?}");
+        assert!((lines[0] - 45.5).abs() < 1.0, "分隔线画在 y={}，应该贴着 46 那条带的下沿", lines[0]);
+    }
+
+    /// 「＋ 添加仓库」那一枚是**幽灵**胶囊（预览稿 `.tab.add`）：不铺底、只描一圈
+    /// `BORDER_STRONG`、字走 §3.1 的辅助档 12px。它是空书签列表里**唯一**的入口，
+    /// 所以"画得轻"不能等于"没画"。
+    /// 反向变异：把 `ghost_tab` 的 `Stroke::new(1.0, BORDER_STRONG)` 换成 `Stroke::NONE`
+    /// （= 描边没了，`stroked()` 那一格空）；把颜色换成 `BORDER_SUBTLE`；把 12 换成 13；
+    /// 把 `TEXT_MUTED` 换成 `TEXT_SECONDARY`——四条各红一次。
+    /// spec 写的是 `1px dashed`：egui 0.37 的圆角矩形描边给不了虚线，这条只钉"有一圈实线"，
+    /// 虚线那一档作为已知让步登记在 PROCESS。
+    #[test]
+    fn the_add_repo_entry_is_a_ghost_pill() {
+        // 空列表那一帧：顶栏左组只有这一枚，描边不会有第二块来掺。
+        let out = frame(&mut blank());
+        let pills: Vec<(Color32, Rect)> = stroked(&out)
+            .into_iter()
+            .filter(|(_, r)| r.min.y >= 0.0 && r.max.y <= HEADER_H)
+            .collect();
+        assert_eq!(pills.len(), 1, "顶栏该只有一枚描边胶囊：{pills:?}");
+        let (edge, rect) = pills[0];
+        assert_eq!(edge, Color32::from_rgb(0xD0, 0xD5, 0xDD), "幽灵 tab 的描边不是 §3.1 的 BORDER_STRONG");
+        assert!((rect.height() - 26.0).abs() < 1.0, "幽灵 tab 高 {}，§2 的胶囊都是 26", rect.height());
+        assert!((rect.min.x - 92.0).abs() < 1.0, "空列表时它就该顶在 inset 92 起：{rect:?}");
+        let band = 0.0..=HEADER_H;
+        assert_eq!(text_color(&out, "＋ 添加仓库", band.clone()), Color32::from_rgb(0x8B, 0x94, 0x9E), "幽灵 tab 的字不是 §3.1 的辅助档");
+        assert_eq!(text_size(&out, "＋ 添加仓库", band), 12.0, "幽灵 tab 的字不是 `.tab.add` 的 12px");
     }
 
     /// 文件多到一屏装不下时，提交框**必须还在窗口里**。真窗口目视抓到过一次（2026-10-20）：
@@ -1397,16 +1811,20 @@ use crate::viewport;
         assert!(!has("src/overflow/23.rs"), "第 24 行也画了出来：列表根本没滚");
     }
 
-    /// 参考图的侧栏**没有**折叠三角，也**没有**「（3）」计数。这两样是凭 SourceTree 3 的印象加的。
+    /// §2 把计数从"不许有"改成了"必须有"（分组头 = 11px 灰字 + **右对齐计数**），所以这条
+    /// 从上一代的「侧栏没有计数」翻了过来：它现在钉的是**括号计数**和**字符画的三角/黑点**
+    /// 都不许回来——计数只能是指甲盖右边那枚裸数字（`the_sidebar_group_headers_carry_a_right_aligned_count`
+    /// 钉它的字号、颜色和落位），当前分支只能用 §2 那颗真圆点形状。
     #[test]
-    fn the_sidebar_has_no_counts_or_disclosure_triangles() {        let out = frame(&mut loaded());
-        let t: Vec<String> = all_text_rects(&out, TOOLBAR_H..=WIN_H, &[""])
+    fn the_sidebar_has_no_parenthesised_counts_or_character_glyph_markers() {
+        let out = frame(&mut loaded());
+        let t: Vec<String> = all_text_rects(&out, HEADER_H..=WIN_H, &[""])
             .into_iter()
             .filter(|(_, r)| r.min.x < SIDEBAR_W)
             .map(|(s, _)| s)
             .collect();
-        assert!(t.iter().all(|s| !s.contains('（')), "侧栏标题里还有计数：{t:?}");
-        assert!(t.iter().all(|s| !s.contains('▼') && !s.contains('●')), "侧栏还在画三角/黑点：{t:?}");
+        assert!(t.iter().all(|s| !s.contains('（')), "侧栏标题里还挂着括号计数「（3）」：{t:?}");
+        assert!(t.iter().all(|s| !s.contains('▼') && !s.contains('●')), "侧栏还在用字符画三角/黑点：{t:?}");
     }
 
     /// 行距判据：`show_rows` 的周期 = row_height + item_spacing.y，所以 `style()` 把
@@ -1466,6 +1884,37 @@ use crate::viewport;
         // 整行铺底：宽度必须吃掉差异区那一整块，只铺到文字末尾就不是 SourceTree 那个观感。
         let wide = r.iter().find(|(c, _)| *c == ADD_BG).map(|(_, rc)| *rc).expect("没有增行底色");
         assert!((wide.max.x - WIN_W).abs() < 1.5, "增行底色右边没收齐到窗口：{wide:?}");
+    }
+
+    /// §3.1 把增/删两行记成**底 + 字一对**（预览稿 `.dl.a`/`.dl.d` 的 `background` 与 `color` 同批给出）。
+    /// 上面那条只问底色；字色没人问的话，把 `ADD_FG`/`DEL_FG` 从两处画字的地方摘掉、恢复成正文黑，
+    /// 全量 153 条照样绿（这一批的反向变异实测过）——绿得毫无意义。
+    /// 两边都写**字面量**：拿 `ADD_FG` 自己比，改常量就是两头一起挪。
+    #[test]
+    fn added_and_deleted_lines_carry_their_own_text_colour() {
+        let out = frame(&mut loaded());
+        let top = WIN_H - STATUS_H - STAGING_H;
+        // 取差异区里**第一条**那种底色的行，拿到它的 y 档；补丁夹具里增行在前、删行在后各有一条。
+        let band = |bg: Color32| {
+            let mut ys: Vec<f32> = rects(&out)
+                .into_iter()
+                .filter(|(c, rc)| *c == bg && rc.min.x > SIDEBAR_W + FILES_W - 1.0 && rc.min.y > top)
+                .map(|(_, rc)| rc.center().y)
+                .collect();
+            ys.sort_by(|a, b| a.total_cmp(b));
+            let y = *ys.first().expect("差异区里没有那一行底色带");
+            (y - DIFF_ROW_H / 2.0 + 1.0)..=(y + DIFF_ROW_H / 2.0 - 1.0)
+        };
+        assert_eq!(
+            text_color(&out, "+加上的一行", band(ADD_BG)),
+            Color32::from_rgb(0x1A, 0x7F, 0x37),
+            "增行的字色（§3.1 ADD_FG）"
+        );
+        assert_eq!(
+            text_color(&out, "-删掉的一行", band(DEL_BG)),
+            Color32::from_rgb(0xCF, 0x22, 0x2E),
+            "删行的字色（§3.1 DEL_FG）"
+        );
     }
 
     /// 行距判据的**动态那一半**。`Ui::put` 会把父游标倒回行中间（见 `fix_pitch`），
@@ -1700,7 +2149,7 @@ use crate::viewport;
         let ctx = egui::Context::default();
         style(&ctx);
         let mut app = filled(200, &[]);
-        let over = pos2((SIDEBAR_W + WIN_W) / 2.0, TOOLBAR_H + 120.0);
+        let over = pos2((SIDEBAR_W + WIN_W) / 2.0, HEADER_H + 120.0);
         let btn = |pressed: bool| egui::Event::PointerButton {
             pos: over,
             button: egui::PointerButton::Primary,
@@ -2178,10 +2627,15 @@ use crate::viewport;
         locate_card(&ctx, app, label, true, true).is_some()
     }
 
-    /// 从 tab 条上那枚「添加仓库」端出卡片。
+    /// 从顶栏那枚幽灵 tab「＋ 添加仓库」端出卡片（§2：入口住在 46pt 那条带里，旧的第二行
+    /// tab 条已经并掉了）。字面以 `＋ ` 开头，所以按**包含**找、并且**问一嘴在不在顶栏**。
     fn open_add_card(app: &mut Gitx) {
-        assert!(click_text(app, "添加仓库"), "tab 条上没有「添加仓库」");
-        assert!(app.modal.is_some(), "点了「添加仓库」没开出卡");
+        let ctx = egui::Context::default();
+        style(&ctx);
+        let at = locate_has(&ctx, app, "添加仓库").expect("顶栏上没有「＋ 添加仓库」那枚幽灵 tab");
+        assert!(at.y < HEADER_H, "「＋ 添加仓库」不在顶栏那 46pt 里：y={}", at.y);
+        click_at(&ctx, app, at);
+        assert!(app.modal.is_some(), "点了「＋ 添加仓库」没开出卡");
     }
 
     /// ⌘/Ctrl+Enter。修饰键要**单独发一条 `ModifiersChanged`**——egui 的 `i.modifiers` 只由那条
@@ -2962,17 +3416,21 @@ use crate::viewport;
         flush("描述", x("描述", head()), [(subject[0], "短"), (subject[1], "一条长得多的…"), (subject[2], "中等长度的一条")]);
         flush("作者", x("作者", head()), [(author[0], "包融"), (author[1], "baorong <…>"), (author[2], "R")]);
         flush("日期", x("日期", head()), [(date[0], "第 1 行"), (date[1], "第 2 行"), (date[2], "第 3 行")]);
-        // 绝对位置钉在**量出来的字面量**上：参考图（1050pt 宽）四条列边线 198 / 275 / 739 / 929，
-        // 表头四个词的左缘 202.5 / 280 / 744 / 934，数据跟自己的表头同一条竖线起笔。
+        // 绝对位置钉在**字面量**上：表头四个词的左缘、数据跟自己的表头同一条竖线起笔。
         // 拿 `COL_*` 加加减减比给自己看等于没判——这一批间距从 8 改成 5，那种写法照样绿。
-        assert_eq!(sha[0], 203.0, "提交号的左缘（边线 198 + 内缩 5）");
-        assert_eq!(subject[0], 280.0, "描述列的左缘（边线 275 + 内缩 5）");
+        //
+        // 前两枚 250 / 327 = 旧实测值 203 / 280 **加上侧栏从 141 搬到 §2 的 188 那 47pt**
+        // （`the_header_has_the_measured_column_rules` 里同批搬的 245 / 322 各加内缩 5）。
+        // 后两枚不动：作者、日期那两列从右缘往左定，和侧栏宽无关。
+        // §2 真正的日志列布局（图 48 | 提交信息 | 作者 96 | 日期 78、`COL_SHA` 删掉）归 S6-4。
+        assert_eq!(sha[0], 250.0, "提交号的左缘（边线 245 + 内缩 5）");
+        assert_eq!(subject[0], 327.0, "描述列的左缘（边线 322 + 内缩 5）");
         assert_eq!(author[0], 744.0, "作者列的左缘（边线 739 + 内缩 5）");
         assert_eq!(date[0], 934.0, "日期列的左缘（边线 929 + 内缩 5）");
         // 行距与表头高也照抄实测值（数据行 130→156→182 = 26，表头 79..103 = 24）：
         // 上面那些判据全是「间距 == ROW_H」，把 ROW_H 改回旧的 21 它们一个都不会红。
         assert_eq!(ROW_H, 26.0, "行距不是参考图量的 26pt");
-        assert_eq!(HEADER_H, 24.0, "表头那一条不是参考图量的 24pt");
+        assert_eq!(LOG_HEAD_H, 24.0, "表头那一条不是参考图量的 24pt");
     }
 
     /// 描述列开头那一串药丸。参考图实测（logical pt）：药丸高 15、浅蓝 `#D5E5FD` 配 `#AAAAAA` 灰边，
@@ -3043,21 +3501,28 @@ use crate::viewport;
         assert!(all_text_rects(&out, row2, &["超前"]).is_empty(), "这一行没有超前数，就不该出那枚胶囊");
     }
 
-    /// 虚拟行（工作区）那一条：整行灰底 `#DCDCDC`、图列里一枚**空心环**、环下面接到第一条提交、
-    /// 日期是「今天 HH:MM」。参考图这一行**没被选中也是灰的**，所以先把选中挪走——
-    /// 选中那格铺的是 SELECTED，灰底量不到了。
+    /// 虚拟行（工作区）那一条：整行浅灰底、图列里一枚**空心环**、环下面接到第一条提交、
+    /// 日期是「今天 HH:MM」。底色是 §3.1 的 `BG_INSET` `#F0F1F3`（§4「虚拟行（未提交）浅灰底整行」）；
+    /// 旧的 `#DCDCDC` 实测值随灰阶 token 一起作废。
+    /// 参考图这一行**没被选中也是灰的**，所以先把选中挪走——选中那格铺的是 SELECTED，灰底量不到了。
     #[test]
     fn the_uncommitted_row_is_a_grey_band_and_a_hollow_ring() {
         let mut app = loaded();
         // 直接挪字段，不走 `select()`：那会对着假路径 `/fixture` 开线程跑 git，判据要的不是它。
         app.sel = Sel::Commit(0);
         let out = frame(&mut app);
+        // 收窄到「整行铺满」的那几条：§3.1 里 `BG_INSET` 一处三色（输入底 / hunk 头 / 虚拟行共用），
+        // 不按宽度筛的话 diff 面板那条 hunk 头也会计进来，「只该有一条」就成了假红。
         let grey: Vec<Rect> = rects(&out)
             .into_iter()
-            .filter(|(c, _)| *c == UNCOMMITTED_BG)
+            .filter(|(c, r)| {
+                *c == BG_INSET
+                    && (r.min.x - SIDEBAR_W).abs() < 1.5
+                    && (r.max.x - WIN_W).abs() < 1.5
+            })
             .map(|(_, r)| r)
             .collect();
-        assert_eq!(grey.len(), 1, "灰底只该铺虚拟行那一条：{grey:?}");
+        assert_eq!(grey.len(), 1, "整行宽的灰底只该铺虚拟行那一条：{grey:?}");
         // 而且就在日志第一条那一格（紧贴表头下沿）：跑到别的带子里就不是它了。
         let top = *head_band(&out).end();
         assert!(
@@ -3065,11 +3530,8 @@ use crate::viewport;
             "灰底不在日志第一条（表头下沿 {top}）：{:?}",
             grey[0]
         );
-        assert!(
-            (grey[0].min.x - SIDEBAR_W).abs() < 1.5 && (grey[0].max.x - WIN_W).abs() < 1.5,
-            "灰底没整行铺满：{:?}",
-            grey[0]
-        );
+        // 「整行铺满」已经由上面那个 filter 的两条边负责（改成铺半行，`grey.len()` 就归 0），
+        // 这里不再拿同样的两个数重断一遍。
         let y = grey[0].center().y;
         assert_eq!(rings(&out), vec![pos2(lane_x(SIDEBAR_W, 0), y)], "环不在第 0 道那一格");
         // 环下面那根竖线：从环心接到行底，颜色跟着第一条提交的车道。
@@ -3146,7 +3608,7 @@ use crate::viewport;
         let mut horizontal: Vec<f32> = Vec::new();
         for c in &out.shapes {
             if let egui::Shape::LineSegment { points, stroke } = &c.shape {
-                if stroke.color != RULE || stroke.width != 1.0 {
+                if stroke.color != BORDER_SUBTLE || stroke.width != 1.0 {
                     continue;
                 }
                 let (a, b) = (points[0], points[1]);
@@ -3163,49 +3625,62 @@ use crate::viewport;
             }
         }
         vertical.sort_by(|a, b| a.0.total_cmp(&b.0));
-        // 这里**故意写字面量**：判据钉的是量出来的那四条边线，拿 `COL_*` 比 `COL_*` 等于没判。
+        // 这里**故意写字面量**：判据钉的是列边线落在哪，拿 `COL_*` 比 `COL_*` 等于没判。
+        //
+        // **198 / 275 这两条已经作废**（原值是参考图在侧栏 141 上量的）：S6-3 把侧栏换成 §2 的
+        // **188**，日志带整体右移 47，所以这两条现在落在 **245 / 322**。739 / 929 是从右往左定的
+        // （日期、作者列贴右缘），不受侧栏宽影响，所以数没动。
+        // 这一档**不是** §2 的日志列布局（图 48 | 提交信息 | 作者 96 | 日期 78）——那要等 S6-4
+        // 连同 `COL_SHA` 一起删。这里只是"跟着上一带搬数值、备注欠账"：搬的是实测的 47，
+        // 不是为了让测试变绿而放宽容差。
         assert_eq!(
             vertical,
-            vec![(198.0, RULE_H), (275.0, RULE_H), (739.0, RULE_H), (929.0, RULE_H)],
-            "表头的列边线跟参考图不符（宽 1、高 {RULE_H}、四条在 198/275/739/929）"
+            vec![(245.0, RULE_H), (322.0, RULE_H), (739.0, RULE_H), (929.0, RULE_H)],
+            "表头的列边线不符（宽 1、高 {RULE_H}、四条在 245/322/739/929；前两条随侧栏 188 搬过，见上）"
         );
         assert_eq!(horizontal.len(), 2, "表头该有上下两条横线把它切出来：{horizontal:?}");
         // 横线贴着行的**边框**（rect 86..110），而 `head_band` 是从文字中线量的（97.5），
         // 差半个像素是 galley 取整——所以这里量两条线自己张开的高度，不跟带子比。
         horizontal.sort_by(|a, b| a.total_cmp(b));
         assert!(
-            (horizontal[1] - horizontal[0] - HEADER_H).abs() < 1.5
+            (horizontal[1] - horizontal[0] - LOG_HEAD_H).abs() < 1.5
                 && ((horizontal[0] + horizontal[1]) / 2.0 - mid).abs() < 1.5,
             "两条横线不是贴着表头那一条的上下边框：{horizontal:?}（带 {top}..{bottom}，中线 {mid}）"
         );
     }
 
-    /// 日志四列的字色是量出来的 `(38,38,38)`，不是浅灰。这一条把「颜色」和「列宽/字重」
-    /// 分开钉：SourceTree 不靠把提交号与日期调淡来分主次（我们原来那么做过，并排一比就显出来了）。
+    /// DESIGN.md §3.4 的层级：提交信息走正文 `TEXT_PRIMARY`，提交号 / 作者 / 日期 / 表头走
+    /// 次要 `TEXT_SECONDARY`。旧写法是四列同色（(38,38,38)）、「只靠列宽和字重分主次」，
+    /// spec 把这条换掉了（原则②「信息靠层级，用字号字重**和灰度**拉开」）。
+    /// 虚拟行**不再取更深一档的字色**（§6：`INK_STRONG` → 加粗），所以这里问两件事：
+    /// 它是正文色，**并且**它真的换了字面（`inter-semibold`）——只改颜色不改字面，
+    /// 强调就等于没落地，而 `text_color` 那条照样绿。
     #[test]
-    fn log_text_is_the_measured_near_black_not_grey() {
+    fn the_log_list_tiers_its_text_by_weight_and_grey() {
         let mut app = loaded();
         app.sel = Sel::Commit(1);
         let out = frame(&mut app);
         let rows = rows_band(&out);
-        assert_eq!(INK, Color32::from_rgb(38, 38, 38), "INK 本身是参考图量的，别改成一个近似值");
-        for label in ["a0000", "主题0", "包融 <", "今天 "] {
+        let primary = Color32::from_rgb(0x1F, 0x23, 0x28);
+        let secondary = Color32::from_rgb(0x59, 0x63, 0x6E);
+        assert_eq!(text_color(&out, "主题0", rows.clone()), primary, "提交信息不是正文色");
+        for label in ["a0000", "包融 <", "今天 "] {
             assert_eq!(
                 text_color(&out, label, rows.clone()),
-                INK,
-                "「{label}」没按参考图取 (38,38,38)——淡一档的字在浅色背景上根本站不住"
+                secondary,
+                "「{label}」没走 §3.4 的次要档——四列同色是复刻期的规则"
             );
         }
-        // 表头同色：参考图那五个词也是 (39,39,39) 这一档，不是灰。
-        assert_eq!(text_color(&out, "提交", head_band(&out)), INK, "表头字色");
-        // 虚拟行更深一档。这一条把 `INK_STRONG` 和 `strong()` 解绑：那面只带 Regular 的
-        // 字体让 `strong()` 退化成一次取色，深浅必须由这里的实测值说了算。
+        for label in ["提交", "作者", "日期"] {
+            assert_eq!(text_color(&out, label, head_band(&out)), secondary, "表头「{label}」不是次要档");
+        }
         let first = *rows.start()..=rows.start() + ROW_H;
         assert_eq!(
-            text_color(&out, "Uncommitted", first),
-            INK_STRONG,
-            "虚拟行的描述没按参考图取 (33,33,33)"
+            text_color(&out, "Uncommitted", first.clone()),
+            primary,
+            "虚拟行还给自己更深一档 = §6 那条「INK_STRONG → 加粗」没落地"
         );
+        assert_eq!(text_family(&out, "Uncommitted", first), "inter-semibold", "虚拟行的强调没走真字重");
     }
 
     /// 视口追上列表尾 = 到底，该问下一页。这一格只管**扳机**：`log_more_busy` 立起来
@@ -4277,11 +4752,67 @@ use crate::viewport;
                 h.diff.iter().map(|l| &l.text).collect::<Vec<_>>()
             );
         }
-        let out = warm_frame(&mut app);
+        // 用 `settled_frame` 而不是 `warm_frame`：这一层是 `Area`（`Order::Foreground`），
+        // 默认带 0.2s 淡入，`warm_frame` 的钟停在第一格——底色被 `multiply_opacity` 就地乘成预乘色
+        // （实测 `ADD_BG` 的 `#E6F4EA` 在这帧里是 `#3639373C`），颜色判据全废。
+        // 文字却不受影响（淡入改的是 `Shape` 上的色，`Galley` 的 section 色原样留着），
+        // 所以「只问字色」的判据在 `warm_frame` 下照样绿——这条差点就是这么漏掉的。
+        let out = settled_frame(&mut app, 0.5);
         let all: Vec<String> = texts(&out).into_iter().map(|(t, _)| t).collect();
         assert!(all.iter().any(|t| t.starts_with("文件历史 · a.txt")), "面板标题没画出来");
         assert!(all.iter().any(|t| t == "逐行归属"), "页签没画出来");
         assert!(all.iter().any(|t| t == "第二条改 a.txt"), "历史行没画出来");
+        // §3.1 那对「底 + 字」在**这个**画字入口也要落地。补丁同一套规则有两处画：
+        // 差异面板（`show_diff_pane`）和历史面板右侧（`history_diff_row`）。
+        // `added_and_deleted_lines_carry_their_own_text_colour` 只走到第一处——反向变异实测：
+        // 把 `history_diff_row` 里 `BG_INSET`/`ADD_FG` 两枚摘掉，全量照样全绿，
+        // 等于一个值两条出口只验了一半。
+        //
+        // 定位靠**文字**，不靠「差异区里第一条某色矩形」：遮罩底下主差异面板照样在画，
+        // 那儿既有 `@@ -` 也有增行底色，按底色找第一条会摸到遮罩后面那一格。
+        let add = all_text_rects(&out, 0.0..=WIN_H, &["+第三行"]);
+        assert_eq!(add.len(), 1, "「+第三行」只该在历史面板右侧出现一次：{add:?}");
+        let y = add[0].1.center().y;
+        let row = |cy: f32| (cy - DIFF_ROW_H / 2.0 + 1.0)..=(cy + DIFF_ROW_H / 2.0 - 1.0);
+        let band_at = |cy: f32, want: Color32| {
+            let hits: Vec<(f32, Rect)> = rects(&out)
+                .into_iter()
+                .filter(|(c, rc)| (rc.center().y - cy).abs() < 3.0 && *c == want)
+                .map(|(_, rc)| (rc.center().y, rc))
+                .collect();
+            hits
+        };
+        assert_eq!(
+            text_color(&out, "+第三行", row(y)),
+            Color32::from_rgb(0x1A, 0x7F, 0x37),
+            "历史面板那行增行的字色（§3.1 ADD_FG）"
+        );
+        assert_eq!(
+            band_at(y, Color32::from_rgb(0xE6, 0xF4, 0xEA)).len(),
+            1,
+            "那行增行没铺 §3.1 的增行底色（文字中心 y={y}，附近的增行底色带={:?}）",
+            band_at(y, Color32::from_rgb(0xE6, 0xF4, 0xEA))
+        );
+        // hunk 头在增行上面（这格补丁是「块 1」+ 两行 + 第三行），四行以内取那一条。
+        // 注意 `layout` 把补丁头**人话化**了：画出来的不是 `@@ -1,1 +1,3 @@` 而是「块 1： 行 1-1（新 1-3）」，
+        // 所以前缀问的是「块 」。
+        let above: Vec<f32> = all_text_rects(&out, (y - 4.0 * DIFF_ROW_H)..=(y - 1.0), &["块 "])
+            .into_iter()
+            .map(|(_, rc)| rc.center().y)
+            .collect();
+        assert_eq!(above.len(), 1, "增行上面四行里该只有一条 hunk 头：{above:?}");
+        assert_eq!(
+            text_color(&out, "块 ", row(above[0])),
+            Color32::from_rgb(0x8B, 0x94, 0x9E),
+            "hunk 头文字走 §3.1 辅助档 TEXT_MUTED"
+        );
+        assert_eq!(
+            band_at(above[0], Color32::from_rgb(0xF0, 0xF1, 0xF3)).len(),
+            1,
+            "hunk 头没铺 §3.1 的 BG_INSET（hunk 中心 y={}，附近的 BG_INSET 带={:?}）",
+            above[0],
+            band_at(above[0], Color32::from_rgb(0xF0, 0xF1, 0xF3))
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4791,6 +5322,28 @@ use crate::viewport;
         assert!(!card_has(&mut app, "差异视图"), "摆了一条没接的页签进来");
     }
 
+    /// §3.4「强调走字重，不走更深的灰」也管模态卡标题：14pt + Inter SemiBold + `TEXT_PRIMARY`。
+    /// 反向变异实测：把 `src/ui/app.rs` 那句的 `.color(TEXT_PRIMARY)` 换成 `TEXT_SECONDARY`、
+    /// 或把 `.family(semibold_family())` 摘掉，全量 155 条全绿——标题这一档以前只有代码、没有判据。
+    /// 颜色与字面**各问一次**：只动其一也要红。
+    #[test]
+    fn the_modal_title_is_semibold_primary_ink() {
+        let mut app = filled(3, &layout(PATCH, false));
+        assert!(click_tool(&mut app, 10), "设置那一枚按钮没点到");
+        let out = warm_frame(&mut app);
+        // 带子按卡底那一格取，不整帧按前缀找：卡标题和别处同名文字（以后溢出菜单里的
+        // 「设置」那一档）得分开。顶栏那 11 枚现在**只有图标**（§4.1），所以这一帧里
+        // 「设置」只出现在卡上——但判据不该靠这个巧合活着。
+        let card = card_back(&out).expect("模态卡底没画出来").1;
+        let band = card.min.y..=(card.min.y + MODAL_TITLE_H);
+        assert_eq!(
+            text_color(&out, "设置", band.clone()),
+            Color32::from_rgb(0x1F, 0x23, 0x28),
+            "模态卡标题的字色（§3.1 TEXT_PRIMARY）"
+        );
+        assert_eq!(text_family(&out, "设置", band), "inter-semibold", "模态卡标题没走真字重（§3.4）");
+    }
+
     /// 「关于」那一页念两条**事实**：书签里几本仓库、库文件在哪儿。数字按整串认，
     /// 少写一本多写本都会红；地址只认它真是个路径（尾巴上那个文件名）。
     #[test]
@@ -5261,7 +5814,7 @@ use crate::viewport;
             }
             let (cfill, cedge, cancel) = foot_button(&out, card, "取消").expect("卡脚上没有「取消」那枚");
             assert_eq!(cfill, Color32::WHITE, "「取消」不是白底：{cfill:?}");
-            assert_eq!(cedge, BTN_EDGE, "「取消」那圈灰边没画上：{cedge:?}");
+            assert_eq!(cedge, BORDER_STRONG, "「取消」那圈灰边没画上：{cedge:?}");
             assert!(
                 cancel.max.x < btn.min.x,
                 "「取消」跑到主按钮右边去了：{cancel:?} vs {btn:?}"
@@ -5754,3 +6307,402 @@ use crate::viewport;
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&other);
     }
+
+    // ---------------------------------------------------- 归档成 zip / 原生选目录面板
+    //
+    // 这两条是同一类接线：点一下**不当场跑**，只立一块 `pending_dialog`，面板在 `ui()` 里、
+    // egui 那一帧之外才跑（`rfd` 的原生存盘/选目录面板是嵌套事件循环）。于是判据分成三段，
+    // 每段都得能单独红掉：菜单/按钮 → 牌子；牌子 → 面板之后那段；那段 → 真 git。
+
+    /// 卡上那几枚「浏览…」的中心，按 y 从上往下。克隆那一档有**两枚**（主输入一枚、目标目录
+    /// 一枚），按字定位只会撞上第一枚，所以先数出来再挑。
+    fn browse_spots(ctx: &egui::Context, app: &mut Gitx) -> Vec<Pos2> {
+        let card = card_now(app);
+        let mut out = ctx.run_ui(raw_input(Vec::new()), |ui| app.shell(ui));
+        let mut hits: Vec<(f32, Pos2)> = out
+            .shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Text(t) if t.galley.text() == "浏览…" => {
+                    let r = t.galley.rect.translate(t.pos.to_vec2());
+                    card.contains(r.center()).then_some((r.center().y, r.center()))
+                }
+                _ => None,
+            })
+            .collect();
+        out.textures_delta.clear();
+        hits.sort_by(|a, b| a.0.total_cmp(&b.0));
+        hits.into_iter().map(|(_, p)| p).collect()
+    }
+
+    /// 日志一行的右键菜单里有「归档成 zip」，点它只立一块牌子，牌子带的是**打开菜单那一行**
+    /// 那条提交的完整号，不是 HEAD。建议文件名钉字面量（`fixture-00000000.zip`）：拿
+    /// `repo_name()` 现算一遍再和它自己比，函数写坏了两边一起坏。
+    #[test]
+    fn the_history_menu_arms_an_archive_for_the_row_it_was_opened_on() {
+        let mut app = loaded();
+        let want = app.snap.as_ref().unwrap().commits[1].id.clone();
+        menu_pick(&mut app, "主题1", "归档成 zip");
+        assert_eq!(
+            app.pending_dialog,
+            Some(Dialog::Archive {
+                repo: "/fixture".to_owned(),
+                oid: want,
+                name: "fixture-00000000.zip".to_owned(),
+            }),
+            "右键第二行点「归档成 zip」，立起来的牌子不是那一条提交"
+        );
+        assert!(app.modal.is_none(), "归档只读对象库、不动工作区，不该先问一句确认卡");
+        assert!(!app.busy, "面板还没落地就把 busy 立起来：用户在面板里按取消，就再没人把它落回去");
+        assert_eq!(app.sel, Sel::Uncommitted, "点归档顺带把选中的那行挪了");
+        assert!(app.note.is_none(), "点归档当场就报了 note：{:?}", app.note);
+    }
+
+    /// 「跑测试不会弹真面板」那道边界：牌子**不在** `shell()` 里消费。无头判据一律直接调
+    /// `shell()`，所以这一位不动面板，测试就一辈子碰不到 `rfd`。
+    #[test]
+    fn a_headless_frame_never_consumes_the_pending_dialog() {
+        let mut app = loaded();
+        let want = Some(Dialog::PickFolder { field: FolderField::Main });
+        app.pending_dialog = want.clone();
+        for _ in 0..3 {
+            frame(&mut app);
+        }
+        assert_eq!(app.pending_dialog, want, "无头帧把牌子消费掉了：判据会替真窗口去跑原生面板");
+        assert!(!app.busy, "帧里消费牌子还顺手立了 busy");
+    }
+
+    /// 「添加仓库」三档都有「浏览…」（三档填的全是磁盘路径）。枚数按两枚/一枚分档钉：
+    /// 只数得出某一档有，就测不出克隆那档的第二枚被删掉。
+    #[test]
+    fn every_add_repo_tab_has_a_browse_button() {
+        let mut app = blank();
+        open_add_card(&mut app);
+        for (tab, want) in [("打开已有", 1), ("克隆到本地", 2), ("新建仓库", 1)] {
+            assert!(click_card(&mut app, tab), "卡上没有「{tab}」那一档");
+            let ctx = warm(&mut app);
+            let n = browse_spots(&ctx, &mut app).len();
+            assert_eq!(n, want, "「{tab}」那档的「浏览…」枚数不对（克隆档主输入 + 目标目录各一枚）");
+        }
+    }
+
+    /// 两枚「浏览…」交回的是**两个不同的格子**——合成一个枚举值就会把源地址填成目标目录。
+    /// 上面那枚 = 主输入，下面那枚 = 目标目录；点完卡不许关（面板回来要往它里面填）。
+    #[test]
+    fn the_browse_button_arms_the_picker_for_the_field_it_sits_next_to() {
+        let mut app = blank();
+        open_add_card(&mut app);
+        let ctx = warm(&mut app);
+        let spots = browse_spots(&ctx, &mut app);
+        assert_eq!(spots.len(), 1, "「打开已有」那档该只有一枚「浏览…」");
+        click_at(&ctx, &mut app, spots[0]);
+        assert_eq!(
+            app.pending_dialog,
+            Some(Dialog::PickFolder { field: FolderField::Main }),
+            "主输入旁边那枚「浏览…」交的不是主输入"
+        );
+        assert!(app.modal.is_some(), "点「浏览…」把卡关了：面板回来没格子可填");
+        assert!(!app.busy, "选目录只是填一个字，不该把界面冻成在跑 git");
+
+        let mut app = blank();
+        open_add_card(&mut app);
+        assert!(click_card(&mut app, "克隆到本地"), "切不到克隆那一档");
+        let ctx = warm(&mut app);
+        let spots = browse_spots(&ctx, &mut app);
+        assert_eq!(spots.len(), 2, "克隆档该有两枚「浏览…」，点不到第二枚");
+        click_at(&ctx, &mut app, spots[1]);
+        assert_eq!(
+            app.pending_dialog,
+            Some(Dialog::PickFolder { field: FolderField::CloneDest }),
+            "目标目录旁边那枚「浏览…」交的不是目标目录（两枚交同一格就是填错格子）"
+        );
+    }
+
+    /// 面板选回来的目录落到**哪一格**。`rfd` 那一层无头跑不到，所以判据直接问它后面那一步。
+    #[test]
+    fn a_picked_folder_lands_in_the_field_the_button_belongs_to() {
+        let mut app = blank();
+        open_add_card(&mut app);
+        app.fill_folder(FolderField::Main, "/选里的目录");
+        assert_eq!(
+            app.modal.as_ref().unwrap().text.as_deref(),
+            Some("/选里的目录"),
+            "主输入那一格没收到面板选回来的目录"
+        );
+
+        let mut app = blank();
+        open_add_card(&mut app);
+        assert!(click_card(&mut app, "克隆到本地"), "切不到克隆那一档");
+        app.fill_folder(FolderField::CloneDest, "/目标目录");
+        let m = app.modal.as_ref().unwrap();
+        let Form::AddRepo { dest, .. } = &m.form else { panic!("卡不是「添加仓库」了") };
+        assert_eq!(dest, "/目标目录", "目标目录那一格没收到面板选回来的目录");
+        assert!(m.text.as_deref().unwrap_or_default().is_empty(), "填错了：目标目录跑到主输入（源地址）那一格");
+
+        // 牌子立起来之后用户可能把档切走：那一格已经从卡上消失，就不该往它里面写字。
+        let mut app = blank();
+        open_add_card(&mut app);
+        click_card(&mut app, "克隆到本地");
+        assert!(click_card(&mut app, "打开已有"), "切不回「打开已有」");
+        app.fill_folder(FolderField::CloneDest, "/不该出现");
+        let m = app.modal.as_ref().unwrap();
+        let Form::AddRepo { dest, .. } = &m.form else { panic!("卡不是「添加仓库」了") };
+        assert!(dest.is_empty(), "都切出克隆那一档了，还往目标目录里写字");
+    }
+
+    /// 面板之后那一步交给 core 的三个参数。`git::archive` 在 core 侧自有三条判据，这一条钉的是
+    /// **UI 交的是哪一条提交**：反向变异把 `archive_to` 里的 `&oid` 换成 `"HEAD"`，第一条断言就红
+    /// ——那正是用户右键旧提交、拿回最新代码的那种错。
+    /// 第二遍导 HEAD 是给这条判据自己出夹具：文件名压根不出现在 zip 里时 `!contains` 会假绿。
+    #[test]
+    fn archiving_a_row_hands_core_that_rows_oid_not_head() {
+        let (mut app, dir) = open_repo("archive-ui");
+        let path = dir.to_str().unwrap().to_owned();
+        std::fs::write(dir.join("new.txt"), "第二条才有的文件\n").unwrap();
+        git_in(&dir, &["add", "new.txt"]);
+        git_in(&dir, &["commit", "-q", "-m", "第二条"]);
+        app.open(&path);
+        pump(&mut app, |a| a.snap.as_ref().map(|s| s.commits.len()).unwrap_or(0) == 2);
+        let snaps = app.snap.as_ref().unwrap();
+        let (head, first) = (snaps.commits[0].id.clone(), snaps.commits[1].id.clone());
+        let tmp = std::env::temp_dir().join(format!("gitx-archive-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let at_first = tmp.join("first.zip");
+        let at_head = tmp.join("head.zip");
+
+        app.archive_to(&path, &first, at_first.to_str().unwrap());
+        assert!(app.busy, "归档发出去了但 busy 没立起来");
+        let want = format!("已导出 {}", at_first.display());
+        pump(&mut app, |a| a.note.as_deref() == Some(want.as_str()));
+        let bytes = String::from_utf8_lossy(&std::fs::read(&at_first).unwrap()).into_owned();
+        assert!(bytes.contains("PK"), "导出来的不是 zip：{bytes:?}");
+        assert!(bytes.contains("a.txt"), "第一条提交里就有的文件没进快照");
+        assert!(!bytes.contains("new.txt"), "右键旧提交拿回了最新那一版：快照里有第二条才有的文件");
+
+        app.archive_to(&path, &head, at_head.to_str().unwrap());
+        let want = format!("已导出 {}", at_head.display());
+        pump(&mut app, |a| a.note.as_deref() == Some(want.as_str()));
+        let bytes = String::from_utf8_lossy(&std::fs::read(&at_head).unwrap()).into_owned();
+        assert!(bytes.contains("new.txt"), "夹具自己没生效：连 HEAD 的快照都读不出 new.txt，上一条 !contains 是假绿");
+        assert!(!app.busy, "归档回来 busy 没落下：进度条会一直转");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 归档成功的回复：落下 `busy`、报一句落在哪儿。
+    #[test]
+    fn the_archive_reply_clears_busy_and_names_the_file() {
+        let mut app = loaded();
+        app.busy = true;
+        let tx = app.tx.clone();
+        let _ = tx.send(Msg::Archived("/tmp/gitx-00000000.zip".to_owned()));
+        frame(&mut app);
+        assert!(!app.busy, "归档回复没落下 busy");
+        assert_eq!(app.note.as_deref(), Some("已导出 /tmp/gitx-00000000.zip"), "回复没报落在哪儿");
+    }
+
+    /// 「分离时日志走宽口径」这一条规则的**四条出口**都得钉，只钉一条等于没钉：
+    /// ① 分离 + 「当前分支」→ 换成「所有引用」，否则上面那些提交直接从日志里消失
+    ///    （这就是用户报的那件事）；② 在分支上 → 不许偷偷把别人的分支也拉进来；
+    ///    ③ 已经是「所有引用」→ 保持；④ 用户在日志栏点了某条分支的历史（`Rev`）→
+    ///    **必须**保持，那是他明确挑的口径，分离不分离都不能替他改回去。
+    ///
+    /// 翻页那一处（`ask_for_more`）也过这一位，但无头里没有 500+ 提交的夹具，
+    /// 「那里直接传 `self.scope`」这种改坏杀不掉 —— 已记进台账，不当作业已做完。
+    #[test]
+    fn a_detached_repo_widens_the_log_scope_and_a_wider_one_never_narrows() {
+        use git::Scope;
+        assert_eq!(
+            eff_scope(&Scope::Current, true),
+            Scope::All,
+            "分离时按 HEAD 的可达链取数 = 检出的那条提交之上的历史全没了"
+        );
+        assert_eq!(
+            eff_scope(&Scope::Current, false),
+            Scope::Current,
+            "在分支上时不许顺手把整个仓库的历史倒进日志"
+        );
+        assert_eq!(eff_scope(&Scope::All, true), Scope::All, "已经是最宽口径，别再收窄");
+        assert_eq!(
+            eff_scope(&Scope::Rev("side".to_owned()), true),
+            Scope::Rev("side".to_owned()),
+            "用户点了「只看 side 的历史」，分离不许把这一格改成全仓库"
+        );
+    }
+
+    /// 端到端：真仓库、真检出到**上一条**提交，然后回答用户那句「后面的历史都看不到了」。
+    /// 日志必须还认得出上面那条更新的提交。杀伤路径是把 `snapshot_of` 里那句
+    /// `eff_scope` 撤掉 —— 那样取回来的就是 `HEAD~1` 的可达链，只剩一条。
+    #[test]
+    fn a_detached_checkout_still_shows_the_commits_above() {
+        // 提交**先**造好再开仓库：`open_repo` 之后没人会自己去重读磁盘，
+        // 往临时仓库里再 commit 一条，快照里那条永远等不来（pump 只会白跑 600 帧）。
+        let dir = scratch_repo("detached-log");
+        // 夹具带着一处**已暂存**的改动；带着它 checkout 会被 git 拒（would be overwritten），
+        // 报出来的就是 checkout 的错，而不是我要问的那件事。
+        git_in(&dir, &["reset", "-q", "--hard", "HEAD"]);
+        std::fs::write(dir.join("b.txt"), "b\n").unwrap();
+        git_in(&dir, &["add", "b.txt"]);
+        git_in(&dir, &["commit", "-q", "-m", "后一条"]);
+        let head = git_in(&dir, &["rev-parse", "HEAD"]);
+        let first = git_in(&dir, &["rev-parse", "HEAD~1"]);
+        let path = dir.to_str().expect("utf-8 路径").to_owned();
+        let mut app = blank();
+        app.open(&path);
+        pump(&mut app, |a| a.snap.as_ref().map(|s| s.commits.len()) == Some(2));
+        let snap = app.snap.as_ref().unwrap();
+        assert_eq!(snap.commits[0].id, head, "夹具自己没生效：日志顶上就不是最新那条");
+        assert!(snap.status.detached_at.is_none(), "夹具自己得先在分支上");
+        let before = snap.taken_at;
+        assert!(app.act(Action::Checkout(first.clone())), "检出没被接住");
+        // 等的是「**新的一份快照**落地」，不是 `!busy`：`busy` 是一面共用的旗子，
+        // `Msg::Patch`（开仓库时那一格差异的回复）也在落它 —— 检出还在路上，差异先回来，
+        // 旗子就落了，`!busy` 那一刻读到的仍是**检出之前**那份快照。
+        // （这本身是个界面缺陷，已记台账；这里先把判据的等待条件写对。）
+        pump(&mut app, |a| a.snap.as_ref().is_some_and(|s| s.taken_at > before));
+        let snap = app.snap.as_ref().unwrap();
+        assert_eq!(snap.commits.len(), 2, "检出上一条之后，上面那条从日志里消失了");
+        assert_eq!(snap.commits[0].id, head, "日志最上面还得是那条更新的提交");
+        assert_eq!(
+            snap.status.detached_at.as_deref(),
+            Some(first.as_str()),
+            "core 认不出分离，界面就没有「分离 HEAD」那一格可写"
+        );
+        // 只信快照等于让被测对象自己出证词。
+        assert_eq!(git_in(&dir, &["rev-parse", "HEAD"]), first, "仓库里其实没分离");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 状态栏在分离时说的两句话：HEAD 现在**在哪条提交**上，以及**怎么回去**。
+    /// 完整号只印前 8 位（那一排还要放 ↑2 和右边的路径）；两条出口都要钉——
+    /// 记得住分支名就给「回到 main」，一开始就没在分支上（空仓库、或刚 clone 就检出）
+    /// 就不许给一条点了没反应的假链接。
+    #[test]
+    fn the_detached_status_bar_names_the_commit_and_offers_a_way_back() {
+        let oid = "b43eb9bcd42c1ec86b17875fbea452a0ce0683f9";
+        let band = (WIN_H - STATUS_H)..=WIN_H;
+        let mut app = loaded();
+        let snap = app.snap.as_mut().unwrap();
+        snap.status.branch = String::new();
+        snap.status.detached_at = Some(oid.to_owned());
+        let out = frame(&mut app);
+        let det = text_rect(&out, "分离 HEAD · b43eb9bc", band.clone());
+        assert!(det.min.x < SIDEBAR_W + 20.0, "分离那一段没贴左：{}", det.min.x);
+        let back = text_rect(&out, "回到 main", band.clone());
+        assert!(back.min.x > det.max.x, "「回到 main」没接在分离那一段后面");
+        // 按**包含**问，不按前缀：那一格的文字是「分离 HEAD · b43eb9bc」，就算把完整号
+        // 印进去，整串也不是以号开头的 —— 前缀匹配杀不掉「多印了 32 位」这种改坏。
+        assert!(
+            texts(&out).into_iter().all(|(s, _)| !s.contains(oid)),
+            "不许把 40 位完整号印进状态栏"
+        );
+        assert!(
+            texts(&out).into_iter().all(|(s, _)| !s.contains("(detached)")),
+            "git 的内部词汇 `(detached)` 漏进了界面"
+        );
+
+        // 第二条出口：没有「最后一次在分支上」那条名字时，那一格整段不画。
+        let mut app = loaded();
+        app.last_branch = String::new();
+        let snap = app.snap.as_mut().unwrap();
+        snap.status.branch = String::new();
+        snap.status.detached_at = Some(oid.to_owned());
+        let out = frame(&mut app);
+        assert!(
+            text_rect_or_none(&out, "回到", band.clone()).is_none(),
+            "认不出该回哪条分支，就别画一条点了没反应的回链"
+        );
+
+        // 第三条出口：正常在分支上时也不许出现「回到」——那一格只属于分离。
+        let out = frame(&mut loaded());
+        assert!(
+            text_rect_or_none(&out, "回到", band).is_none(),
+            "在分支上却挂着「回到」，用户会以为走错了地方"
+        );
+    }
+
+    /// 端到端把那一格点掉：真分离 → 帧里出现「回到 main」→ 真点 → 仓库回到分支上、
+    /// 快照不再是分离、状态栏那一帧也不再写「分离 HEAD」。少了最后那半截，
+    /// 「数据回来了但界面还挂着旧说法」这种改坏杀不掉。
+    #[test]
+    fn going_back_from_a_detached_head_reattaches_to_the_branch() {
+        let dir = scratch_repo("detached-back");
+        git_in(&dir, &["reset", "-q", "--hard", "HEAD"]);
+        std::fs::write(dir.join("b.txt"), "b\n").unwrap();
+        git_in(&dir, &["add", "b.txt"]);
+        git_in(&dir, &["commit", "-q", "-m", "后一条"]);
+        let first = git_in(&dir, &["rev-parse", "HEAD~1"]);
+        let path = dir.to_str().expect("utf-8 路径").to_owned();
+        let mut app = blank();
+        app.open(&path);
+        pump(&mut app, |a| a.snap.as_ref().map(|s| s.commits.len()) == Some(2));
+        // 分支名按快照里的来，不写死 `main`：不同机器上 `git init` 的默认分支名不一样。
+        let branch = app.snap.as_ref().unwrap().status.branch.clone();
+        assert!(!branch.is_empty(), "夹具自己得在一条分支上");
+        let before = app.snap.as_ref().unwrap().taken_at;
+        assert!(app.act(Action::Checkout(first.clone())), "检出没被接住");
+        // 等「新快照落地」而不是 `!busy`：同一个理由，见上一条判据里那段注释。
+        pump(&mut app, |a| a.snap.as_ref().is_some_and(|s| s.taken_at > before));
+        assert!(
+            app.snap.as_ref().unwrap().status.detached_at.is_some(),
+            "没先分离，下面点的那一格就不存在"
+        );
+
+        let label = format!("回到 {branch}");
+        let before = app.snap.as_ref().unwrap().taken_at;
+        assert!(click_text(&mut app, &label), "状态栏里点不到「{label}」");
+        pump(&mut app, |a| a.snap.as_ref().is_some_and(|s| s.taken_at > before));
+        let snap = app.snap.as_ref().unwrap();
+        assert!(snap.status.detached_at.is_none(), "点了回去，快照还挂着那条号");
+        assert_eq!(snap.status.branch, branch, "回去之后分支名要还是原来那条");
+        assert_eq!(
+            git_in(&dir, &["symbolic-ref", "--short", "-q", "HEAD"]),
+            branch,
+            "仓库里 HEAD 并没有挂回分支"
+        );
+        let out = frame(&mut app);
+        assert!(
+            text_rect_or_none(&out, "分离 HEAD", (WIN_H - STATUS_H)..=WIN_H).is_none(),
+            "界面还写着分离 HEAD"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 日志一行的右键菜单把那一步的**代价**写在字里：「检出这条提交（分离 HEAD）」。
+    /// 只写「检出这个提交」的话，用户点完发现上面那截没了，只会以为是软件吞了他的历史 ——
+    /// 这一格是唯一一处**事前**说清的地方（状态栏那句「回到 main」是事后的）。
+    ///
+    /// 走一次真点击（不是 `app.act`）：挑菜单里那一项本身就把文案钉住了（换了写法就 panic
+    /// 「菜单里没有这项」），而 `intent.run` 那一位要是把 `full` 换成 `HEAD`，这里落下去
+    /// 的就还是最新那条 —— 只断「菜单里有没有这行字」杀不掉它。
+    #[test]
+    fn the_history_menu_says_what_checking_out_a_commit_costs() {
+        let dir = scratch_repo("menu-detach");
+        git_in(&dir, &["reset", "-q", "--hard", "HEAD"]);
+        std::fs::write(dir.join("b.txt"), "b\n").unwrap();
+        git_in(&dir, &["add", "b.txt"]);
+        git_in(&dir, &["commit", "-q", "-m", "上面那条"]);
+        let first = git_in(&dir, &["rev-parse", "HEAD~1"]);
+        let path = dir.to_str().expect("utf-8 路径").to_owned();
+        let mut app = blank();
+        app.open(&path);
+        pump(&mut app, |a| a.snap.as_ref().map(|s| s.commits.len()) == Some(2));
+        assert!(
+            app.snap.as_ref().unwrap().status.detached_at.is_none(),
+            "夹具自己得先在分支上"
+        );
+        let before = app.snap.as_ref().unwrap().taken_at;
+        menu_pick(&mut app, "起点", "检出这条提交（分离 HEAD）");
+        pump(&mut app, |a| a.snap.as_ref().is_some_and(|s| s.taken_at > before));
+        let snap = app.snap.as_ref().unwrap();
+        assert_eq!(
+            snap.status.detached_at.as_deref(),
+            Some(first.as_str()),
+            "点的是最下面那一行，落下来的却不是那一条提交"
+        );
+        assert_eq!(snap.commits.len(), 2, "从菜单检出，上面那条一样会消失");
+        assert_eq!(git_in(&dir, &["rev-parse", "HEAD"]), first, "仓库里没换过去");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+

@@ -318,7 +318,8 @@ Create/Apply Patch、Custom Actions、Move/Revert to Revision、冲突 Mark Reso
 
 **功能面**：设置卡只接了「通用 / 关于」两页（其余六页一张空壳比没有更糟，见 `PrefPage`）、
 网络远端的 push/pull 判据（本地裸仓库的端到端已有）、命令层 + 命令面板（⌘K 那半在 egui 版还没搬）、
-多选、拖拽与「扫描文件夹」入口、原生目录选择器（要引 `rfd`）、深色模式、
+多选、拖拽与「扫描文件夹」入口、深色模式、
+（原生目录选择器**已接**：`rfd` + `Dialog::PickFolder`，见「右键归档 + 原生选目录面板」那一节）、
 按**行**暂存（`line.hunk` 已经给每一行留了值）、
 `COL_GRAPH` 超过 4 道目前是 **assert 报错**（没做列宽自适应）、`--depth`/bare/submodule、
 克隆进度与 stderr 流式（现在只有结果一条 note）、`.gitignore` 编辑器、`--no-verify` / `-S` 签名、
@@ -414,6 +415,19 @@ UI 不许出现 emoji、提交行高度只有一个来源、没有上游时绝�
 - **界面重设计** 换锚：不再复刻 SourceTree，改**现代化清爽风**。首页两条顶带并成 46pt、
   侧栏 141→188、行高 26→28、选中改 tint + 左缘主色条、状态色块 12pt 圆角；弹窗去格线、
   三档宽度、确认卡单列。**只写了文档，代码与判据锚点一行没动**（全文见下）
+- **换锚 S6-1（token 层 + 卡按行长）** `bbcae60`：三张卡不再钉 nib 的 855×441 / 650×271 /
+  614×299，改按内容算高；`widgets.rs` 换上新 token 与 `seg_tabs`。**这一批的台账在 commit
+  message 里，正文欠着**；它的反向变异表是原作者转述的，我（2026-10-25 接手这一带的人）没重跑
+- **换锚 S6-2（顶栏 46 单带）** 两条顶带真的并成一条：胶囊 tab + 分支 chip + 11 枚 28pt 纯图标
+  按钮 + 1px 分隔线；注释与判据全部改挂 `DESIGN.md §N`。**抓到两条假绿**（按中心点筛带 +
+  改名 `HEADER_H` 静默重绑），`MIN_W 860` 的"由判据守"一句证伪（全文见下）
+- **右键归档 + 原生选目录面板** `git archive` 那条实测坑（**先创建文件、后解析 revision**，
+  号错就留一个 0 字节 zip）；`rfd` 的面板是**嵌套事件循环**，所以一次点击只立一块牌子、
+  由 `App::ui` 在画帧外消费 —— 「跑测试不会弹真面板」从此是结构性质而不是习惯（全文见下）
+- **分离 HEAD：检出一条提交不该让历史少一截** 两层原因叠在一起（`(detached)` 当分支名 +
+  「当前分支」档 = HEAD 可达链）；**实测更正**：本机 git 2.54 的 unborn 占位符是 `(initial)`
+  不是 `(none)`，而「分离 + 占位符」这个组合 git 永远不会自己产生，所以那道守卫只能拿文本当夹具。
+  顺带抓到 `busy` 是**一面共用旗子**（`Msg::Patch` 也落它），等 `!busy` 的判据会读到旧快照（全文见下）
 
 ---
 ## 接通分支 / 标签 / 贮藏 / 忽略 / 远端：模态卡 + 右键菜单（任务 #27，2026-10-21 凌晨）
@@ -500,7 +514,10 @@ M2/M3 各只红一格，正是这条判据要**形状和后果都问**的原因�
 行高 26、底部 34 这几个数只有无头证据**；合并卡只列本地分支（远程分支要先抓取）；
 `Action::Discard` **不在** `needs_confirm` 里，菜单发起的「放弃」和既有按钮/方框一样不弹卡，
 这是刻意的策略缺口，等「放弃」整组改成先摊改动清单再确认那一批一起收；
-卡里的 Tab 焦点切换、上下键选行没做；「检出这个提交/标签」会进 detached HEAD，没提示；
+卡里的 Tab 焦点切换、上下键选行没做；
+「检出这条提交」现在**事前**在菜单里写明会分离 HEAD、状态栏另给一枚可点的「回到 {分支}」
+（见 2026-10-25「分离 HEAD」那一节）；但侧栏「检出这个标签」那一项的文案还没跟着改，
+标签检出走的同样是分离 HEAD；
 侧栏「远端」那一栏的点击只报一条 note，抓取全部远端还没进度；文件行末那枚「⋯」仍然没有
 可见的把手（右键能用，但参考图那枚要点出来才知道有，#26）。
 
@@ -1736,6 +1753,9 @@ M18–M22 这五条一起改坏、跑一次全量，按红灯归属归因（7 �
 - 按旧值拍阈值的判据要重拍，否则改完照样绿（**假绿**）：
   `bands_match_the_measured_reference`（52+24 → 46）、侧栏 141 → 188、`ROW_H 26` → 28、
   `STATUS_H 26` → 24、`MIN_W 870` → 860。
+  **进度（2026-10-25）**：第一条已在 S6-2 改名重拍为 `bands_match_the_design_spec`；
+  `MIN_W` 870 → 860 只是常量换了、**"由判据守"那句证伪了**（见 S6-2 全文与 `DESIGN.md` §7）。
+  侧栏 188 / `ROW_H 28` / `STATUS_H 24` 还没动，分别归 S6-3 / S6-4 / S6-5。
 - 选中态判据若写的是「整行铺 `SELECTED`」，要改判 tint 底 + 左缘 2pt 条，否则新皮肤下
   那条判据永远杀不死实现。
 - `COMMIT_H 96` 这个预算是按 Inter 行盒算的；字级从 12.5/11.5 换成 13/12/11 之后要重新核。
@@ -1751,4 +1771,335 @@ M18–M22 这五条一起改坏、跑一次全量，按红灯归属归因（7 �
   这个数要重扫一遍才算数。
 - **溢出菜单 `»` 只是提案**：顶栏收窄时动作按钮怎么收、仓库 tab 怎么截断，文档写了设计意图，
   没有任何实现，也没有判据。
+
+
+---
+
+## 换锚 S6-2：两条顶带并成一条 46pt（2026-10-25）
+
+`DESIGN.md` §2 + §4.1 的第一次**代码落地**：`TOOLBAR_H 52` + `TAB_H 24` 两条带真的并成
+`HEADER_H 46` 一条，`tab_bar()` 整个函数删掉。锚点同时换干净——这一带新增/改写的常量、
+注释、判据一律挂 `DESIGN.md §N`，不再出现「参考图量出来」的出处。
+
+**决定与依据**
+
+- **一栏一排**：红绿灯 inset 92 不变 → 左组是仓库**胶囊 tab**（选中 = `ACCENT_SOFT` 底 +
+  `ACCENT_INK` 字 + 真字重 600）+ 一枚幽灵「＋ 添加仓库」；右组是分支 chip（名字 12px 次要档，
+  `↑n ↓m` 只在真有涨跌时才出现）+ 11 枚 28×28 纯图标按钮，整组贴右沿让 12，彼此让 2。
+  旧那行「xxx (Git)」标题按 §2 删掉——tab 自己就是仓库名。
+- **分隔线画在父 ui 上**：`Frame` 的 show 闭包里 `ui.max_rect()` 已经被 `inner_margin`
+  收到 92..1038 / 9..37 那一格，在里面画只能画出"让了边距的一小截"。§2 要的是横贯整窗、
+  贴带外沿的那一条，所以先 `let outer = ui.max_rect()`，`.show()` 完之后用
+  `ui.painter_at(...)` 画。
+- **中文标签从顶栏消失**：`TOOLS` 第二个字段只留给 tooltip 和（还没实现的）`»` 溢出菜单。
+  真线描 SVG 排在 S6-6，在那之前用字体链里确实存在的字形顶着——上一版有七个是豆腐块。
+
+**判据（162 条，比这批开始前多 6 条）**
+
+新增/重拍的顶栏判据：`bands_match_the_design_spec`（原 `bands_match_the_measured_reference`）、
+`the_header_numbers_are_the_design_md_values`、`the_active_repo_tab_is_an_accent_capsule`、
+`the_action_group_is_icon_only_and_flush_right`、`the_branch_chip_reads_name_then_counts`、
+`the_add_repo_entry_is_a_ghost_pill`、`the_header_divides_itself_with_a_1px_line`、
+`nothing_is_drawn_under_the_traffic_lights`、`the_header_has_no_overlapping_widgets`
+（原 `the_top_bands_have_no_overlapping_widgets`）、`the_window_itself_is_floored_at_the_spec_size`
+（原 `..._at_the_measured_size`）；`the_toolbar_band_is_the_window_titlebar` **名字留着**
+（改名叫 `the_header_band_...` 会让 PROCESS 里 #34 那条"52pt 就是标题栏"的取证链断掉），
+只把注释改挂 §2。每条都把值写成**字面值**（`0xE8F1FD` / `26.0` / `1024.0` / `45.5`），
+不是常量比常量。
+
+**反向变异表**
+
+| 变异（都在 `src/ui/`，验完还原） | 红的那条 | 报的话 |
+|---|---|---|
+| `repo_tab` 底色 `ACCENT_SOFT` → 白 | `the_active_repo_tab_is_an_accent_capsule` | 选中胶囊的底色不是 §3.1 的 ACCENT_SOFT |
+| `ghost_tab` 描边 → `Stroke::NONE` | `the_add_repo_entry_is_a_ghost_pill` | 顶栏该只有一枚描边胶囊：`[]` |
+| 分支名 `TEXT_SECONDARY` → `TEXT_MUTED` | `the_branch_chip_reads_name_then_counts` | 分支名不是 §3.1 的次要档 |
+| `ICON_PX` 14 → 13 | `the_action_group_is_icon_only_and_flush_right` | 图标的字号不是 §4.1 的 14px |
+| `TAB_PILL_PAD` 11 → 6 | `nothing_is_drawn_under_the_traffic_lights` | tab 文字左沿不是 92+11=103 |
+| `HEADER_H` 46 → 40 | numbers 那条 + 分隔线那条 | 而 `bands_match_the_design_spec` **仍绿**——它问"带是不是白的"，数归 numbers 那条管（分工，不是漏） |
+| `ICON_BTN` 28 → 40 | `the_action_group_...` | 中心距那条，1639 |
+| `HEADER_RIGHT` 12 → 21（只改消费点） | `the_action_group_...` | 同一条，同一个位置——证明这个常量真被吃到，不是只在字面值判据里自说自话 |
+| toolbar / status 的 `Frame` 底色 → `BG_INSET` | `bands_match_the_design_spec` | 带底色不是 §2 BG_WINDOW（`#F0F1F3`） |
+| 把旧的中文标签画回 `icon_button` | `the_action_group_...` | **第一版没红**，见下面假绿一 |
+| 删掉 toolbar 末尾那句 `line_segment` | 只有 `the_header_divides_itself_with_a_1px_line` | 全量跑过：161 绿 1 红，和注释里那句"只有这一条会红"对上 |
+
+**抓到两条假绿（都记进方法论）**
+
+1. **按中心点筛带会放过"越线的字"**。`all_text_rects(band)` 用文字矩形的**中心**判断在不在
+   `0..=46`，而 28 的按钮框正好占满内容高（`46 − 9 − 9`），标签画在框底下时中心是 **47**——
+   屏幕上看得见，判据却当它不在顶栏。这条变异第一次跑是绿的。改成按 `min.y < HEADER_H` 筛
+   （`visible_texts`，裁剪后仍可见），并先钉「筛子收满了东西」`in_header.len() >= 12`，
+   再跑才红。**这是「过程判据的夹具自己没生效」那一族的近亲：筛子的边界和内容的边界不是一回事。**
+2. **改名撞上同名常量 = 静默重绑**。把日志表头那条从 `HEADER_H(24)` 改名成 `LOG_HEAD_H`，
+   同时新写了 `HEADER_H = 46` 给顶栏；`geometry.rs` 里三处旧消费点（`head_band`、
+   `assert_eq!(HEADER_H, 24.0)`、列竖线跨度）没报错，而是**安静地改读 46**，于是"表头高 24"
+   这几条判据其实一直在比顶栏。暴露它的是那句 `== 24.0` 的字面值钉法：列竖线那条报"带在
+   66..112、线落在 77.5/100.5"，未提交虚拟行那条报"灰带在 y 101..127、预期 112"——两个都是
+   顶栏减表头算出来的坐标，一眼就不是日志区。教训：改名之后要 grep 旧名字，别信编译器——
+   它只认得"还在"。
+
+**结掉/新增的欠账**
+
+- 把 2026-10-24 那节「仍然没看到过的」里 **`MIN_W 860` 是算出来的**那条结掉了：扫过一遍，
+  撞车判据在 800 仍绿、760 才红，所以 860 **不是**内容压力线，只由字面值判据钉。
+  上一版注释里"往下调一个像素就红"是没验过的夸大，已改。
+- 新增欠账（都写进了 `DESIGN.md` §7）：虚线描边（egui 0.37 的 `Stroke` 没有 dash）、
+  圆角 999（只有 u8 半径，取半高 13）、SVG 图标（S6-6）、`»` 溢出菜单（没实现）、
+  `STATUS_H` 还 26（S6-5）、日志表头还 24（S6-4）。
+
+**仍然没看到过的**
+
+- **这一带一次都没有在真窗口里看过**：全部结论来自无头帧（`ctx.run_ui` 出来的 shapes）。
+  46pt 单带的实际观感、胶囊 tab 与红绿灯的间距、11 枚图标会不会太挤，**都没有目视证据**。
+  暗色整套同样没实现，`theme.rs` 仍只有一套亮色常量。
+- 幽灵那枚「＋ 添加仓库」和 11 枚图标在 **860 宽**那一档没有单独目视：判据只在 1050 与
+  `MIN_W × MIN_H` 两种尺寸上跑过重叠检查。
+- `»` 溢出菜单长什么样、tab 多到放不下怎么截断，**设计意图之外一无所有**：没有实现，也没有判据。
+
+## 换锚 S6-3a：侧栏那 188pt（2026-10-25）
+
+§2 的侧栏第一次真落地：宽 **188**、底 `BG_SIDEBAR #F7F8FA`、分组头**无图标无三角** +
+右对齐计数、子项行高 **26**、选中 = **浅蓝药丸**（`ACCENT_SOFT`、圆角 6、x 4..184）、
+当前分支 = **主色蓝点 + 中黑字**、底置筛选框 **26**。这一带的出处全部改挂 `DESIGN.md §N`，
+`src/ui/widgets.rs` 里那五枚照参考图画的线描图标（`icon_monitor` / `icon_branch` / `icon_tag` /
+`icon_cloud` / `icon_stash` / `icon_dot`）整个删掉，不留别名。
+
+**决定与依据**
+
+- **两列网格 8/16/24**：面板横内边距 8（§3.5），分组头起在 16、子项起在 24（§2.1 那句
+  「仓库行缩进 8」同一档，分支/标签不分第二档）。旧的「所有标签起在 x=41」是参考图量的，作废。
+- **行高单独一枚常量**：`SIDE_ROW_H 26` **不复用 `ROW_H`**——`ROW_H` 是日志行，§2 要在 S6-4
+  升到 28；共用会让那一刀顺手改坏侧栏。
+- **选中 ≠ 当前**：旧实现把两件事合成一档（选中就铺灰药丸、当前分支再画颗蓝点，两者同色）。
+  现在药丸只跟 `selected` 走，蓝点+中黑字只跟 `current` 走，两条判据各自有反向变异（M19/M3）。
+- **底置筛选框 26 和 §4.2 的 30 撞车**：就近取 §2 的侧栏档，冲突登记在 `DESIGN.md §7`。
+  `SIDE_FILTER_GAP 8` 单拎出来是因为 `sidebar()` 真会画一次 `add_space`，扣掉的预算和画出来的
+  高度必须同源。
+
+**判据（163 条，比 S6-2 结束时多 1 条）**
+
+侧栏这一带重写：`the_sidebar_numbers_are_the_design_md_values`（十四枚字面值）、
+`the_sidebar_texts_sit_on_the_8_16_grid`、`the_sidebar_font_ranks_are_the_spec_two_steps`、
+`the_sidebar_group_headers_carry_a_right_aligned_count`、
+`the_sidebar_group_headers_are_iconless_and_triangleless`、`the_sidebar_rows_step_by_26pt`、
+`the_selected_sidebar_row_wears_the_accent_pill`、
+`the_current_branch_wears_the_accent_dot_and_medium_ink`、
+`the_sidebar_filter_box_is_26_tall_and_sits_at_the_bottom`、
+`the_sidebar_has_no_parenthesised_counts_or_character_glyph_markers`。
+删掉的旧判据：`the_sidebar_constants_are_the_measured_reference_numbers`、
+`every_sidebar_category_has_an_icon`、`the_sidebar_labels_all_start_at_the_measured_column`、
+`the_sidebar_category_rows_step_by_47pt`、`the_selected_sidebar_row_is_the_measured_pill`、
+`the_current_branch_is_marked_with_the_measured_blue_dot`、
+`the_sidebar_has_no_counts_or_disclosure_triangles`。
+新落的两批 token 也各补了字面值判据：`the_grey_and_status_tokens_are_the_design_md_values`
+（§3.1 十四枚）与 `the_status_badges_are_the_design_md_six_colors`（§3.2 六枚 + 12pt + 圆角 3）。
+
+**我这次自己造成的破坏（必须留在台账里）**
+
+删 `side_text` 那枚已经没人的辅助函数时，我用了一段 **python heredoc 按字符串切片**，
+结束标记 `/// 侧栏那一栏里的一块文字（含它的落笔颜色` 在**一百六十行之后的新注释**里又出现一次，
+于是 `src/geometry.rs` 从 737 行被切到 900 行——连带切掉**四条判据**：
+`the_sidebar_numbers_are_the_design_md_values`、`the_grey_and_status_tokens_are_the_design_md_values`、
+`the_diff_header_constants_are_the_measured_reference_numbers`、
+`log_text_is_the_measured_near_black_not_grey`。
+清点方式：`cargo test --bin gitx -- --list` 的条数和台账对不上（158 vs 应有的 164），再拿
+`git show HEAD:src/geometry.rs` 的函数名 `comm` 一遍。**编译器一条都不会报**——
+切掉的都是没人调用的 `#[test]`。
+补救：前三条按 §2/§3.1/§3.2 重写回来（`the_diff_header_constants_...` 拆成
+`the_status_badges_are_the_design_md_six_colors` + `the_diff_head_band_is_still_on_its_pre_spec_numbers`，
+因为前者那三位还挂在旧实测值上、归 S6-5）；第四条**不重写**——
+`the_log_list_tiers_its_text_by_weight_and_grey` 已经用新 token 覆盖了它全部断言，
+补回来只会多条死判据。
+教训：这条正是我自己存过的「改代码/做变异只准用 Edit 精确定位，perl -pi 曾误伤同一字符串的第二处」，
+这次换了 python 切片，犯的是同一件事——**marker 唯一性没验就拿来当边界**。清点靠条数，不靠编译器。
+
+**反向变异表（20 条，全绿之后逐条打红）**
+
+| # | 变异（都在绘制点，除非写明） | 该红的判据 | 结果 |
+|---|---|---|---|
+| 1 | 药丸底色 `ACCENT_SOFT` → `BG_HOVER` | `the_selected_sidebar_row_wears_the_accent_pill` | 红 |
+| 2a | 蓝点色 `ACCENT` → `ACCENT_HOVER` | `the_current_branch_wears_the_accent_dot_and_medium_ink` | 红 |
+| 2b | 蓝点 x +8 | 同上 | 红 |
+| 3 | `if current` 拆掉，**每行**都上 `medium` | 同上 → **第一次绿** | **抓到假绿**，见下 |
+| 4a | 计数写死 `"1"` | `the_sidebar_group_headers_carry_a_right_aligned_count` | 红 |
+| 5 | 计数 x −8 | 同上 | 红 |
+| 6a | 分组头字色 → `TEXT_PRIMARY` | `the_sidebar_font_ranks_are_the_spec_two_steps` | 红 |
+| 6b | 计数字号 +2 | `the_sidebar_group_headers_carry_a_right_aligned_count` | 红（`font_ranks` 保持绿 = 两条各管各的） |
+| 7 | 分组头左边重新画一枚圆点 | `the_sidebar_group_headers_are_iconless_and_triangleless` | 红 |
+| 8 | `SIDE_ROW_H` 26 → 30（常量） | `the_sidebar_rows_step_by_26pt` + `the_sidebar_numbers_...` | 两条红；**药丸那条绿**（它拿常量比常量） |
+| 9 | `SIDEBAR_W` 188 → 200（常量） | 全量跑：`the_sidebar_numbers_...` + `the_header_has_the_measured_column_rules` + `every_log_column_starts_at_its_own_header` | **三条**红（日志列边线 245/250 是字面值，替侧栏宽度兜了底） |
+| 10 | `BG_SIDEBAR` 换灰 | `bands_match_the_design_spec`（钉的是字面 `#F7F8FA`）+ numbers | 两条红 |
+| 11 | `BADGE_UNK` 末位 `81` → `80` | `the_status_badges_are_the_design_md_six_colors` | 红（差一个 nibble 也杀得掉） |
+| 12 | 药丸圆角绘制点硬写 `4.0`（不跟常量） | `the_selected_sidebar_row_wears_the_accent_pill` | 红 |
+| 13 | 筛选框高度忘扣 gap（`app.rs`） | `the_sidebar_filter_box_is_26_tall_and_sits_at_the_bottom` | 红（只有这条红） |
+| 14 | `SIDE_FILTER_H` 里那个 26 → 24（常量） | numbers + filter box | **两条都红**（框那条钉的是字面 26） |
+| 15 | 分组头画在子项列（`SIDE_TEXT_X`） | `the_sidebar_texts_sit_on_the_8_16_grid` | 红 |
+| 16 | 分组头字号硬写 13.0 | `the_sidebar_font_ranks_are_the_spec_two_steps` | 红 |
+| 17 | 分组头左边画 `▼` **文字** | `the_sidebar_has_no_parenthesised_counts_or_character_glyph_markers` | 红；**`gutter_ink` 那条绿**（它只认圆/线段/描边方框，看不见文字）——两条判据合起来才覆盖「无图标」和「无三角」 |
+| 18 | 分组头标题后贴 `（3）` | 同 17 | 红 |
+| 19 | 药丸 `if selected` → `if true` | `the_selected_sidebar_row_wears_the_accent_pill` | 红 |
+| 20 | 药丸左缘 +6（绘制点） | 同上 | 红 |
+
+**抓到的一条假绿（第十五类：一个值两条出口只验一半）**
+
+M3 把 `side_row` 里那句 `if current` 拆掉、给侧栏**每一行**都上了 `inter-medium`，
+`the_current_branch_wears_the_accent_dot_and_medium_ink` 照样绿——它只断了「main 是 medium」,
+没断「别人不是」。那颗蓝点当时已经有「搜索」那一行的负对照，字重这一半漏了。
+补上 `assert_ne!(搜索那行的字族, "inter-medium")` 后 M3 重跑才红。
+这条和 §「判据必过反向变异」里那十五类同族，只是这次漏在**同一条判据的两个属性**上：
+一颗点的颜色/位置验了两半，一个字重只验了一半。
+
+**结掉/新增的欠账**
+
+- 结掉：`SIDE_PILL_*`、`SIDE_DOT_*`、`SIDE_GROUP_*`、`SIDE_ROW_H`、`SIDE_FILTER_H`、
+  `BG_SIDEBAR`、`SIDEBAR_W` 现在有**双钉**（字面值 + 绘制点）；§3.1 灰/蓝十四枚、§3.2 六枚
+  补上了字面值钉。
+- 新增欠账（进 `DESIGN.md §7`，五行）：分组头行高 spec 没给（自拍 26）、计数离右缘距离
+  （自拍 16）、药丸左右留白（自拍 4）、蓝点用哪枚蓝/多大（取 `ACCENT`、直径 7 沿用旧档）、
+  §2 的筛选框 26 和 §4.2 的输入框 30 **撞车**。
+- 新增欠账（判据侧）：**§3.2 六枚色块里只有 `M` 有绘制点判据**（差异带头那枚），
+  `A/D/R/?/!` 五种状态现在只由字面值钉着——夹具里造不出这五种状态。归 S6-5：
+  那一刀要把文件表按六态各造一行，顺便把「12pt 见方、圆角 3、白字 11px」在绘制点上钉住。
+- 未定位的抖动：这批门禁里有一次跑出 2 条失败、下一次 0 条，后面连跑四遍全绿，
+  **失败名字没抓到**（当时只 `tail -3`）。嫌疑是那几条真发 `git` 子进程的判据
+  （`the_refresh_button_...` / `ticking_push_after_commit_...` / `the_scope_menu_...`）。
+  登记，别当已解决。
+
+**仍然没看到过的**
+
+- 侧栏这一带**没有在真窗口里看过**：188 宽 + 8/16/24 网格 + 药丸 + 蓝点的实际观感、
+  11px 分组头会不会显得太小、计数右对齐那 16pt 会不会贴边，全部来自无头帧。
+- **分组头点击折叠**、**「最近 | 分组」分段**、**仓库行的副行**（§2.1）都没做，归 S6-3b。
+  S6-3b 还有个 spec 洞要先回答：§2.1 说仓库行**高 26**、又要正文 13px **加**副行 11px，
+  26pt 塞两行是紧的——要么副行只在悬停时出现，要么这一档给到 34。
+- 暗色整套仍未实现，`theme.rs` 仍只有亮色一套常量。
+
+---
+## 右键归档 + 原生选目录面板（2026-10-25）
+
+用户两条：「git历史记录增加一个右键归档」（问清 = 导出**这条提交**的快照，`git archive`）、
+「导入仓库支持打开文件对话框」（问清 = 引 `rfd`）。
+
+**核心层那一条真坑**：`git archive --output=X <rev>` **先创建文件、后解析 revision**，
+号写错就留下一个 0 字节的 zip 挂在磁盘上。所以 `git::archive` 先 `git cat-file -e '<oid>^{commit}'`
+探一次，探不过就直接报错、不碰输出路径。
+
+**面板是嵌套事件循环**，一句都不能落在 egui 画帧里。形式：一次点击只把
+`state::pending_dialog` 立起来，由 `eframe::App::ui` 在 `shell()` **之前**消费。
+无头判据一律直接调 `shell()`，于是「跑测试不会弹真面板」成了一条**结构**性质而不是习惯——
+`a_headless_frame_never_consumes_the_pending_dialog` 钉的就是「立起来但不在绘制帧里被消费」。
+
+`run_dialogs` 自己一辈子测不到（它一跑就弹窗），所以拆成薄适配层 + 两条纯接缝
+（`archive_to` / `fill_folder`），判据全打在接缝和牌子上。
+
+**7 条判据**（`the_history_menu_arms_an_archive_...`、`a_headless_frame_never_consumes_...`、
+`every_add_repo_tab_has_a_browse_button`、`the_browse_button_arms_the_picker_...`、
+`a_picked_folder_lands_in_the_field_...`、`archiving_a_row_hands_core_that_rows_oid_not_head`、
+`the_archive_reply_clears_busy_and_names_the_file`）。
+
+**反向变异（那一批跑了 14 次）**——这里只誊**我能在这一节里逐条对上号**的五条，
+其余九条是上一段会话跑的，记录只有「全红、全部还原、四条门禁全绿」这一句，
+**具体靶子与红点没转述过来**（同 S6-1 那一行同一个处理方式：转述的表就当转述的看）。
+要用的话重跑一遍再说。
+
+| # | 变异 | 该红的判据 | 结果 |
+|---|---|---|---|
+| M1 | 归档那一步把 `busy` 提前立起来 | `the_history_menu_arms_an_archive_...` | 红（`busy` 那一格） |
+| M3 | 牌子上的 `repo`/`oid` 接线挪位（先 `move` 再用，编译不过） | 同上 | 改成 `repo.clone()` 这种 careless refactor 真会写的形状之后，红在 `busy` 那一格 |
+| M4 | `needs_confirm` 里加上 `Archive`（归档也拦一道确认卡） | 同上 | **红在更早的断言**，见下「被遮蔽的两条」 |
+| M6 | 把面板消费点挪进 `shell()` | `a_headless_frame_never_consumes_...` | **没真跑**：那会在测试进程里弹出一个真的 macOS 打开面板（挂住 + 上屏）。换了等价代理——在 `shell()` 顶部 `pending_dialog = None`——红了 |
+| M14 | 右键那一帧顺带把行选中 | `..._arms_an_archive_...` | **红在更早的断言**，同 M4 |
+
+**被遮蔽的两条断言**（诚实记录，别当已覆盖）：M4 和 M14 都让
+`the_history_menu_arms_an_archive_for_the_row_it_was_opened_on` 在**前一个**断言就红了，
+所以 `modal.is_none()`、`sel == Sel::Uncommitted` 这两句**没有独立杀伤路径**。
+要补的话得给它们各配一条只断这一件事的判据。
+
+**两条事故**
+
+1. 我把 `run_dialogs` 插进了 `act()` 的 doc 注释块**里面**——doc comment 把整段吞成一个注释，
+   编译器一条都不报，是读 diff 时看见的。修法是把它挪到 `start_init` 与 `act` 之间并自带 doc。
+2. `state.rs` 的注释里我引用了一条**不存在的**判据名（`a_history_archive_arms_one_save_panel`）。
+   注释写判据名等于写指针，指针指向空处比不写更坏，已改回真名。
+
+**许可与审计**：`rfd 0.17.2` 实测 **MIT 单许可**（crates.io API 查的，不是抄 README），
+`ATTRIBUTION.md` 加一行并写明「只在 `src/ui/` 里用 + 嵌套事件循环所以走 `Dialog`」；
+`scripts/license-audit.sh` 加两条棘轮（新增原生面板依赖必须在 ATTRIBUTION 点名；
+`grep -rl "rfd::" src/` 出现 `src/ui/` 以外的文件就红——核心层不许碰原生面板）。两条都验过可反。
+
+**E0004 那条穷尽臂**：`Action::Archive(_)` 加进 worker 的 match 时并进「到不了这儿」那一支，
+用 `Err` 而不是 `unreachable!`——线程里 panic 会把 `tx` 一起带走，`busy` 就永远没人落回。
+
+---
+## 分离 HEAD：检出一条提交不该让历史少一截（2026-10-25）
+
+用户报了两次：「检出这个提交有问题，后面的历史都看不到了」。两个原因叠在一起：
+
+1. `parse_status` 把 git 的字面量 `(detached)` 当**分支名**交了出去——状态栏印出
+   `(detached)`、侧栏拿它和每条分支比全都比不中（一枚蓝点都点不中）。
+2. 「当前分支」那一档 = `git log` 不带位置参数 = **HEAD 的可达链**。分离到 `HEAD~1` 之后，
+   更新的那几条不可达，就真的不在列表里了。那是 git 的可达性，不是取数取错，
+   但用户右键点的明明是「检出这条提交」，一转头历史没了，看着就是软件吞了他的提交。
+
+做法：core 归一化（新增 `RepoStatus.detached_at`，`branch` 留空）；`eff_scope` 把分离 +
+Current 换成 `--all`；`Gitx.last_branch` 记住最后一次在分支上时那条名字；状态栏改成
+「分离 HEAD · 短8」+ 一枚可点的「回到 {分支}」（点了发 `Action::Checkout`）；
+菜单文案改成「检出这条提交（分离 HEAD）」——**事前**只有一处能说清代价，状态栏那句是事后的。
+
+**实测更正（我先前写错的那道守卫）**：本机 git 2.54 在还没提交的空仓库写的是
+`# branch.oid (initial)`，**不是** `(none)`；我按 `(none)` 键的那一半是错的 token。
+往 `.git/HEAD` 里塞一个解析不出来的号，`git status` 直接 `fatal: bad object HEAD`，连表头都不印——
+所以「分离 + 占位符」这个组合 **git 自己永远不会产生**，那道守卫在真仓库夹具里杀不掉。
+处理：改成只认**形状**（≥40 位且全是十六进制），并把这条判据换成拿文本当夹具的
+`parse_status_reads_only_a_real_oid_as_detached`（三个占位符 + 长非十六进制 + 七位缩写 +
+一条真号，四红一绿）。形状检查的两个 conjunct 各有独立杀伤路径，见下表 4、5。
+
+**9 条判据**（核心 4 + 界面 5）：核心层 `detached_head_is_not_reported_as_a_branch`、
+`a_fresh_empty_repo_is_not_called_detached`、`parse_status_reads_only_a_real_oid_as_detached`、
+`checking_out_a_branch_clears_the_detached_state`；界面层
+`a_detached_repo_widens_the_log_scope_and_a_wider_one_never_narrows`（四条出口全钉：
+Current+分离→All、Current+在分支→Current、All+分离→All、**Rev+分离→Rev 不许被覆盖**）、
+`a_detached_checkout_still_shows_the_commits_above`、
+`the_detached_status_bar_names_the_commit_and_offers_a_way_back`、
+`going_back_from_a_detached_head_reattaches_to_the_branch`、
+`the_history_menu_says_what_checking_out_a_commit_costs`。
+
+**反向变异表（16 次，这一批是我自己一条条打的；全部还原后四条门禁重跑全绿）**
+
+| # | 变异 | 该红的判据 | 结果 |
+|---|---|---|---|
+| 1 | `(detached)` 不再清成空串 | 核心 1、4 + `parse_status_reads_only_...` | 三条红（4 红在**夹具自证**那句） |
+| 2 | `detached_at` 少掉 `branch.is_empty()` 这一 conjunct | 核心 4 | 红在「回到分支后不许还报着那条号」（只有它红） |
+| 3 | 形状检查换成 `!head_oid.is_empty()` | 核心 3 | 红在 `(initial)` 那一档 |
+| 4 | 形状检查只留长度 | 核心 3 | 红在「非十六进制的号不认」 |
+| 5 | 形状检查只留十六进制 | 核心 3 | 红在 `""` 那一档（`all()` 对空串是**真**，长度那一挡才是拒绝它的东西） |
+| 5b | 长度门槛从 40 降到 7 | 核心 3 | 红在「七位缩写不是完整号」（5 那条红在 `""`，两句各有自己的出口） |
+| 6 | 首屏取数不过 `eff_scope`（`scope.clone()`） | `a_detached_checkout_still_...` | 红：`left 1 / right 2`，正是用户报的那件事 |
+| 7 | `eff_scope` 只看 `detached`、不辨档位 | `a_detached_repo_widens_...` | 红在「用户点了只看 side 的历史」那一档 |
+| 8 | `eff_scope` 只看档位、不辨分离 | 同上 | 红在「在分支上不许顺手把整个仓库倒进来」 |
+| 9 | 状态栏换掉「分离 HEAD」写法 | `the_detached_status_bar_...` | 红（`going_back_...` 保持绿：它不念这句文案，负断言不冒充正断言） |
+| 10 | 「回到」那一位少掉 `last_branch` 非空这道守卫 | `the_detached_status_bar_...` | 红在第二条出口（空名字时画出一条点了没反应的回链） |
+| 11 | 在分支上也给「回到」 | 同上 | 红在第三条出口 |
+| 12 | 点「回到」只写一条 note、不发动作 | `going_back_...` | 红（600 帧超时，panic 里带着那句 note——这就是它该长的样子） |
+| 13 | `Msg::Loaded` 记 `last_branch` 那道的条件反过来 | `going_back_...` | 红在「状态栏里点不到『回到 main』」 |
+| 14 | 菜单文案退回「检出这个提交」 | `the_history_menu_says_...` | 红在 `menu_pick` 那句 panic |
+| 15 | 菜单那一项接到 `Action::Merge` | 同上 | 红在「落下来的却不是那一条提交」 |
+
+**新抓到的一个缺陷（登记，未修）**：`busy` 是**一面共用的旗子**——`Msg::Loaded` 落它，
+`Msg::Patch` 也落它（`app.rs:1039`）。于是「检出还在路上、差异先回来」时进度牌提前落下，
+无头判据等 `!busy` 会读到**检出之前那份快照**。我这两条端到端判据最初就是这么红的
+（`detached_at` 是 None，但快照里两条提交都在，看起来像 `eff_scope` 没生效）。
+等待条件改成「`snap.taken_at` 变新」之后才对准。真窗口里这一样会让转圈的牌子在两三百毫秒内
+自己停掉，值得单开一刀：要么 `busy` 拆成「列表在途 / 差异在途」两面，要么给每条请求配号。
+
+**两条没覆盖到的（别当已做完）**
+
+- `ask_for_more` 里那处 `eff_scope` 调用**没有杀伤路径**：要 500+ 提交的夹具才能翻到下一页，
+  现在只有 `eff_scope` 这条纯函数判据钉着规则本身，「那里直接传 `self.scope`」这种改坏杀不掉。
+- `the_detached_status_bar_...` 里「这一帧不许出现 `(detached)`」那句在界面层没有独立杀伤路径
+  （core 归一化之后界面拿不到这个串），它的杀伤在核心层第 1 条变异那儿。
+
+**未决的文案不一致**：分离时取数偷偷走了 `--all`，筛选条那枚 chip 还写着「当前分支」。
+字和实参不一致，已记进 `DESIGN.md §7`，归下一刀（要么给 chip 一档「分离 HEAD（全部引用）」，
+要么在 chip 上写明实际口径）。
 

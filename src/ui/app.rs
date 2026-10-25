@@ -22,6 +22,16 @@ pub(crate) fn default_scope() -> git::Scope {
     git::Scope::Current
 }
 
+/// 存盘面板里那格建议文件名的前半段：路径最后一段当仓库名。
+/// `Path::file_name` 自己会忽略尾斜杠（`/a/b/` 也给出 `b`），所以不先 trim。
+/// 归档的 zip 落到用户自己选的位置，这个名字只是**默认值**，面板里可以改。
+fn repo_name(repo: &str) -> String {
+    std::path::Path::new(repo)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| repo.to_owned())
+}
+
 impl Gitx {
     pub(crate) fn new() -> Self {
         let (tx, rx) = channel();
@@ -82,6 +92,9 @@ impl Gitx {
             hist_seq: 0,
             modal: None,
             modal_focus: false,
+            pending_dialog: None,
+            last_branch: String::new(),
+            remote_open: Vec::new(),
             tx,
             rx,
         };
@@ -193,7 +206,12 @@ impl Gitx {
         let Some(snap) = self.snap.as_ref() else { return };
         let skip = snap.commits.len() as u32;
         self.log_more_busy = true;
-        let (seq, topo, scope, tx) = (self.log_seq, self.topo, self.scope.clone(), self.tx.clone());
+        let (seq, topo, scope, tx) = (
+            self.log_seq,
+            self.topo,
+            eff_scope(&self.scope, snap.status.detached_at.is_some()),
+            self.tx.clone(),
+        );
         std::thread::spawn(move || {
             let _ = tx.send(match git::commits_page(&repo, skip, LOG_PAGE, topo, &scope) {
                 Ok(commits) => Msg::More { repo, seq, commits },
@@ -303,6 +321,59 @@ impl Gitx {
         });
     }
 
+    /// 消费上一帧立起来的原生面板。**只在 `eframe::App::ui` 里被调，无头判据碰不到这里**
+    /// （它们直接调 `shell()`）——这条边界就是「跑测试不会弹真面板」。
+    /// 面板**取消**是正常结局：不报错、不立 `busy`、不留半成品，直接返回。
+    /// 面板之后的那段接线一律交出去做（`archive_to`/`fill_folder`），因为这一位本身测不了。
+    fn run_dialogs(&mut self) {
+        let Some(dialog) = self.pending_dialog.take() else { return };
+        match dialog {
+            Dialog::Archive { repo, oid, name } => {
+                let Some(path) = rfd::FileDialog::new().set_title("归档成 zip").set_file_name(&name).save_file() else {
+                    return;
+                };
+                self.archive_to(&repo, &oid, &path.to_string_lossy());
+            }
+            Dialog::PickFolder { field } => {
+                let Some(path) = rfd::FileDialog::new().set_title("选一个目录").pick_folder() else {
+                    return;
+                };
+                self.fill_folder(field, &path.to_string_lossy());
+            }
+        }
+    }
+
+    /// 把 `oid` 那一版导成 `dest`。从 `run_dialogs` 里拆出来只为一件事：原生面板在无头帧里
+    /// 一辈子跑不到，**面板之后那三个参数交得对不对**得有地方能被问一句
+    /// （`archiving_a_row_hands_core_that_rows_oid_not_head`）。
+    pub(crate) fn archive_to(&mut self, repo: &str, oid: &str, dest: &str) {
+        self.busy = true;
+        let (tx, repo, oid, dest) = (self.tx.clone(), repo.to_owned(), oid.to_owned(), dest.to_owned());
+        std::thread::spawn(move || {
+            let _ = match git::archive(&repo, &oid, &dest) {
+                Ok(()) => tx.send(Msg::Archived(dest)),
+                Err(e) => tx.send(Msg::Failed(format!("{e}"))),
+            };
+        });
+    }
+
+    /// 面板选回来的目录填进卡的**那一格**。卡已经不在了就不复活它——面板跑完可能隔了几帧，
+    /// 中间人可能已经把卡关掉了。
+    pub(crate) fn fill_folder(&mut self, field: FolderField, text: &str) {
+        let Some(m) = self.modal.as_mut() else { return };
+        match (&mut m.form, field) {
+            // 只在**还停在克隆那一档**时才填目标目录：牌子立起来之后用户可能把档切走了，
+            // 那时候这一格已经从卡上消失，填进去就是往一格看不见的格子里写字。
+            (Form::AddRepo { tab, dest }, FolderField::CloneDest) => {
+                if *tab == AddTab::Clone {
+                    *dest = text.to_owned();
+                }
+            }
+            (Form::AddRepo { .. }, FolderField::Main) => m.text = Some(text.to_owned()),
+            _ => {}
+        }
+    }
+
     /// 发一条动作。**返回值 = 这一步有没有被接住**：`false` 只有两种当场就办不成的路
     /// （填的路径不是仓库、手上还没有仓库），调用方据此决定那张模态卡要不要留着。
     /// 起线程那几条一律 `true`——成败要等回复回来说，那时候卡本来就该关了。
@@ -331,6 +402,15 @@ impl Gitx {
         // 到不了动作那一格，但这是「这一步没被接住」的第二种说法：手上没仓库，
         // 任何一条 git 都无处可跑。静默吞掉的话，卡关掉、什么也没发生、连提示都没有。
         let Some(repo) = self.repo.clone() else { return false };
+        // 归档不在这里跑 git：先问用户存哪儿。只把 `pending_dialog` 立起来，面板由下一帧
+        // `ui()` 最前面那段消费（嵌套事件循环不许插在 egui 画帧中间，见 `Dialog` 的注释）。
+        // `busy` **不立**：面板随时可能被取消，取消没有回复，立了就没人把它落回来。
+        if let Action::Archive(oid) = &action {
+            let short: String = oid.chars().take(8).collect();
+            let name = format!("{}-{short}.zip", repo_name(&repo));
+            self.pending_dialog = Some(Dialog::Archive { repo, oid: oid.clone(), name });
+            return true;
+        }
         // 弹出/丢弃之后那条贮藏就没了，后面的 `stash@{n}` 会顶上来。继续按旧下标看，
         // 界面会静默换成**另一条**贮藏——选回工作区，下一份快照落地时差异也跟着回工作区。
         if matches!(action, Action::StashPop(_) | Action::StashDrop(_))
@@ -366,6 +446,9 @@ impl Gitx {
                     .map(|_| ())
                     .and_then(|_| git::push(&repo, None, None, false, false)),
                 Action::Checkout(name) => git::checkout_branch(&repo, name),
+                // 侧栏「远端」那一条：带的是整条远程 ref 名（`origin/main`），落到 git 就是
+                // 切到它对应的本地分支——没有同名本地分支时由 `checkout_remote_branch` 建一条。
+                Action::CheckoutRemote(name) => git::checkout_remote_branch(&repo, name),
                 Action::Fetch => git::fetch(&repo, None, None),
                 Action::FetchRemote(name) => git::fetch(&repo, Some(name), None),
                 // 「拉进哪条本地分支」那一格：git 的 `pull <远端> <分支>` 只会拉进**当前**
@@ -424,6 +507,10 @@ impl Gitx {
                 Action::StashDrop(i) => git::stash_drop(&repo, *i),
                 Action::Ignore(p) => git::ignore_path(&repo, p),
                 Action::RestoreFile { oid, path } => git::restore_file(&repo, oid, path),
+                // 哪一档由卡上那排页签定，落到 git 就是一条 `git reset <flag>`。
+                // 三档里只有硬会碰工作区，而那一档在卡上写明了「找不回来」，
+                // 所以这条路不再叠确认框（叠了会让人以为第一下已经落了）。
+                Action::Reset { oid, mode } => git::reset(&repo, oid, *mode),
                 Action::ResolveOurs(p) => git::resolve_ours(&repo, p),
                 Action::ResolveTheirs(p) => git::resolve_theirs(&repo, p),
                 Action::MarkResolved(p) => git::mark_resolved(&repo, p),
@@ -447,8 +534,12 @@ impl Gitx {
                 // 到不了这儿：`act` 在起线程之前就把这三条拦下走了各自那条路
                 // （它们没有 `repo` 可用，也没有快照可重取）。这一条只为穷尽而写，
                 // 真被走到就是有人挪动了那道守卫——**当场响**，别让它静默变成「点了没反应」。
-                Action::Clone { .. } | Action::Init { .. } | Action::AddExisting { .. } => Err(
-                    GitxError::Other("开仓库那几条不该走到这条路上（act 的守卫被挪了）".to_owned()),
+                // 归档同一个理由：它在 `act` 最前面就被换成了存盘面板，到不了这条线程；
+                // 用 `Err` 而不是 `unreachable!`，因为线程里 panic 会把 `tx` 一起带走，
+                // `busy` 就永远没人落了——报错至少把牌子落回工作区。
+                Action::Clone { .. } | Action::Init { .. } | Action::AddExisting { .. }
+                | Action::Archive(_) => Err(
+                    GitxError::Other("开仓库和归档那几条不该走到这条路上（act 的守卫被挪了）".to_owned()),
                 ),
             };
             match r {
@@ -515,6 +606,9 @@ impl Gitx {
         }
         let mut fetch_remote: Option<String> = None;
         let mut fired: Option<Action> = None;
+        // 「浏览…」按下去要问的是哪一格。和 `fired` 同一套路：面板不能在这帧里跑，
+        // 只能带出去立 `pending_dialog`（见 `Dialog`）。
+        let mut pick: Option<FolderField> = None;
         let mut primary: Option<Action> = None;
         let mut primary_hit = false;
         let mut close = false;
@@ -530,11 +624,11 @@ impl Gitx {
                 // 一整层控件，最后那两条分隔线还得回到卡底来画）。
                 let p = ui.painter().clone();
                 // 卡底 + 一圈描边 + 外面那两档渐隐的光。以前遮罩只有 80 的黑、卡只有一圈
-                // `RULE` 灰边，整张卡像浮在页面上的一块白；遮罩压深、边收重一档，再补两圈
+                // `BORDER_SUBTLE` 灰边，整张卡像浮在页面上的一块白；遮罩压深、边收重一档，再补两圈
                 // 越来越淡的描边当作投影（`card_back` 那条判据只认**有底色**的圆角矩形，
                 // 所以这里全部用空心描边，不会冒充卡底）。
                 p.rect_filled(card, CARD_R, Color32::WHITE);
-                p.rect_stroke(card, CARD_R, Stroke::new(1.0, CARD_EDGE), egui::StrokeKind::Inside);
+                p.rect_stroke(card, CARD_R, Stroke::new(1.0, BORDER_SUBTLE), egui::StrokeKind::Inside);
                 p.rect_stroke(
                     card.expand(1.0),
                     CARD_R + 1.0,
@@ -555,19 +649,19 @@ impl Gitx {
                         pos2(card.min.x, card.min.y + MODAL_TITLE_H),
                         pos2(card.max.x, card.min.y + MODAL_TITLE_H),
                     ],
-                    Stroke::new(1.0, RULE),
+                    Stroke::new(1.0, BORDER_SUBTLE),
                 );
                 put_left(
                     ui,
                     Rect::from_min_max(pos2(card.min.x + MODAL_PAD, y), pos2(card.max.x - MODAL_PAD, y + MODAL_TITLE_H)),
                     |ui| {
-                        ui.add(Label::new(RichText::new(m.title).size(13.5).color(INK_STRONG).strong())
+                        ui.add(Label::new(RichText::new(m.title).size(14.0).color(TEXT_PRIMARY).family(crate::ui::fonts::semibold_family()))
                             .selectable(false));
                     },
                 );
                 y += MODAL_TITLE_H;
                 if let Some(d) = &m.detail {
-                    modal_text(ui, card, y, d, MUTED, 11.0);
+                    modal_text(ui, card, y, d, TEXT_SECONDARY, 11.0);
                     y += MODAL_ROW_H;
                 }
                 // 「添加仓库」那三档排在主输入**上面**：先说要办哪件事，再填对应那一格。
@@ -591,10 +685,22 @@ impl Gitx {
                     y += MODAL_ROW_H;
                 }
                 let hint = m.hint();
+                // 「添加仓库」那三档都在填磁盘上的路径，靠手打太苦：右边挂一枚「浏览…」。
+                // 判据要它出现在卡里，所以这一位单独算出来，别在 `if let` 的借用里再问 `m.form`。
+                let browse = matches!(m.form, Form::AddRepo { .. });
                 if let Some(text) = &mut m.text {
+                    let mut right = card.max.x - MODAL_PAD;
+                    if browse {
+                        // 先画按钮、拿它**实测**的宽，文本框右缘才知道要让到哪儿。
+                        let (hit, w) = card_button(ui, "浏览…", right, y + MODAL_ROW_H / 2.0, false);
+                        if hit {
+                            pick = Some(FolderField::Main);
+                        }
+                        right -= w + 6.0;
+                    }
                     let r = Rect::from_min_max(
                         pos2(card.min.x + MODAL_PAD, y + (MODAL_ROW_H - FIELD_H) / 2.0),
-                        pos2(card.max.x - MODAL_PAD, y + (MODAL_ROW_H + FIELD_H) / 2.0),
+                        pos2(right, y + (MODAL_ROW_H + FIELD_H) / 2.0),
                     );
                     let resp = card_field(ui, r, hint, text, 1);
                     if focus {
@@ -615,12 +721,43 @@ impl Gitx {
                             }
                         }
                     }
+                    // 重置卡：三档页签 + 两句说明。两句各占**固定一行**（见 `Modal::rows`）：
+                    // 换一档卡片高度跟着跳一下，看着就像已经按下去了。
+                    // 卡本身就是说「会丢什么」的那一句问话，所以它不再叠一层确认框。
+                    Form::Reset { mode, .. } => {
+                        seg_tabs(
+                            ui,
+                            Rect::from_min_max(
+                                pos2(card.min.x + MODAL_PAD, y + 3.0),
+                                pos2(card.max.x - MODAL_PAD, y + MODAL_ROW_H - 3.0),
+                            ),
+                            &git::ResetMode::ALL.map(|m| (reset_words(m).0, m)),
+                            mode,
+                        );
+                        modal_text(ui, card, y + MODAL_ROW_H, RESET_SHARES, TEXT_SECONDARY, 11.0);
+                        modal_text(
+                            ui,
+                            card,
+                            y + MODAL_ROW_H * 2.0,
+                            reset_words(*mode).1,
+                            TEXT_PRIMARY,
+                            11.0,
+                        );
+                    }
                     // 第二格文本框（只有克隆那一档有）。`y` 在这儿不再往后推：底部那两枚按
                     // `card.max.y` 定位，这一格的高度已经记进 `rows()`。
                     Form::AddRepo { tab: AddTab::Clone, dest } => {
+                        // 目标目录同样给一枚「浏览…」。这一格只有克隆那一档存在，
+                        // 所以 `FolderField` 直接给 `CloneDest`，不用再问一次当前是哪一档。
+                        let mut right = card.max.x - MODAL_PAD;
+                        let (hit, w) = card_button(ui, "浏览…", right, y + MODAL_ROW_H / 2.0, false);
+                        if hit {
+                            pick = Some(FolderField::CloneDest);
+                        }
+                        right -= w + 6.0;
                         let r = Rect::from_min_max(
                             pos2(card.min.x + MODAL_PAD, y + (MODAL_ROW_H - FIELD_H) / 2.0),
-                            pos2(card.max.x - MODAL_PAD, y + (MODAL_ROW_H + FIELD_H) / 2.0),
+                            pos2(right, y + (MODAL_ROW_H + FIELD_H) / 2.0),
                         );
                         let _ = card_field(ui, r, "目标目录", dest, 1);
                     }
@@ -731,13 +868,13 @@ impl Gitx {
                                 );
                             }
                             PrefPage::About => {
-                                modal_text(ui, card, y, &format!("书签里的仓库：{repos} 本"), INK, 11.5);
+                                modal_text(ui, card, y, &format!("书签里的仓库：{repos} 本"), TEXT_PRIMARY, 11.5);
                                 modal_text(
                                     ui,
                                     card,
                                     y + MODAL_ROW_H,
                                     &database.clone().unwrap_or_else(|| "没有可用的数据库".to_owned()),
-                                    MUTED,
+                                    TEXT_SECONDARY,
                                     11.0,
                                 );
                             }
@@ -782,7 +919,7 @@ impl Gitx {
                         pos2(card.min.x, card.max.y - MODAL_FOOT_H),
                         pos2(card.max.x, card.max.y - MODAL_FOOT_H),
                     ],
-                    Stroke::new(1.0, RULE),
+                    Stroke::new(1.0, BORDER_SUBTLE),
                 );
                 let cy = card.max.y - MODAL_FOOT_H / 2.0;
                 let mut right = card.max.x - MODAL_PAD;
@@ -816,6 +953,11 @@ impl Gitx {
             } else {
                 primary = primary_action(&mut m);
             }
+        }
+        // 「浏览…」按下去只把牌子立起来，面板要等这一帧之外才跑（见 `Dialog`）。
+        // 卡片**保持开着**：这时候还没有答案，关掉等于让用户重填一遍。
+        if let Some(field) = pick {
+            self.pending_dialog = Some(Dialog::PickFolder { field });
         }
         // 偏好卡的开关「改一格算一格」：卡还开着就要生效、就要落库，所以在这儿回写一次。
         if let Form::Settings { prefs, .. } = &m.form {
@@ -855,6 +997,11 @@ impl Gitx {
                         continue;
                     }
                     let snap = *snap;
+                    // 记下「最后一次**在分支上**时的那条分支名」：分离 HEAD 之后 `status.branch`
+                    // 是空的，而状态栏那句「回到 main」要的正是这个已经不再写在快照里的名字。
+                    if !snap.status.branch.is_empty() {
+                        self.last_branch = snap.status.branch.clone();
+                    }
                     // 提交数可能变了（刚切了分支）：下标越界就退回工作区行。
                     self.sel = match &self.sel {
                         Sel::Commit(i) if *i < snap.commits.len() => Sel::Commit(*i),
@@ -986,6 +1133,11 @@ impl Gitx {
                         Err(e) => self.note = Some(format!("仓库没落地：{e}")),
                     }
                 }
+                // 归档成了：只报一句落在哪儿，界面什么都不换（它没动仓库，快照还是对的）。
+                Msg::Archived(dest) => {
+                    self.busy = false;
+                    self.note = Some(format!("已导出 {dest}"));
+                }
                 Msg::Failed(e) => {
                     if !e.is_empty() {
                         self.note = Some(e);
@@ -1010,56 +1162,86 @@ impl Gitx {
         }
     }
 
-    // ---------------------------------------------------------------- 工具栏
-    /// 第一行 = 参考图那条标题带，**只放参考图有的东西**：仓库名、分支、11 枚竖按钮。
-    /// 提示语与「添加仓库」以前也塞在这一行，横向布局给不了它们预算，于是
-    /// `书签 ▼` 压住了 `⤴`、`添加仓库` 压住了 `≡`（无头量出来的两对交叠，见
-    /// `the_toolbar_row_has_no_overlapping_widgets`）。它们现在搬到 `tab_bar`。
+    // -------------------------------------------------------------------- 顶栏
+    /// §2 那条 46pt 的带，从左到右：**红绿灯让出的 92pt** → 仓库胶囊 tab（含「＋ 添加仓库」）
+    /// → 分支名 + `↑↓` → §4.1 那组 28×28 图标按钮。
+    /// 旧的两条带（标题 52 + tab 24）合成一条；仓库名那行「xxx (Git)」删了——书签摊成 tab 之后
+    /// tab 本身就是仓库名，§2 那一行也没有它。提示语走底部 toast（`toast::show`）。
     pub(crate) fn toolbar(&mut self, ui: &mut egui::Ui) {
         let mut tool: Option<usize> = None;
-        let name = self
-            .repo
-            .as_ref()
-            .and_then(|p| self.repos.iter().find(|r| &r.path == p).map(|r| r.name.clone()))
-            .unwrap_or_else(|| "没有仓库".to_owned());
-        let head = self.snap.as_ref().map(|s| {
+        let mut pick: Option<String> = None;
+        let mut want_add = false;
+        let current = self.repo.clone();
+        let repos = self.repos.clone();
+        // 分支那一格拆成两段：名字是次要灰，`↑n ↓m` 是主色 + 真字重（预览稿 `.branch-chip b`）。
+        // 没有上游时一个数字都不许出现（契约：绝不显示 ↑0 ↓0）。
+        let head: Option<(String, Option<String>)> = self.snap.as_ref().map(|s| {
             let st = &s.status;
-            let mut t = st.branch.clone();
-            if st.ahead > 0 || st.behind > 0 {
-                t.push_str(&format!("  ↑{} ↓{}", st.ahead, st.behind));
-            }
-            t
+            let counts = (st.ahead > 0 || st.behind > 0).then(|| format!("↑{} ↓{}", st.ahead, st.behind));
+            (st.branch.clone(), counts)
         });
+        let outer = ui.max_rect();
         egui::Panel::top("toolbar")
-            .exact_size(TOOLBAR_H)
-            // 左边 91.5 是给红绿灯让的（它们由操作系统画在这一行上面，x 20..72），
-            // 右边 21 是参考图最右一枚按钮的余量。上下 5 让 21pt 图标 + 标签落在带里。
-            .frame(egui::Frame::NONE.fill(TOOLBAR_BG).inner_margin(Margin {
+            .exact_size(HEADER_H)
+            // 左 92 是给红绿灯让的（它们由操作系统画在这一行上面，x 20..72），右 12 = §2。
+            // 上下各 9：`(46 − 28) / 2`，28 是这一行最高的控件（§4.1 图标按钮）；
+            // 胶囊 tab 的 26 在净高里垂直居中。
+            .frame(egui::Frame::NONE.fill(BG_WINDOW).inner_margin(Margin {
                 left: TITLE_INSET,
-                right: TOOLBAR_RIGHT,
-                top: 5,
-                bottom: 5,
+                right: HEADER_RIGHT,
+                top: HEADER_VPAD,
+                bottom: HEADER_VPAD,
             }))
             .show(ui, |ui| {
-                // 一整行：左边仓库名 + 分支，右边 11 个竖按钮。
-                // 分两行的话 43pt 的按钮会把 55pt 的带撑到 74pt（无头测试量出来的）。
+                // 一整行。分两行的话按钮 + tab 会把 46pt 的带撑出去（无头测试量出来的）。
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("{name} (Git)")).size(13.5).strong());
-                    if let Some(h) = &head {
-                        ui.label(RichText::new(h).size(11.5).color(MUTED));
+                    ui.spacing_mut().item_spacing.x = TAB_GAP;
+                    for r in &repos {
+                        if repo_tab(ui, &r.name, current.as_deref() == Some(r.path.as_str())) {
+                            pick = Some(r.path.clone());
+                        }
+                    }
+                    // 空列表时这枚是**唯一**的入口。以前它旁边摊着一格路径输入和
+                    // 「打开 / 克隆…」两枚，用户说太简陋：三件事各有一格输入，挤在一条里根本
+                    // 读不清在填什么，现在统一收成一张卡（`Modal::add_repo`）。
+                    if ghost_tab(ui, "＋ 添加仓库") {
+                        want_add = true;
                     }
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                        // right_to_left 得反着加。
+                        ui.spacing_mut().item_spacing.x = ICON_BTN_GAP;
+                        // right_to_left 得反着加：先加的先贴右沿。
                         for i in (0..TOOLS.len()).rev() {
-                            if tool_button(ui, i) {
+                            if icon_button(ui, i) {
                                 tool = Some(i);
                             }
+                        }
+                        // 组与组之间让 14（`.header{gap:14}`），按钮自己那 2 已经吃进去了。
+                        ui.add_space(14.0 - ICON_BTN_GAP);
+                        if let Some((branch, counts)) = &head {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            if let Some(c) = counts {
+                                ui.label(RichText::new(c).size(BRANCH_FONT).color(TEXT_PRIMARY).family(crate::ui::fonts::semibold_family()));
+                            }
+                            ui.label(RichText::new(branch).size(BRANCH_FONT).color(TEXT_SECONDARY));
                         }
                     });
                 });
             });
+        // 下沿那条 1px 分隔线（§2「白底 + 下 1px 分隔线」）。画在**父 ui** 上：
+        // 卡布里 `ui.max_rect()` 已经被 `inner_margin` 收到 92..1038、37 那格，
+        // 在里面画只能画出"让了边距的一小截"；§2 要的是横贯整窗贴着带外沿的那一条。
+        ui.painter_at(Rect::from_min_max(outer.min, pos2(outer.max.x, outer.min.y + HEADER_H))).line_segment(
+            [pos2(outer.min.x, outer.min.y + HEADER_H - 0.5), pos2(outer.max.x, outer.min.y + HEADER_H - 0.5)],
+            Stroke::new(1.0, BORDER_SUBTLE),
+        );
+        if want_add {
+            self.show_modal(Modal::add_repo());
+        }
+        if let Some(p) = pick {
+            self.open(&p);
+        }
         if let Some(i) = tool {
-            // 卡片开着的时候工具条不再接第二下 —— 上面那层遮罩挡的是**鼠标**，键盘是共享的：
+            // 卡片开着的时候顶栏不再接第二下 —— 上面那层遮罩挡的是**鼠标**，键盘是共享的：
             // 卡里的文本框正在接 Enter，这时候再按 ⌥⌘ 之类的快捷键开第二张卡会把状态搞乱。
             if self.modal.is_none() {
                 self.on_tool(i);
@@ -1295,7 +1477,7 @@ impl Gitx {
                 ui.painter().rect_filled(bg, 0.0, Color32::from_black_alpha(80));
                 let p = ui.painter();
                 p.rect_filled(card, 6.0, Color32::WHITE);
-                p.rect_stroke(card, 6.0, Stroke::new(1.0, RULE), egui::StrokeKind::Middle);
+                p.rect_stroke(card, 6.0, Stroke::new(1.0, BORDER_SUBTLE), egui::StrokeKind::Middle);
 
                 let head_cy = card.min.y + HIST_HEAD_H / 2.0;
                 put_left(
@@ -1309,7 +1491,7 @@ impl Gitx {
                             Label::new(
                                 RichText::new(format!("文件历史 · {}", h.path))
                                     .size(12.5)
-                                    .color(INK_STRONG)
+                                    .color(TEXT_PRIMARY)
                                     .strong(),
                             )
                             .truncate()
@@ -1366,7 +1548,7 @@ impl Gitx {
                         let right = Rect::from_min_max(pos2(list.max.x + 8.0, body.min.y), body.max);
                         ui.painter().line_segment(
                             [pos2(list.max.x + 4.0, body.min.y), pos2(list.max.x + 4.0, body.max.y)],
-                            Stroke::new(1.0, RULE),
+                            Stroke::new(1.0, BORDER_SUBTLE),
                         );
                         if h.entries.is_empty() {
                             history_note(
@@ -1576,86 +1758,54 @@ impl Gitx {
         }
     }
 
-    // ------------------------------------------------------------- 仓库 tab 条
-    /// 第二行：书签列表摊成一排 tab，点一枚就是把那个仓库开起来。
-    /// SourceTree 把这些放在**另一个窗口**（书签窗），这个壳只有一个窗口，所以列表常驻在这一行。
-    /// 开发期提示（`note`）以前挤在这一行右端，现在是底部 toast（`toast::show`）。
-    pub(crate) fn tab_bar(&mut self, ui: &mut egui::Ui) {
-        let mut pick: Option<String> = None;
-        let current = self.repo.clone();
-        let repos = self.repos.clone();
-        let mut want_add = false;
-        egui::Panel::top("tabs")
-            .exact_size(TAB_H)
-            .frame(egui::Frame::NONE.fill(TOOLBAR_BG).inner_margin(Margin::symmetric(6, 2)))
-            .show(ui, |ui| {
-                // 控件高度钉死在这一条的净高上：`spacing.interact_size.y` 是 22（= ROW_H），
-                // 直接 `ui.button` 会把 24pt 的带撑到 30（无头量出来的），
-                // 于是 tab 条的底色越界压到侧栏和日志顶上几像素。
-                ui.allocate_ui_with_layout(
-                    vec2(ui.available_width(), TAB_H - 4.0),
-                    egui::Layout::left_to_right(Align::Center),
-                    |ui| {
-                        ui.spacing_mut().item_spacing.x = 3.0;
-                        for r in &repos {
-                            if tab_button(ui, &r.name, current.as_deref() == Some(r.path.as_str())) {
-                                pick = Some(r.path.clone());
-                            }
-                        }
-                        // 空列表时这枚按钮是**唯一**的入口。以前它旁边摊着一格路径输入和
-                        // 「打开 / 克隆…」两枚，用户说太简陋：三件事各有一格输入，挤在 24pt
-                        // 的一条里根本读不清在填什么，现在统一收成一张卡（`Modal::add_repo`）。
-                        if tab_button(ui, "添加仓库", false) {
-                            want_add = true;
-                        }
-                    },
-                );
-            });
-        if want_add {
-            self.show_modal(Modal::add_repo());
-        }
-        if let Some(p) = pick {
-            self.open(&p);
-        }
-    }
-
     // ------------------------------------------------------------------ 侧栏
-    /// 参考图：分类是「图标 + 浅灰标签」一行 47pt，子项 26pt 一条、**和分类标签同一列**，
-    /// 被选中的那一条铺一枚灰色圆角药丸。**没有**折叠三角，也**没有**「（3）」计数——
-    /// 这两样我们原来都有，是凭 SourceTree 3 的印象加的，4.2.19 的图上不存在。
+    /// §2：188pt 灰底一栏，分组头 = 11px 灰字 + 右对齐计数（**无图标**），子项行高 26、
+    /// 选中 = 浅蓝药丸（圆角 6），当前分支 = 蓝点 + 中黑字，底置一枚 26pt 筛选输入框。
+    /// **没有**折叠三角那一枚字符（§2 明写）；「远端」那一组能点开，靠的是子项往右缩一档、
+    /// 而不是一个箭头。其余几组的折叠归 S6-3b 和仓库分组一起接。
     pub(crate) fn sidebar(&mut self, ui: &mut egui::Ui) {
-        let none = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        let (branches, tags, remotes, stashes) = match &self.snap {
-            Some(s) => (&s.branches, &s.tags, &s.remotes, &s.stashes),
-            None => (&none.0, &none.1, &none.2, &none.3),
+        let none = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (branches, tags, remotes, stashes, remote_refs) = match &self.snap {
+            Some(s) => (&s.branches, &s.tags, &s.remotes, &s.stashes, &s.remote_refs),
+            None => (&none.0, &none.1, &none.2, &none.3, &none.4),
         };
         let sel = self.sel.clone();
         let mut filter = self.side_filter.clone();
+        // 展开着的那几条远端的名字，**开局读一份**：面板闭包里 `self` 正被借走，
+        // 而这一份只用来决定画不画，改它走 `Intent::toggle_remote`（见 `land`）。
+        let remote_open = self.remote_open.clone();
         let mut intent = Intent::default();
         egui::Panel::left("sidebar")
             .exact_size(SIDEBAR_W)
-            .frame(egui::Frame::NONE.fill(SIDEBAR_BG).inner_margin(Margin::same(SIDE_INSET)))
+            .frame(
+                egui::Frame::NONE
+                    .fill(BG_SIDEBAR)
+                    .inner_margin(Margin { left: SIDE_INSET, right: SIDE_INSET, top: SIDE_VPAD, bottom: SIDE_VPAD }),
+            )
             .show(ui, |ui| {
                 // 先把最底那条筛选框的高度扣掉再开滚动区：ScrollArea 默认吃掉全部可用高度，
                 // 不扣的话「筛选器」会被挤到窗口外（无头测试里侧栏的底色矩形超出窗口 27pt）。
                 let list_h = (ui.available_height() - SIDE_FILTER_H).max(60.0);
                 ScrollArea::vertical().auto_shrink([false, false]).max_height(list_h).show(ui, |ui| {
-                    side_row(ui, SIDE_HEAD_H, "工作区", 12.5, SIDE_LABEL_C, false, Some(icon_monitor));
+                    // 「工作区」那一档固定三条，所以计数写死 3；它不是从 `items` 数出来的。
+                    side_group_row(ui, "工作区", 3);
                     for (label, hit) in [("文件状态", Sel::Uncommitted), ("历史", Sel::Commit(0))] {
-                        if side_row(ui, ROW_H, label, 12.0, SIDE_INK, sel == hit, None).clicked() {
+                        if side_row(ui, label, sel == hit, false).clicked() {
                             intent.goto = Some(hit);
                         }
                     }
-                    if side_row(ui, ROW_H, "搜索", 12.0, SIDE_INK, false, None).clicked() {
+                    if side_row(ui, "搜索", false, false).clicked() {
                         intent.note = Some("egui 版还没接：搜索面板（SourceTree 是带作用域条的独立面板）".to_owned());
                     }
                     side_category(
                         ui,
                         "分支",
-                        icon_branch,
                         &filter,
                         branches,
                         |b| b.name.clone(),
+                        // 分支这一组没有「选中」：`Sel` 里没这一档，点它就是切过去（会改 HEAD，
+                        // 回来时 `is_current` 自己会挪地方）。§2 那颗蓝点标的是**当前**，不是选中。
+                        |_| false,
                         |b| b.is_current,
                         |b, intent| intent.run(Action::Checkout(b.name.clone())),
                         |ui, b, intent| {
@@ -1675,15 +1825,17 @@ impl Gitx {
                             );
                             menu_item(ui, "删除这个分支", || Action::DeleteBranch(b.name.clone()), intent);
                         },
+                        // 本地分支没有第三级：点开没有下一步，硬摆一格空的只会让用户以为坏了。
+                        |_, _, _| {},
                         &mut intent,
                     );
                     side_category(
                         ui,
                         "标签",
-                        icon_tag,
                         &filter,
                         tags,
                         |t| t.name.clone(),
+                        |_| false,
                         |_| false,
                         |t, intent| intent.reveal = Some(t.target.clone()),
                         |ui, t, intent| {
@@ -1697,30 +1849,61 @@ impl Gitx {
                             );
                             menu_item(ui, "删除这个标签", || Action::DeleteTag(t.name.clone()), intent);
                         },
+                        |_, _, _| {},
                         &mut intent,
                     );
                     side_category(
                         ui,
                         "远端",
-                        icon_cloud,
                         &filter,
                         remotes,
                         |r| r.name.clone(),
                         |_| false,
+                        |_| false,
+                        // 左键管展开/收起。没有箭头字符（§2 明写侧栏不画折叠三角），
+                        // 展开这件事靠下面那几行往右缩一档来说。
                         |r, intent| {
-                            intent.note = Some(format!("{} → {}（右键这一行有抓取、打开主页）", r.name, r.url));
+                            intent.toggle_remote = Some(r.name.clone());
                         },
                         |ui, r, intent| {
                             menu_item(ui, "抓取这个远端", || Action::FetchRemote(r.name.clone()), intent);
                             menu_item(ui, "抓取全部远端", || Action::Fetch, intent);
                             menu_item(ui, "在浏览器里打开主页", || Action::BrowseRemote(r.name.clone()), intent);
+                            // 地址那一格从**点一下**挪到了右键：左键现在管展开，不能再兼着念地址。
+                            if ui.button("看地址").clicked() {
+                                intent.note = Some(format!("{} → {}", r.name, r.url));
+                                ui.close();
+                            }
+                        },
+                        // 点开之后：这一条远端的远程分支，剥掉 `origin/` 那一截前缀
+                        // （远端已经由上面那一行说了，行上要说的是分支）。
+                        // 筛选只筛**远端名**：筛到 `fork` 时它的分支跟着出来，反过来
+                        // 只命中分支名而远端名不命中时，那一组整个被筛掉了——这一档限制
+                        // 登记在 `DESIGN.md` §7。
+                        |ui, r, intent| {
+                            if !remote_open.iter().any(|n| n == &r.name) {
+                                return;
+                            }
+                            let prefix = format!("{}/", r.name);
+                            for rr in remote_refs.iter().filter(|x| x.name.starts_with(&prefix)) {
+                                let tail = &rr.name[prefix.len()..];
+                                let resp = side_sub_row(ui, tail);
+                                let name = rr.name.clone();
+                                let target = rr.target.clone();
+                                resp.context_menu(|ui| {
+                                    menu_item(ui, "切换过去", || Action::CheckoutRemote(name.clone()), intent);
+                                    menu_go(ui, "到那条提交", target.clone(), intent);
+                                });
+                                if resp.clicked() {
+                                    intent.run(Action::CheckoutRemote(rr.name.clone()));
+                                }
+                            }
                         },
                         &mut intent,
                     );
                     side_category(
                         ui,
                         "已贮藏",
-                        icon_stash,
                         &filter,
                         stashes,
                         // `stash@{0}:` 是列表包装、`On <分支>:` 是 git 的包装，两截在核心层都剥掉了。
@@ -1733,17 +1916,23 @@ impl Gitx {
                             }
                         },
                         |s| matches!(sel, Sel::Stash(i) if i == s.index as usize),
+                        // 贮藏不是分支，没有 §2 那颗「当前分支」蓝点。
+                        |_| false,
                         |s, intent| intent.goto = Some(Sel::Stash(s.index as usize)),
                         |ui, s, intent| {
                             menu_item(ui, "应用到工作区", || Action::StashApply(s.index), intent);
                             menu_item(ui, "弹出并删掉这条", || Action::StashPop(s.index), intent);
                             menu_item(ui, "丢弃这条贮藏", || Action::StashDrop(s.index), intent);
                         },
+                        |_, _, _| {},
                         &mut intent,
                     );
                 });
-                ui.add_space(4.0);
-                ui.add_sized(Vec2::new(ui.available_width(), 20.0), TextEdit::singleline(&mut filter).hint_text("筛选器"));
+                ui.add_space(SIDE_FILTER_GAP);
+                ui.add_sized(
+                    Vec2::new(ui.available_width(), SIDE_FILTER_H - SIDE_FILTER_GAP),
+                    TextEdit::singleline(&mut filter).hint_text("筛选器"),
+                );
             });
         self.side_filter = filter;
         self.land(intent);
@@ -1763,9 +1952,9 @@ impl Gitx {
                     .resizable(true)
                     .default_size(FILES_W)
                     .min_size(200.0)
-                    // 横向内边距 0：文件表那几列的缩进**全部按面板左缘量**（141 起算：方框 8、
-                    // 图标 47、文件名 68），再让 egui 偷偷加 4pt 就对不上参考图了。
-                    // 竖向留 2pt，给上下那条分隔线。
+                    // 横向内边距 0：文件表那几列的缩进**全部按面板左缘量**（S6-3 之后侧栏宽 188，
+                    // 这一格的左缘就从 141 挪到 188；方框 8、图标 47、文件名 68 这三档归 S6-5 重新对）。
+                    // 再让 egui 偷偷加 4pt 就对不上了。竖向留 2pt，给上下那条分隔线。
                     .frame(egui::Frame::NONE.fill(Color32::WHITE).inner_margin(Margin::symmetric(0, 2)))
                     .show(ui, |ui| self.file_list(ui));
                 egui::CentralPanel::default().frame(egui::Frame::NONE.fill(Color32::WHITE).inner_margin(Margin::symmetric(0, 2))).show(ui, |ui| self.diff_pane(ui));
@@ -1795,7 +1984,7 @@ impl Gitx {
             ui.horizontal(|ui| {
                 // 参考图这一条的文字起在 x 169.5，和下面分类行的标签**同一列**（面板左缘 141 + 28.5）。
                 ui.add_space(CHK_HEAD_X + CHK_S + 7.0);
-                ui.label(RichText::new(PENDING_SORTED_BY_PATH).size(11.0).color(MUTED));
+                ui.label(RichText::new(PENDING_SORTED_BY_PATH).size(11.0).color(TEXT_MUTED));
                 ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                     if ui.small_button("全部暂存").clicked() {
                         act = Some(Action::StageAll);
@@ -1817,7 +2006,7 @@ impl Gitx {
                 section(ui, "已暂存文件", &staged, true, &current, &mut act, &mut pick, &mut hist);
                 section(ui, "未暂存文件", &unstaged, false, &current, &mut act, &mut pick, &mut hist);
                 if files.is_empty() {
-                    ui.label(RichText::new("工作区是干净的。").color(MUTED).size(12.0));
+                    ui.label(RichText::new("工作区是干净的。").color(TEXT_SECONDARY).size(12.0));
                 }
             });
 
@@ -1862,7 +2051,7 @@ impl Gitx {
                     act = Some(if self.amend { Action::Amend(msg.clone()) } else { Action::Commit(msg.clone()) });
                 }
                 if !can {
-                    ui.label(RichText::new(why).size(11.0).color(MUTED));
+                    ui.label(RichText::new(why).size(11.0).color(TEXT_SECONDARY));
                 }
             });
         } else {
@@ -1892,7 +2081,7 @@ impl Gitx {
                 format!("这个提交改了 {} 个文件", files.len())
             };
             ui.horizontal(|ui| {
-                ui.label(RichText::new(head).size(11.0).color(MUTED));
+                ui.label(RichText::new(head).size(11.0).color(TEXT_SECONDARY));
                 if let Some(o) = &oid {
                     if ui.small_button("全部变更").clicked() {
                         pick = Some(if stash {
@@ -1903,7 +2092,7 @@ impl Gitx {
                     }
                 }
             });
-            ui.label(RichText::new(subject).size(11.5).color(MUTED));
+            ui.label(RichText::new(subject).size(11.5).color(TEXT_SECONDARY));
             ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 let current = self.file.clone();
                 for d in files {
@@ -1968,12 +2157,12 @@ impl Gitx {
         if let Some(st) = &badge_st {
             let (fill, glyph) = badge_of(st);
             let b = Rect::from_min_size(pos2(x, head.center().y - BADGE_S / 2.0), Vec2::splat(BADGE_S));
-            p.rect_filled(b, 4.0, fill);
-            p.text(b.center(), Align2::CENTER_CENTER, glyph, FontId::proportional(10.5), Color32::WHITE);
+            p.rect_filled(b, BADGE_R, fill);
+            p.text(b.center(), Align2::CENTER_CENTER, glyph, FontId::proportional(11.0), Color32::WHITE);
             x = b.max.x + 6.0;
         }
         if busy {
-            p.text(head.right_center(), Align2::RIGHT_CENTER, "读取中…", FontId::proportional(11.0), MUTED);
+            p.text(head.right_center(), Align2::RIGHT_CENTER, "读取中…", FontId::proportional(11.0), TEXT_MUTED);
         }
         // 搜索框固定钉在灰带右端：参考图有这条，但没量到它的宽高（见 docs/PROCESS.md），
         // 宽度只按「搜索差异」四个字 + 输入余量估。
@@ -2005,12 +2194,12 @@ impl Gitx {
             pos2(head.max.x - if busy { 62.0 } else { DIFF_SEARCH_W + 14.0 }, head.max.y),
         );
         put_left(ui, r, |ui| {
-            ui.add(Label::new(RichText::new(label.as_str()).size(12.0).color(INK_STRONG).strong()).truncate())
+            ui.add(Label::new(RichText::new(label.as_str()).size(12.0).color(TEXT_SECONDARY)).truncate())
         });
         // 搜索把每一行都筛掉了：整块空白会让人以为差异没取回来，得说清是「筛没了」。
         if rows.is_empty() {
             let msg = if lines.is_empty() { "没有差异" } else { "没有匹配的行" };
-            ui.centered_and_justified(|ui| ui.label(RichText::new(msg).color(MUTED)));
+            ui.centered_and_justified(|ui| ui.label(RichText::new(msg).color(TEXT_MUTED)));
             return;
         }
         let width = ui.available_width();
@@ -2052,14 +2241,14 @@ impl Gitx {
                         Align2::LEFT_CENTER,
                         label,
                         font.clone(),
-                        INK_STRONG,
+                        TEXT_SECONDARY,
                     );
                     p.text(
                         rect.right_center(),
                         Align2::RIGHT_CENTER,
                         if folded { "点击展开" } else { "点击折叠" },
                         FontId::proportional(10.5),
-                        MUTED,
+                        TEXT_MUTED,
                     );
                     if resp.clicked() {
                         fold = Some(line.file);
@@ -2072,7 +2261,7 @@ impl Gitx {
                 let bg = match line.kind {
                     Kind::Add => ADD_BG,
                     Kind::Del => DEL_BG,
-                    Kind::Hunk => HUNK_BG,
+                    Kind::Hunk => BG_INSET,
                     // 文件头在上一段就 `continue` 了，走不到这儿。
                     Kind::File | Kind::Ctx => Color32::TRANSPARENT,
                 };
@@ -2082,13 +2271,17 @@ impl Gitx {
                 for (i, n) in [(0, line.old), (1, line.new)] {
                     let text = n.map(|v| v.to_string()).unwrap_or_default();
                     let r = band(rect, rect.min.x + NO_W * i as f32, NO_W, th);
-                    p.text(r.right_center(), Align2::RIGHT_CENTER, text, font.clone(), LINE_NO);
+                    p.text(r.right_center(), Align2::RIGHT_CENTER, text, font.clone(), TEXT_MUTED);
                 }
                 let x = rect.min.x + NO_W * 2.0 + 6.0;
                 let rich = match line.kind {
                     // hunk 头在 `layout`（工作线程）里就已经翻成人话了，帧里只管画。
                     // 这儿原来还带一份自己的翻译，两条规则各写一遍——见 `a_hunk_row_reads_as_a_block_number_and_line_range`。
-                    Kind::Hunk => RichText::new(&line.text).font(font.clone()).color(MUTED),
+                    Kind::Hunk => RichText::new(&line.text).font(font.clone()).color(TEXT_MUTED),
+                    // §3.1 的增/删两行是**连字一起染**（预览稿 `.dl.a`/`.dl.d` 同一条规则），
+                    // 不是只铺一条底色带、正文仍然黑。
+                    Kind::Add => RichText::new(&line.text).font(font.clone()).color(ADD_FG),
+                    Kind::Del => RichText::new(&line.text).font(font.clone()).color(DEL_FG),
                     _ => RichText::new(&line.text).font(font.clone()).color(fg),
                 };
                 // 文字那一格只按**看得见**的宽度申请（和 hunk 按钮同一个道理：跟着
@@ -2231,7 +2424,7 @@ impl Gitx {
         let sel = self.sel.clone();
         let Some(snap) = self.snap.as_ref() else {
             egui::CentralPanel::default().frame(egui::Frame::NONE.fill(Color32::WHITE)).show(ui, |ui| {
-                ui.centered_and_justified(|ui| ui.label(RichText::new("左侧选一个仓库").color(MUTED)));
+                ui.centered_and_justified(|ui| ui.label(RichText::new("左侧选一个仓库").color(TEXT_MUTED)));
             });
             return;
         };
@@ -2393,24 +2586,41 @@ impl Gitx {
     }
 
     /// 底部状态栏：左边当前分支与领先落后，右边仓库路径。
-    /// SourceTree 的四张参考图都把窗口底裁掉了，这 26pt 的内容没有对照依据——
-    /// 挑了没有争议的三样：分支名、有上游才出现的 ↑↓ 计数（契约：没有上游绝不显示 ↑0 ↓0）、
-    /// 正在进行的操作。等拿到一张带状态栏的参考图或真窗口对照再修。
+    /// 内容（分支名、有上游才出现的 ↑↓ 计数——契约：没有上游绝不显示 ↑0 ↓0、正在进行的操作）
+    /// 是挑的没有争议的三样；几何与配色走 §2 STATUS + §3.4「辅助」档，11px 灰字那一档跟 S6-5 进来。
     pub(crate) fn status_bar(&mut self, ui: &mut egui::Ui) {
+        // 「回到 main」那一格点下去要发一条检出。和其余面板同一个套路：闭包里不许碰 `self`
+        // （正被 `snap` 借着），所以只把要办的事带出去，等 `show` 返回再落地。
+        let mut go_back: Option<String> = None;
         egui::Panel::bottom("status")
             .exact_size(STATUS_H)
-            .frame(egui::Frame::NONE.fill(TOOLBAR_BG))
+            .frame(egui::Frame::NONE.fill(BG_WINDOW))
             .show(ui, |ui| {
                 let rect = ui.max_rect();
-                // 顶上那条 1px 分隔线：状态栏是 chrome（灰底），和上面白底的内容区要有边界。
+                // 顶上那条 1px 分隔线（§2「STATUS 24pt：白底 + 上 1px 分隔线」）：
+                // 状态栏和内容区同白底，边界只能靠这条线。
                 ui.painter().line_segment(
                     [pos2(rect.min.x, rect.min.y + 0.5), pos2(rect.max.x, rect.min.y + 0.5)],
-                    Stroke::new(1.0, RULE),
+                    Stroke::new(1.0, BORDER_SUBTLE),
                 );
                 let mut left: Vec<String> = Vec::new();
+                let mut back: Option<String> = None;
                 if let Some(snap) = &self.snap {
                     let st = &snap.status;
-                    left.push(st.branch.clone());
+                    match &st.detached_at {
+                        // 分离 HEAD。`branch.head` 那一行 git 写的是字面量 `(detached)`，
+                        // 把它当分支名印出来，用户读到的是「有一条分支叫 (detached)」，
+                        // 而他真正想知道的两件事一个字没说：HEAD 现在**在哪条提交**上，
+                        // 以及怎么回去。
+                        Some(oid) => {
+                            let short: String = oid.chars().take(8).collect();
+                            left.push(format!("分离 HEAD · {short}"));
+                            if !self.last_branch.is_empty() {
+                                back = Some(self.last_branch.clone());
+                            }
+                        }
+                        None => left.push(st.branch.clone()),
+                    }
                     // ↑↓ 各自只在有数的时候出现：`↑0 ↓0` 是噪音，没上游时更是谎言。
                     if st.upstream.is_some() {
                         if st.ahead > 0 {
@@ -2433,9 +2643,26 @@ impl Gitx {
                         Align2::LEFT_CENTER,
                         part,
                         FontId::proportional(12.0),
-                        INK,
+                        TEXT_PRIMARY,
                     );
                     x = r.max.x + 4.0;
+                }
+                if let Some(b) = back {
+                    let r = ui.painter().text(
+                        pos2(x + 8.0, rect.center().y),
+                        Align2::LEFT_CENTER,
+                        format!("回到 {b}"),
+                        FontId::proportional(12.0),
+                        ACCENT,
+                    );
+                    let spot =
+                        Rect::from_min_max(pos2(x + 6.0, rect.min.y), pos2(r.max.x + 2.0, rect.max.y));
+                    if ui
+                        .interact(spot, egui::Id::unique("gitx-status-go-back"), Sense::click())
+                        .clicked()
+                    {
+                        go_back = Some(b);
+                    }
                 }
                 if let Some(path) = &self.repo {
                     ui.painter().text(
@@ -2443,10 +2670,13 @@ impl Gitx {
                         Align2::RIGHT_CENTER,
                         path,
                         FontId::proportional(11.5),
-                        MUTED,
+                        TEXT_MUTED,
                     );
                 }
             });
+        if let Some(b) = go_back {
+            self.act(Action::Checkout(b));
+        }
     }
 
     /// 面板装配顺序。egui 的规矩是**后声明的避让先声明的**，所以从窗底往外排：
@@ -2459,7 +2689,6 @@ impl Gitx {
         let ctx = ui.ctx().clone();
         self.poll(&ctx);
         self.toolbar(ui);
-        self.tab_bar(ui);
         // 底部面板从窗底往上叠：先声明的贴着窗底。状态栏要贴底，所以排在暂存带前面。
         self.status_bar(ui);
         self.sidebar(ui);
@@ -2477,6 +2706,10 @@ impl Gitx {
 
 impl eframe::App for Gitx {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // 原生面板画在 `shell` **之前**：`rfd` 的面板是嵌套事件循环，塞进一帧的中间等于让
+        // 同一个窗口同时在两个循环里跑。`take()` 一次消费一个，所以一次点击最多弹一个面板。
+        // 无头判据调的是 `shell()`，永远走不到这一行——这是「测试不会弹真面板」那条边界。
+        self.run_dialogs();
         self.shell(ui);
     }
 }

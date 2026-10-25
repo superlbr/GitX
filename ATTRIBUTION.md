@@ -27,6 +27,7 @@ MIT/Apache 授权范围内（条款在 `NOTICE` 里）：分叉出去请改名�
 | `eframe` / `egui` / `epaint` 0.37 | Emil Ernerfeldh 与贡献者 | MIT OR Apache-2.0 | 界面层本体，彩色 emoji 走 `color_fonts` feature |
 | `serde` / `serde_json` / `thiserror` / `chrono` / `tempfile` | 各自作者 | MIT OR Apache-2.0 | 序列化、错误类型、时间戳、测试临时目录 |
 | `rusqlite` 0.31 | Ryan Olson | MIT | 本地状态存储 |
+| `rfd` 0.17.2（原生存盘/选目录面板） | 8pt Labs 与贡献者 | **MIT**（单许可，不是双许可） | 只在 `src/ui/` 里用，核心层不许碰；它的面板是**嵌套事件循环**，只能在 `eframe::App::ui` 里、egui 那一帧之外跑（见 `state::Dialog`） |
 | SQLite（`rusqlite` 的 `bundled` feature 编进来的 C 源码） | SQLite 团队 | **公有领域** | 不需要署名，也不设限制 |
 
 字体这条曾经踩过一个坑，值得留在这儿：egui 的默认字体集里没有 CJK，缺字体时汉字落到

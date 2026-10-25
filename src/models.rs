@@ -192,6 +192,17 @@ pub struct Stash {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoStatus {
     pub branch: String,
+    /// HEAD 不挂在任何分支上时 = 那条提交的完整号；正常在分支上 = `None`。
+    /// `git status --porcelain=v2 --branch` 在分离时把 `# branch.head` 写成字面量
+    /// `(detached)`、把 `# branch.oid` 写成那条提交的号。于是「分离」有两处要说清：
+    /// `branch` 这时候**不是分支名**（所以留空，界面不许把它当名字显示），
+    /// 而那条号在 `detached_at` 里。
+    ///
+    /// `detached_at` 只收**完整号**（≥40 位十六进制）。一条提交都没有的仓库那里写的是
+    /// 占位符（本机 git 2.54 实测 `(initial)`，旧版写 `(none)`），形状这一挡把
+    /// 「还没提交」和「HEAD 脱离了分支」分开——不然新仓库一打开就顶着一行
+    /// 「分离 HEAD · (initial)」。
+    pub detached_at: Option<String>,
     /// What this branch tracks, if anything. Without it the two counts below
     /// are not "in sync" — they are "never compared to a remote at all",
     /// which the interface has to be able to tell apart.
