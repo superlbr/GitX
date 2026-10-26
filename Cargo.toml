@@ -1,6 +1,6 @@
 [package]
 name = "gitx"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
@@ -30,6 +30,9 @@ eframe = "0.37"
 # 已在 NOTICE/ATTRIBUTION 里署名。**只在 `src/ui/` 里用**：核心层（lib target）
 # 不许碰它——那条边界靠「`src/git.rs` 里 grep 不到 rfd」和编译单元本身一起守。
 rfd = "0.17.2"
+# 只解一张打包进来的 PNG（`assets/icon.png`），不引 `image` 那套通用解码：
+# 依赖树里本来就有 `png`（epaint 走它），加一条直接依赖不多下一个包。
+png = "0.18"
 
 # 彩色 emoji（COLR/PNG 位图）需要 vello_cpu 的字形光栅化，默认不开。
 [dependencies.epaint]

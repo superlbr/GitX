@@ -22,7 +22,12 @@ fn viewport() -> egui::ViewportBuilder {
     egui::ViewportBuilder::default()
         .with_inner_size([WIN_W, WIN_H])
         .with_min_inner_size([MIN_W, MIN_H])
-        .with_title("GitX")
+        // 标题栏不画（见下面三条开关），所以 Dock / Mission Control / `cmd+tab`
+        // 里认这个应用只能靠这里。版本一并写上：系统那一列没有别的可读。
+        .with_title(format!("GitX {}", crate::ui::VERSION))
+        // 窗口图标。macOS 的 Dock 图标来自 `.app` 里的 `.icns`（`scripts/bundle-macos.sh`），
+        // 这一条是给 Linux/Windows 和窗口管理器用的；两边读的是同一张 `assets/icon.png`。
+        .with_icon(crate::ui::icon::app_icon())
         // 参考图里那一行 52pt 是**标题栏本身**：红绿灯 + 仓库名 + 11 枚按钮同在一行。
         // 我们原来在它下面又画了一条工具栏，于是窗口顶部白占一条 28pt 的系统标题栏，
         // 而且仓库名排在 x=9 —— 正被红绿灯盖着。这三条开关把两条带合成一条。

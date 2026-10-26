@@ -819,7 +819,7 @@ pub fn commits(
     author: Option<&str>,
     path: Option<&str>,
 ) -> Result<Vec<Commit>> {
-    log_commits(repo, max, author, path, false, 0, &Scope::Current)
+    log_commits(repo, max, author, path, false, 0, &Scope::Current, None)
 }
 
 /// The same list in topological order — SourceTree's 「层级顺序」 switch: a branch's
@@ -831,7 +831,7 @@ pub fn commits_topo(
     author: Option<&str>,
     path: Option<&str>,
 ) -> Result<Vec<Commit>> {
-    log_commits(repo, max, author, path, true, 0, &Scope::Current)
+    log_commits(repo, max, author, path, true, 0, &Scope::Current, None)
 }
 
 /// The next page of the log: `max` commits starting `skip` commits past the head.
@@ -840,14 +840,66 @@ pub fn commits_topo(
 /// the same trade every paginated history makes; refetching the whole log to be safe
 /// costs a full walk per page.
 pub fn commits_page(repo: &str, skip: u32, max: u32, topo: bool, scope: &Scope) -> Result<Vec<Commit>> {
-    log_commits(repo, max, None, None, topo, skip, scope)
+    log_commits(repo, max, None, None, topo, skip, scope, None)
 }
 
 /// The history **of one revision** — a branch picked out of the log bar's scope popup.
 /// `git log <rev>` walks that rev's ancestors, so commits only other branches reached
 /// drop out; that is the whole point of picking a branch there.
 pub fn commits_on(repo: &str, rev: &str, max: u32, topo: bool) -> Result<Vec<Commit>> {
-    log_commits(repo, max, None, None, topo, 0, &Scope::Rev(rev.to_owned()))
+    log_commits(repo, max, None, None, topo, 0, &Scope::Rev(rev.to_owned()), None)
+}
+
+/// 一次历史页搜索在 git 那一侧分几路打。
+///
+/// 两路**各自一条 `git log`**，不是并成一条：git 里 pathspec 和 `--grep` 是**与**关系
+/// （`git log --grep=x -- path` 要的是「说明含 x **且** 改了 path」），并成一条的话
+/// 输一个文件名什么都搜不到。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchField {
+    /// 提交说明（`-F --grep=`，定长字符串不是正则：文件名里那些 `.` `+` `(A)` 不该被当成正则）。
+    Subject,
+    /// 这条提交**改动过的文件路径**（走 `log_args` 里那三条 pathspec，子串 + 忽略大小写）。
+    Path,
+}
+
+/// 历史页那一格搜索：按说明**或**按文件名找提交。
+///
+/// 返回的是「两路命中的并集，去重，新的在上」。上限 `max` 是**每一路**的上限，
+/// 所以合并后最多 `2 × max` 条——想钉总数得先钉住「两路各自取多少」这件事，
+/// 而那是界面层的问题（见 `SEARCH_MAX`）。
+pub fn search_commits(repo: &str, query: &str, scope: &Scope, max: u32) -> Result<Vec<Commit>> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut hits: Vec<Commit> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for field in [SearchField::Subject, SearchField::Path] {
+        let (author, path, grep) = match field {
+            SearchField::Subject => (None, None, Some(q)),
+            SearchField::Path => (None, Some(q), None),
+        };
+        for c in log_commits(repo, max, author, path, false, 0, scope, grep)? {
+            if seen.insert(c.id.clone()) {
+                hits.push(c);
+            }
+        }
+    }
+    sort_newest_first(&mut hits);
+    Ok(hits)
+}
+
+/// 把命中的提交按**作者时间**从新到旧排。两路各自回来的顺序是 git 自己的顺序，
+/// 拼起来会出现「上周那条排在昨天那条前面」——搜索结果的列表本来就该是时间倒序。
+/// 读不出时间的排最后，并且保持它原来在两路里的相对次序（`sort_by` 是稳定排序）。
+fn sort_newest_first(commits: &mut Vec<Commit>) {
+    let key = |c: &Commit| {
+        chrono::DateTime::parse_from_rfc3339(&c.date)
+            .map(|d| d.timestamp())
+            .unwrap_or(i64::MIN)
+    };
+    commits.sort_by(|a, b| key(b).cmp(&key(a)));
 }
 
 /// Builds the `git log` argv. Split from the parse so a test can prove the topology
@@ -864,6 +916,7 @@ fn log_args(
     topo: bool,
     skip: u32,
     scope: &Scope,
+    grep: Option<&str>,
 ) -> Vec<String> {
     let fmt = LOG_FMT;
     let mut args: Vec<String> = vec![
@@ -881,6 +934,19 @@ fn log_args(
         let t = a.trim();
         if !t.is_empty() {
             args.push(format!("--author={}", t));
+        }
+    }
+    // `-F` 让 `--grep` 按定长字符串找，不按正则：搜索框里打的 `main.ts` 那个点、
+    // `README(1)` 那对括号被当成正则的话，命中的就不是用户看见的那串字。
+    // `-i` 是**明写**的：git 的 `--grep` 默认忽略大小写，但那个默认值读的是用户全局配置里的
+    // `grep.ignoreCase`——别人把那一项设成 false，我们的搜索就跟着变成区分大小写，
+    // 而界面上一个字都没变。要 git ≥ 2.28（`--fixed-strings` 那一年才加到 `git log` 上）。
+    if let Some(g) = grep {
+        let t = g.trim();
+        if !t.is_empty() {
+            args.push("-F".into());
+            args.push("-i".into());
+            args.push(format!("--grep={}", t));
         }
     }
     // The scope takes the single slot **before** the `--`: after it, git reads the same
@@ -944,8 +1010,12 @@ fn log_commits(
     topo: bool,
     skip: u32,
     scope: &Scope,
+    grep: Option<&str>,
 ) -> Result<Vec<Commit>> {
-    let out = match run_git(repo, &str_slice(&log_args(max, author, path, topo, skip, scope))) {
+    let out = match run_git(
+        repo,
+        &str_slice(&log_args(max, author, path, topo, skip, scope, grep)),
+    ) {
         Ok(out) => out,
         // 刚 `git init` 出来的仓库有分支、还没有一条提交：`git log` 在这种仓库上退出 128，
         // 说的是 `does not have any commits yet`。那是**一份空的日志**，不是错误——
@@ -3508,8 +3578,8 @@ mod tests {
     /// 否则切一次排序，用户看到的提交集合会静默变掉。
     #[test]
     fn topo_switch_only_adds_the_order_flag() {
-        let plain = log_args(10, Some("nobody"), Some("src/a.rs"), false, 0, &Scope::Current);
-        let topo = log_args(10, Some("nobody"), Some("src/a.rs"), true, 0, &Scope::Current);
+        let plain = log_args(10, Some("nobody"), Some("src/a.rs"), false, 0, &Scope::Current, None);
+        let topo = log_args(10, Some("nobody"), Some("src/a.rs"), true, 0, &Scope::Current, None);
         assert!(!plain.iter().any(|a| a == "--topo-order"), "日期序里冒出 topo 参数");
         assert_eq!(topo.iter().filter(|a| *a == "--topo-order").count(), 1);
         let without = |v: Vec<String>| {
@@ -3524,8 +3594,8 @@ mod tests {
     /// `git log --skip=0` 合法但白拼一个参数，也让「有没有下一页」的判断少了对照。
     #[test]
     fn the_page_offset_only_adds_skip() {
-        let first = log_args(3, None, None, false, 0, &Scope::Current);
-        let second = log_args(3, None, None, false, 3, &Scope::Current);
+        let first = log_args(3, None, None, false, 0, &Scope::Current, None);
+        let second = log_args(3, None, None, false, 3, &Scope::Current, None);
         assert!(!first.iter().any(|a| a.starts_with("--skip")), "第一页发了 --skip");
         assert_eq!(second.iter().filter(|a| a.starts_with("--skip")).count(), 1);
         assert!(second.contains(&"--skip=3".to_owned()));
@@ -3538,8 +3608,8 @@ mod tests {
     /// 和 `topo_switch_only_adds_the_order_flag` 同一个理由：换筛选条件不许顺带改别的参数。
     #[test]
     fn the_rev_argument_only_adds_the_rev_before_the_pathspec() {
-        let all = log_args(10, Some("nobody"), Some("src/a.rs"), false, 0, &Scope::Current);
-        let one = log_args(10, Some("nobody"), Some("src/a.rs"), false, 0, &Scope::Rev("side".into()));
+        let all = log_args(10, Some("nobody"), Some("src/a.rs"), false, 0, &Scope::Current, None);
+        let one = log_args(10, Some("nobody"), Some("src/a.rs"), false, 0, &Scope::Rev("side".into()), None);
         assert_eq!(one.len(), all.len() + 1, "多出来的不止那一个参数：{one:?}");
         let without: Vec<String> = one.iter().filter(|a| **a != "side").cloned().collect();
         assert_eq!(without, all, "选分支顺带改了别的参数：{all:?}");
@@ -3548,8 +3618,8 @@ mod tests {
         assert!(at < dash, "rev 落在 `--` 后面就被当成路径了：{one:?}");
         // 空白的那一位等于没选：不给 git 传一个空参数（它会报 ambiguous argument）。
         assert_eq!(
-            log_args(10, None, None, false, 0, &Scope::Rev("  ".into())),
-            log_args(10, None, None, false, 0, &Scope::Current)
+            log_args(10, None, None, false, 0, &Scope::Rev("  ".into()), None),
+            log_args(10, None, None, false, 0, &Scope::Current, None)
         );
     }
 
@@ -3559,8 +3629,8 @@ mod tests {
     /// `--all` 同样必须在 `--` 前面——落到后面 git 当它是路径，列表安静地回空。
     #[test]
     fn the_all_scope_adds_only_dash_all_in_the_rev_slot() {
-        let cur = log_args(10, Some("nobody"), Some("src/a.rs"), false, 0, &Scope::Current);
-        let all = log_args(10, Some("nobody"), Some("src/a.rs"), false, 0, &Scope::All);
+        let cur = log_args(10, Some("nobody"), Some("src/a.rs"), false, 0, &Scope::Current, None);
+        let all = log_args(10, Some("nobody"), Some("src/a.rs"), false, 0, &Scope::All, None);
         assert_eq!(all.len(), cur.len() + 1, "多出来的不止 --all：{all:?}");
         assert_eq!(all.iter().filter(|a| *a == "--all").count(), 1, "--all 发了不止一次");
         let without: Vec<String> = all.iter().filter(|a| *a != "--all").cloned().collect();
@@ -3570,6 +3640,104 @@ mod tests {
         assert!(at < dash, "--all 落在 `--` 后面就被当成路径了：{all:?}");
         // 默认那一档不许偷偷带 --all：`commits()` 和 `commits_on(HEAD)` 必须是同一份列表。
         assert!(!cur.iter().any(|a| a == "--all"), "当前分支那一档发了 --all");
+    }
+
+    /// 搜提交说明那一路只多 `-F -i --grep=` 这三位，而且它们占的是**选项**那一格：
+    /// 和 `topo_switch_only_adds_the_order_flag` 同一个理由——加一档筛选不许顺带动别的参数，
+    /// 否则一次搜索会连带改掉用户看到的范围/排序。
+    #[test]
+    fn the_subject_search_adds_only_fixed_strings_grep() {
+        let plain = log_args(10, None, None, false, 0, &Scope::Current, None);
+        let one = log_args(10, None, None, false, 0, &Scope::Current, Some("README(1)"));
+        // 三位各自先问一遍，再问长度：长度那条会把「少了谁」糊成一团（M19/M20 实测都只报
+        // 「多出来的不止那三位」，看不出掉的是 `-F` 还是 `-i`）。
+        assert_eq!(one.iter().filter(|a| **a == "-F").count(), 1, "-F 没发或发了多次");
+        assert_eq!(one.iter().filter(|a| **a == "-i").count(), 1, "-i 没发或发了多次");
+        assert!(one.contains(&"--grep=README(1)".to_owned()), "--grep 少了定长那串字：{one:?}");
+        assert_eq!(one.len(), plain.len() + 3, "多出来的不止那三位：{one:?}");
+        let without: Vec<String> = one
+            .iter()
+            .filter(|a| **a != "-F" && **a != "-i" && !a.starts_with("--grep="))
+            .cloned()
+            .collect();
+        assert_eq!(without, plain, "搜说明顺带改了别的参数：{plain:?}");
+        // 空白那一位等于没搜：不给 git 发一条 `--grep=`（那会命中每一条提交）。
+        assert_eq!(
+            log_args(10, None, None, false, 0, &Scope::Current, Some("  ")),
+            plain,
+            "空搜索串发了 --grep"
+        );
+    }
+
+    /// 两路查询**各自一条 `git log`**，所以范围那一档（`--all`）在两路里都得出现一次。
+    /// 这条钉的是「合并之后范围没走偏」：要是把第二路写成 `Scope::Current`，
+    /// 那么在「所有分支」那一档下按文件名搜，支线独有的提交会安静地消失。
+    #[test]
+    fn both_search_axes_honor_the_same_scope() {
+        let (_d, p) = init_repo();
+        let base = status(&p).unwrap().branch;
+        git(&p, &["checkout", "-q", "-b", "side"]);
+        fs::write(format!("{}/only_side.log", p), "侧\n").unwrap();
+        git(&p, &["add", "-A"]);
+        git(&p, &["commit", "-q", "-m", "支线独有"]);
+        // 回到主线再搜：那条提交此刻**只有支线走得到**，`Current` 那一档不该看见它。
+        git(&p, &["checkout", "-q", base.as_str()]);
+        let needle = "only_side";
+        let cur = search_commits(&p, needle, &Scope::Current, 50).unwrap();
+        let all = search_commits(&p, needle, &Scope::All, 50).unwrap();
+        assert!(cur.is_empty(), "当前分支那一档按文件名搜出了别的分支的提交：{cur:?}");
+        assert_eq!(all.len(), 1, "所有分支那一档按文件名搜没走到支线：{all:?}");
+    }
+
+    /// 端到端：**按文件名**搜到那条提交。两档词都故意错开——提交说明里没有一个字含
+    /// `deploy`，路径里没有一个字含「改配置」——所以这条红了就是「文件名那一路根本没发出去」，
+    /// 而不是「靠说明那一路蒙对了」。
+    #[test]
+    fn a_search_by_file_name_finds_the_commit_that_touched_it() {
+        let (_d, p) = init_repo();
+        fs::write(format!("{}/deploy.yaml", p), "上线: 是\n").unwrap();
+        git(&p, &["add", "-A"]);
+        git(&p, &["commit", "-q", "-m", "改配置"]);
+        let hit = |q: &str| -> Vec<String> {
+            search_commits(&p, q, &Scope::Current, 50)
+                .unwrap()
+                .iter()
+                .map(|c| c.subject.clone())
+                .collect()
+        };
+        assert_eq!(hit("deploy"), vec!["改配置"], "按文件名搜没找到改了它的那条");
+        // 忽略大小写：路径里是 `deploy`，人打的是 `DEPLOY`。
+        assert_eq!(hit("DEPLOY"), vec!["改配置"], "按文件名搜没忽略大小写");
+        // 目录名也算（`**/*q*/**` 那一档）：搜 `src` 要能捞到改了 `src/a.rs` 的提交。
+        assert_eq!(hit("src"), Vec::<String>::new(), "这个仓库里没有 src，凭空搜出了东西");
+        // 空串/纯空白 = 没有搜索，不是「全命中」。
+        assert!(hit("").is_empty(), "空搜索把整本历史都算成命中");
+        assert!(hit("   ").is_empty(), "纯空白搜索把整本历史都算成命中");
+    }
+
+    /// 两路都命中同一条时**只出现一次**，而且列表是**新的在上**。
+    /// 后一半有杀伤力：合并顺序是「先说明那一路、再文件名那一路」，而这条夹具故意让
+    /// 只命中文件名的那条**更新**——照拼接顺序排就会把旧的排在前面，这条会红。
+    #[test]
+    fn a_search_merges_both_axes_once_and_newest_first() {
+        let (_d, p) = init_repo();
+        // 第 1 条：说明和文件名都含 `notes`（两路都命中，只能出现一次）。
+        fs::write(format!("{}/notes.md", p), "一\n").unwrap();
+        git(&p, &["add", "-A"]);
+        git(&p, &["commit", "-q", "-m", "补 notes 一段"]);
+        // 第 2 条（更新）：只有**文件名**含 notes，说明里一个字不提。
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        fs::write(format!("{}/notes2.md", p), "二\n").unwrap();
+        git(&p, &["add", "-A"]);
+        git(&p, &["commit", "-q", "-m", "调整排版"]);
+        let hits = search_commits(&p, "notes", &Scope::Current, 50).unwrap();
+        let subjects: Vec<&str> = hits.iter().map(|c| c.subject.as_str()).collect();
+        assert_eq!(subjects, vec!["调整排版", "补 notes 一段"], "合并后的顺序/去重不对：{subjects:?}");
+        assert_eq!(
+            hits.iter().filter(|c| c.subject == "补 notes 一段").count(),
+            1,
+            "两路都命中的那条被列了不止一次"
+        );
     }
 
     /// 端到端：`commits_on("side")` 只走那条支线的祖先，主线独有的提交得不在列表里；

@@ -48,7 +48,10 @@ pub(crate) const ICON_BTN_GAP: f32 = 2.0;
 /// 分支名那一格（`.branch-chip{font-size:12}` + `b{font-weight:600}`）：
 /// 分支名 12px `TEXT_SECONDARY`，`↑n ↓m` 同字号走 `TEXT_PRIMARY` + 真字重（§3.4 数字归 600 那档）。
 pub(crate) const BRANCH_FONT: f32 = 12.0;
-pub(crate) const STAGING_H: f32 = 245.0;
+/// 暂存带默认高：§2「STAGING 带 **240pt**，可拖」。旧 245 是按旧行距（26 × ? + 提交框）凑的，
+/// 随 S6-4/S6-5 的换锚作废。带可拖的档位仍是 `120 … 窗口余量`（§2 明写），
+/// 所以 240 只是**默认值**，不是下限。
+pub(crate) const STAGING_H: f32 = 240.0;
 /// 文件表底下那格提交框占的高度：摘要 26 + 描述 3 行 45.6 + 按钮行 26（行距 0，控件之间的
 /// `item_spacing.y` 也是 0），合计 97.6，按 96 的预算放。**这是自己定的预算，不是参考图量来的**——
 /// 参考图那张提交框只露出摘要一行，量不到三行描述该多高。它的用处只有一个：文件表在上面滚，
@@ -56,7 +59,9 @@ pub(crate) const STAGING_H: f32 = 245.0;
 /// 这 1.6pt 的溢出是换上 Inter 之后多出来的（行盒比自带字体高）：不能靠抬预算解决，
 /// 抬了会把文件表最后一行顶到视口边缘、点不中；父面板的 clip 会把这点溢出切掉，看不见。
 pub(crate) const COMMIT_H: f32 = 96.0;
-pub(crate) const FILES_W: f32 = 435.0;
+/// 文件表那一栏的默认宽：§2「文件表 **330pt** │ 差异区」。旧 435 是 1050pt 参考图量的
+/// （面板左缘 141 起、文件表右缘 576），随 §2 换锚作废。两栏都可拖，这一枚只是默认值。
+pub(crate) const FILES_W: f32 = 330.0;
 /// 窗口能缩到多小：§2 钉 `860 × 394`。
 /// **860 这个数只由字面值判据钉**（`the_header_numbers_are_the_design_md_values` 里
 /// `assert_eq!((MIN_W, MIN_H), (860.0, 394.0))`）。`no_visible_text_overlaps_at_the_smallest_allowed_window`
@@ -66,36 +71,49 @@ pub(crate) const FILES_W: f32 = 435.0;
 /// §2 还写了「窗口收窄时溢出收进 `»` 菜单」——那一档溢出**还没实现**，登记在 PROCESS。
 /// 真撞车的是 760 以下：那儿顶栏的 11 枚图标 + 分支 chip 已经没有地方躲。
 pub(crate) const MIN_W: f32 = 860.0;
-/// 高度 = §2 钉的 **394**（= `HEADER 46 + LOG 下限 84 + STAGING 240 + STATUS 24`）。
-/// 写成字面值、不写成公式：公式里那四个数（`ROW_H 28`、`STAGING_H 240`）是 S6-4/S6-5 的，
-/// 现在还是 26/245 —— 拿旧数拼一条公式会得到 393，那是"我们自己算出来的"，不是 spec 的数。
+/// 高度 = §2 钉的 **394**（= `HEADER 46 + LOG 下限 84 + STAGING 240 + STATUS 24`，S6-5 之后
+/// 这四项真的对得上：`ROW_H`/`LOG_HEAD_H` 已是 28、`STAGING_H` 已是 240、`STATUS_H` 已是 24）。
+/// 仍写成字面值、不写成公式：公式是**我们自己算出来的**，spec 给的是 394 这一个数；
+/// 而且 §2 那条 MIN_H 判据（`the_window_itself_is_floored_at_the_spec_size`）要的正是字面值。
 pub(crate) const MIN_H: f32 = 394.0;
-/// 参考图（1050pt 宽那张）数据行的行距：130→156→182→210，**26pt**。
-/// 我们原来用 21，整张日志因此比 SourceTree 矮一截、一屏多塞五行。
-pub(crate) const ROW_H: f32 = 26.0;
+/// 日志数据行的行距：§2「表头 28 + 行 28 × N」，预览稿 `.lr{height:28}`。
+/// 旧 26 是 1050pt 那张参考图量的（130→156→182→210），§6 把它换成 28——和表头同档，
+/// 4/8 网格（原则④）上 28 落得比 26 稳。
+pub(crate) const ROW_H: f32 = 28.0;
+/// 文件表那一档的行高：**24**（§2「STAGING 带：文件表 330pt：**行高 24**」，§6 迁移表
+/// `ROW_H 26`→`28` 那行明写了「文件行 24 另设 `FILE_ROW_H`」）。
+/// **这条常量的存在本身就是一条 bug 的记录**：文件行从前跟着 `ROW_H` 走，S6-4 把日志行距
+/// 从 26 换成 28，三条文件行连两个分类标题一起长高 24pt，最后一条（`notes.md`）被挤出
+/// `ScrollArea` 的可见框——`put_left` 里那个子 `Ui` 整块不可见时 egui **根本不落字**，
+/// 于是状态色块（painter 直接画）还在、文件名没了。日志行距与文件行距是两回事，不许共用一个数。
+pub(crate) const FILE_ROW_H: f32 = 24.0;
 pub(crate) const DIFF_ROW_H: f32 = 15.0;
-/// 日志表头那一条。§2 记的是 **28**（和 `ROW_H` 同档）；这一带只先把名字让给顶栏——
-/// 原来这条叫 `HEADER_H`，和 §2 的 HEADER 撞名，两套"表头"混在判据里迟早出事。
-/// **数还是 24**，等 S6-4（LOG 区）把行距/表头一起换过来，别在这一带改一半。
-pub(crate) const LOG_HEAD_H: f32 = 24.0;
+/// 日志表头那一条：**28**，§2 明写「表头 28pt」，和 `ROW_H` 同档（预览稿 `.lh{height:28}`）。
+/// 原来这条叫 `HEADER_H`，和 §2 的顶栏撞名，S6-2 改名时数还是 24。
+pub(crate) const LOG_HEAD_H: f32 = 28.0;
 /// 表头列边上的分隔竖线高 16pt，宽 1pt，四条都在列边界上（颜色 = `BORDER_SUBTLE`，
 /// §3.5「所有分隔线 1px」）。之前判定「表头没有竖线」是量错了带——线只有 16pt 高，
 /// 用整带阈值扫会被背景盖掉。
 pub(crate) const RULE_H: f32 = 16.0;
-/// 每列文字离自己列左边线的距离。参考图四个表头词的左缘：提交 202.5、描述 280、
-/// 作者 744、日期 934——列边界分别 198 / 275 / 739 / 929，都差 5pt。
-pub(crate) const COL_INSET: f32 = 5.0;
-/// 四列的宽度全部照那张 1050pt 宽的参考图量：边线在 198 / 275 / 739 / 929。
-/// 描述列（275..739 = 464）是弹性的，所以只要这三条定死，剩下那条自然对上。
-pub(crate) const COL_GRAPH: f32 = 57.0;
-pub(crate) const COL_SHA: f32 = 77.0;
-pub(crate) const COL_AUTHOR: f32 = 190.0;
-pub(crate) const COL_DATE: f32 = 121.0;
+/// 每列文字离自己列左边线的距离。§2 只给了四列的**宽**，没给内缩；预览稿 `.lr{padding:0 12px;
+/// gap:12px}` 给的是 12，也是 4/8 网格（原则④）上的一档。旧 5 是参考图四个表头词量出来的，
+/// 那张图的列宽和现在不同，那个数跟着一起作废。
+pub(crate) const COL_INSET: f32 = 12.0;
+/// §2 的三枚定宽列：图 48 \| 作者 96 \| 日期 78，中间「提交信息」那一列弹性。
+/// **`COL_SHA`（提交号那一列 77）整列删掉**——§2 的四列里没有它，预览稿 `.lr` 也只有
+/// `.g / .sj / .au / .dt` 四格；提交号仍可从筛选条与右键菜单拿到。
+pub(crate) const COL_GRAPH: f32 = 48.0;
+pub(crate) const COL_AUTHOR: f32 = 96.0;
+pub(crate) const COL_DATE: f32 = 78.0;
 pub(crate) const NO_W: f32 = 30.0;
-/// 图序列的车道几何：第 0 道的**中心**在列左缘 +22.75（参考图量圆点 239..246.5，
-/// 列从 220 起），往后每 12pt 一道；57pt 的列装得下 4 道（见 `layout_graph` 裁尾巴那段）。
-pub(crate) const LANE_W: f32 = 12.0;
-pub(crate) const GRAPH_PAD: f32 = 16.75;
+/// 图序列的车道几何。§2 把图列从 57 收到 **48**，四档车道（§3.3 有 `LANE_1..4` 四枚色）
+/// 在旧档上装不下：第 0 道中心 22.75 + 3×12 = 58.75 早就越列。
+/// 于是拍成**第 0 道中心离列左缘 12、道距 10**：四道落在 12/22/32/42，圆点（半径 4）
+/// 最右到 46，左右各留 8 / 2pt 的余量。旧 `LANE_W 12 / GRAPH_PAD 16.75` 是参考图在
+/// 57pt 列上量的（台账自己写了「LANE_W 是估的」），随这一列一起换。
+pub(crate) const LANE_W: f32 = 10.0;
+/// 第 0 道**中心**离图列左缘多远（不是车道间距，也不是圆点左沿）。
+pub(crate) const LANE0_X: f32 = 12.0;
 /// 参考图实测（logical pt，@2x 量的）：圆点直径 8.0 → 半径 4.0，竖线宽 2.0。
 /// 之前那对 2.6 / 1.3 是旧 React 版留下的，比参考图小一圈——同一张截图并排一看就露出来。
 pub(crate) const DOT_R: f32 = 4.0;
@@ -159,22 +177,27 @@ pub(crate) const SIDE_DOT_R: f32 = 3.5;
 /// 扣掉的预算（这一条）和画出来的高度必须同源，不然又是一处"两个数各说各话"。
 pub(crate) const SIDE_FILTER_GAP: f32 = 8.0;
 pub(crate) const SIDE_FILTER_H: f32 = SIDE_FILTER_GAP + 26.0;
-/// 描述列前面那枚药丸的几何。高 15 / 上下各留 2.5 是参考图量的（行带 129..149，药丸 131.5..146.5）；
-/// 两枚浅蓝药丸（`upstream/main` 357.5..458、`origin/main` 458.5..538.5）之间只隔 2pt，
-/// 而「超前 3 个版本」那枚深藏青是**贴死**在前一枚右边的（403 / 403.5）——它俩合成一颗胶囊。
-/// 药丸结束后描述文字再让 5pt（药丸右缘 476、文字起笔 481）。圆角取 4。
+/// 描述列开头那串 ref 药丸的几何（§4.5）。**高 15 / 圆角取半高 7 是拍的**：§4.5 只给了
+/// 「圆角 999、11/600」和四套颜色，没给高度；15 沿用参考图量到的那一档（行带 129..149、
+/// 药丸 131.5..146.5），半高画出来就是 spec 要的那颗胶囊（同 §7 里 `TAB_PILL_R` 那条处理）。
+/// 两枚浅蓝之间隔 2pt，「超前/落后」那枚**贴死**在前一枚右侧（§4.5 括弧里那句），
+/// 药丸结束后描述文字再让 5pt。
 pub(crate) const PILL_H: f32 = 15.0;
 pub(crate) const PILL_PAD: f32 = 5.0;
 pub(crate) const PILL_GAP: f32 = 2.0;
 pub(crate) const PILL_AFTER: f32 = 5.0;
-pub(crate) const PILL_R: u8 = 4;
+pub(crate) const PILL_R: u8 = 7;
 pub(crate) const PILL_FONT: f32 = 11.0;
 
 /// 侧栏灰底（§3.1 `BG_SIDEBAR` `#F7F8FA`；旧 `SIDEBAR_BG` 那枚 `#F1F1F3` 是参考图量的，
 /// 迁移表 §6 里 `SIDEBAR_BG → BG_SIDEBAR` 这一行说的就是它）。
 pub(crate) const BG_SIDEBAR: Color32 = Color32::from_rgb(0xF7, 0xF8, 0xFA);
-// 日志行的选中底还是旧的实心蓝：§4.6 要改成 `ACCENT_SOFT` tint + 左缘 2pt 主色条，归 S6-4。
-pub(crate) const SELECTED: Color32 = Color32::from_rgb(0x1c, 0x6c, 0xf0);
+/// §4.6 的选中态：**底 `ACCENT_SOFT` + 左缘 2pt `ACCENT` 竖条 + 文字保持 `TEXT_PRIMARY`**。
+/// 旧的 `SELECTED`（实心蓝 `#1C6CF0` + 整行反白）是复刻期从参考图量的，§6 那条「实心蓝底白字作废」
+/// 说的就是它——所以这枚常量**删掉不留别名**，选中改由「底色取 §3.1 的 `ACCENT_SOFT`、
+/// 条子取 `ACCENT`」两枚现成 token 画。这条 2pt 是 §4.6 给的，预览稿 `.lr.on` 用
+/// `box-shadow: inset 2px 0 0 var(--accent)` 画的是同一件事。
+pub(crate) const SELECT_BAR_W: f32 = 2.0;
 
 // ---- §3.1 色板：这一带只落**现在真有人在画**的几枚（DESIGN.md 列了 18 枚，
 // 剩下的 `WARN_*` / `CONF_*` 那些
@@ -215,18 +238,25 @@ pub(crate) const WARN: Color32 = Color32::from_rgb(0xb0, 0x3a, 0x2e);
 pub(crate) const WARN_BG: Color32 = Color32::from_rgb(0xfd, 0xf0, 0xee);
 /// 冲突横幅的行高。也没有参考图；和 `ROW_H` 差 4pt，塞得下 11.5 号字与两枚小按钮。
 pub(crate) const CONFLICT_BANNER_H: f32 = 30.0;
-/// 底部状态栏。SourceTree 的四张参考图都把窗口底裁掉了（量不到它的状态栏），
-/// 高度按行节奏取 `ROW_H`；文案与几何等拿到一张带状态栏的参考图或真窗口对照再修，
-/// PROCESS「还没量到的」已登记。
-pub(crate) const STATUS_H: f32 = 26.0;
-// 描述列那几枚 ref 药丸。三个值都是在参考图上量的（`docs/reference/…-repo-window-2026-10-20.png`，
-// 第一行 `⑂ main` 的浅蓝底取 (213,229,253)、描边取 (170,170,170)、`超前3个版本` 的藏青底取 (0,57,121)）。
-pub(crate) const PILL_BG: Color32 = Color32::from_rgb(0xd5, 0xe5, 0xfd);
-pub(crate) const PILL_EDGE: Color32 = Color32::from_rgb(0xaa, 0xaa, 0xaa);
-pub(crate) const PILL_AHEAD_BG: Color32 = Color32::from_rgb(0x00, 0x39, 0x79);
-/// 标签药丸**没有**参考图依据：那张截图的仓库里一个标签都没有。这里的浅绿只是
-/// 「和分支区分得开」，不是量出来的。哪天拿一张带标签的参考图来，替换掉这一行。
-pub(crate) const PILL_TAG_BG: Color32 = Color32::from_rgb(0xe4, 0xf2, 0xdc);
+/// 底部状态栏：§2「STATUS **24pt**，横贯整窗；左：分支 · ↑↓ · 进行中操作；右：仓库路径；11px 灰字」。
+/// 旧 26 是「参考图把窗口底裁掉了、量不到，于是按行节奏取 `ROW_H`」的产物；现在 spec 给了数就照 spec。
+/// 24 也让 §2 那条地板公式对得上：`46 + 84 + 240 + 24 = 394`。
+pub(crate) const STATUS_H: f32 = 24.0;
+// ---- §4.5 ref 药丸的四套「浅底 + 同色描边 + 深色字」----
+// 全部取 §3.1 现成的 token，不再从参考图上量颜色（旧三枚 `#D5E5FD / #AAAAAA / #003979`
+// 是那张截图里第一行 `⑂ main` 上取的，§6 迁移表把它们归到 §4.5 这四枚）。
+// 分支/远程共用浅蓝（参考图与 spec 都是同一档）；标签一支 spec 单独给了一档浅绿，
+// 它的描边 `#B7E0C2` **不在 §3.1 色板里**——§4.5 就地写了这个值，这里照写，
+// 并在 §7 登记「色板缺一枚 `ADD_LINE`」。
+pub(crate) const PILL_BG: Color32 = ACCENT_SOFT;
+pub(crate) const PILL_EDGE: Color32 = ACCENT_LINE;
+pub(crate) const PILL_INK: Color32 = ACCENT_INK;
+/// 「超前/落后」那枚：**深藏青底白字**（§4.5），且贴死在前一枚右侧合起来才是一颗胶囊。
+/// 藏青就是 `ACCENT_INK` `#0550AE`——spec 把同一个值写了两遍，这里不重复定义。
+pub(crate) const PILL_AHEAD_BG: Color32 = ACCENT_INK;
+pub(crate) const PILL_TAG_BG: Color32 = ADD_BG;
+pub(crate) const PILL_TAG_EDGE: Color32 = Color32::from_rgb(0xB7, 0xE0, 0xC2);
+pub(crate) const PILL_TAG_INK: Color32 = ADD_FG;
 // ---- §3.2 文件状态色块：**六种状态各有自己的颜色**，白字 11px、12pt 见方、圆角 3。
 // 旧那三枚（琥珀 `…` / 玫瑰 `R` / 紫 `?`）是 SourceTree 参考图量的，剩下几种落灰底；
 // 新 spec 给了六枚，`badge_of` 里就不再有「没量到所以落灰」那一条出口。
@@ -245,13 +275,14 @@ pub(crate) const BADGE_R: f32 = 3.0;
 /// 文件表那一格的四档落点。参考图（`sourcetree-4.2.19-repo-window.png`，面板左缘那条
 /// 1pt 分隔线在 x=140，往右 141 起算）实测：分类行方框 **x 149**、文件行方框 **x 165**、
 /// 状态图标 **x 188**、文件名 **x 208.5** —— 也就是离面板左缘 8 / 24 / 47 / 67.5。
-/// 方框与图标都是 **13.5 见方**（三枚量到一模一样）。取整为 8 / 25 / 47 / 68。
 ///
 /// 中间有一批把文件行那三档各减 8（17 / 39 / 60），**这一批改回来了**：用户 2026-10-21
 /// 说「我知道为啥文件改动列表内容需要左移一点（勾选的 box 没了，但是没有移动位置）」——
 /// 那句「往左移」要修的是**没有方框那一栏白留一格空位**（某条提交的改动列表），
 /// 不是工作区那两栏的缩进。空位收掉之后，工作区按参考图排。
-pub(crate) const CHK_S: f32 = 13.5;
+/// 方框与图标都是 **13 见方**（§2「圆角勾选框 **13pt**」）。参考图三枚方框、两枚图标
+/// 量到的是 13.5，和 spec 差半像素——按 S6 的规矩以 spec 为准，半档归进 §7。
+pub(crate) const CHK_S: f32 = 13.0;
 pub(crate) const CHK_HEAD_X: f32 = 8.0;
 pub(crate) const CHK_ROW_X: f32 = 25.0;
 pub(crate) const ICON_X: f32 = 47.0;
@@ -259,15 +290,18 @@ pub(crate) const NAME_X: f32 = 68.0;
 /// 勾上的方框：参考图那三枚中心色都是 (71,141,247)（边缘被抗锯齿拉到 (54,122,246)）。
 pub(crate) const CHK_BLUE: Color32 = Color32::from_rgb(71, 141, 247);
 /// **这一栏没有方框时**（某条提交的改动列表）两档落到哪儿：色块顶到最左边那一格
-/// （和分类行的全选框同列），文字挪到**分类标题同一列**（8 + 13.5 + 7 = 28.5）。
+/// （和分类行的全选框同列），文字挪到**分类标题同一列**（8 + 13 + 7 = 28）。
 /// 留着方框那 22pt 空档就是用户说的那句「勾选的 box 没了，但是没有移动位置」。
 pub(crate) const NO_BOX_ICON_X: f32 = CHK_HEAD_X;
 pub(crate) const NO_BOX_NAME_X: f32 = CHK_HEAD_X + CHK_S + 7.0;
 // 没勾上那面 = 白底 + 1pt `BORDER_STRONG`（§3.1「输入框/按钮描边」同一枚灰）；
 // 旧的 `CHK_EDGE`(190,190,190) 是估的，现在跟着 token 走。
-/// 差异区那格文件标题的底色带：两张参考图都是 **(236,236,236) 高 30pt**
-/// （一张 y338..368、一张 y378..408），色块离带左缘 8pt（585-577、665-657）。
-pub(crate) const DIFF_HEAD_BG: Color32 = Color32::from_rgb(236, 236, 236);
+/// 差异区那格文件标题的底色带。**底色 §3.1 有 token**：`BG_INSET` 那一行写的用途就是
+/// 「输入底、**hunk 头**、虚拟行」，S6-5 换锚后不再用参考图上量的 (236,236,236)。
+/// **高度和左边距 spec 没给**：两张参考图量到的是高 30pt（一张 y338..368、一张 y378..408）、
+/// 色块离带左缘 8pt（585-577、665-657），§7 登记「自拍」。折叠时文件头那条（`Kind::File`）
+/// spec 也没单列，和本带共用同一枚 token。
+pub(crate) const DIFF_HEAD_BG: Color32 = BG_INSET;
 pub(crate) const DIFF_HEAD_H: f32 = 30.0;
 /// 色块离差异带头左缘的距离，两张图都是 8pt。
 pub(crate) const DIFF_HEAD_PAD: f32 = 8.0;
@@ -303,27 +337,56 @@ pub(crate) const HIST_ROW_H: f32 = 46.0;
 pub(crate) const HIST_BLAME_ROW_H: f32 = 18.0;
 pub(crate) const HIST_PAD: f32 = 10.0;
 
-/// 模态卡那一层的尺寸档位。**2026-10-24 起改成按内容算**：这三张卡以前各自钉死在
-/// SourceTree 那三张 nib 的窗口尺寸上（855×441 / 650×271 / 614×299），可卡里只有
-/// 两三行控件，剩下的全是一片空白——目视那一轮（用户：「提交、推送、设置窗口都好丑」）
-/// 就是这么抓出来的。复刻契约降级成脚手架之后，尺寸跟着内容走（见 `card_rect`），
-/// 这里只留**行的档位**：一行多高、脚部多高、控件多大。
-pub(crate) const MODAL_W: f32 = 420.0;
+/// 模态卡那一层的尺寸档位。**宽度只有 §5.1 的三档，高度跟着内容走**（2026-10-24 起）：
+/// 这三张卡以前各自钉死在 SourceTree 那三张 nib 的窗口尺寸上（855×441 / 650×271 / 614×299），
+/// 可卡里只有两三行控件，剩下的全是一片空白——目视那一轮（用户：「提交、推送、设置窗口都好丑」）
+/// 就是这么抓出来的。剩下的全是**行的档位**：一行多高、脚部多高、控件多大。
+///
+/// 宽度三档（§5.1「确认卡 380 · 标准卡 440 · 宽卡 560」）。以前这里是一卡一号：提交/添加 420、推送 600、拉取 520、偏好 520，四个数没有一个来自 spec。
+/// 归属：宽卡 = 提交/拉取/推送/偏好/添加仓库；标准卡 = 新建分支/标签/贮藏/重命名/合并/重置；
+/// 确认卡 = 那道闸自己。重置卡 §5.1 没点名（它是「会丢什么」的那一句问话），拍标准档，见 §7。
+pub(crate) const CARD_W_CONFIRM: f32 = 380.0;
+pub(crate) const CARD_W_STD: f32 = 440.0;
+pub(crate) const CARD_W_WIDE: f32 = 560.0;
+/// 宽卡里内容区的右缘（`560 − 16`，§5.2「内边距 16」）。推送那张表的外框、拉取那只「选项」框
+/// 和「刷新」都钉在这一格上，所以它们跟着宽度档走，不再各带一枚宽度常量。
+pub(crate) const CARD_BODY_RIGHT: f32 = CARD_W_WIDE - MODAL_PAD;
 pub(crate) const MODAL_TITLE_H: f32 = 42.0;
-pub(crate) const MODAL_ROW_H: f32 = 28.0;
-pub(crate) const MODAL_FOOT_H: f32 = 50.0;
+/// 卡里一行的**行距**（不是控件高）。§4.2 的输入框 30 是卡里最高的那格，行距比它大一档
+/// 才不让上下两格贴住；4/8 网格（原则④）上取 32，留 2pt 缝。自定数已登记 §7。
+pub(crate) const MODAL_ROW_H: f32 = 32.0;
+/// 底部按钮区高（§5.2「底部按钮区高 52」）。
+pub(crate) const MODAL_FOOT_H: f32 = 52.0;
 /// 卡内容的左右内边距。
 pub(crate) const MODAL_PAD: f32 = 16.0;
 /// 卡里两组控件之间的那道缝。
 pub(crate) const MODAL_GAP: f32 = 12.0;
-pub(crate) const CARD_R: f32 = 10.0;
-/// 输入框：高与圆角。
-pub(crate) const FIELD_H: f32 = 26.0;
+/// 卡圆角（§3.5「圆角 12 卡片/弹窗/窗口」，旧 10 作废）。
+pub(crate) const CARD_R: f32 = 12.0;
+/// 遮罩（§5.1「整窗 `rgba(31,35,40,.48)`」）。**带色**，不是旧的无色黑 `from_black_alpha(120)`：
+/// 0.48 × 255 = 122.4 → 122。const 那一档叫 `from_rgba_unmultiplied_const`（`ecolor-0.37.0/src/color32.rs:139`），
+/// 普通那个不是 const fn。
+pub(crate) const MODAL_SCRIM: Color32 = Color32::from_rgba_unmultiplied_const(31, 35, 40, 122);
+/// 卡的投影（§5.1「真阴影：offset 0/8、blur 24、黑 40%」）。旧实现是**两圈空心描边冒充**的，
+/// egui 0.37 有真阴影（`Shadow::as_shape` 出一条带 `blur_width` 的 `RectShape`），描边撤了。
+/// 40% = 102/255。
+pub(crate) const CARD_SHADOW: eframe::egui::epaint::Shadow = eframe::egui::epaint::Shadow {
+    offset: [0, 8],
+    spread: 0,
+    blur: 24,
+    color: Color32::from_black_alpha(102),
+};
+/// 输入框：高与圆角（§4.2「高 30，圆角 6」，旧 26 作废）。
+pub(crate) const FIELD_H: f32 = 30.0;
 pub(crate) const FIELD_R: f32 = 6.0;
-/// 卡脚那两枚按钮：高、圆角、最小宽。
-pub(crate) const BTN_H: f32 = 26.0;
-pub(crate) const BTN_R: f32 = 7.0;
+/// 卡脚那两枚按钮：高、圆角、最小宽（§4.1「主按钮 高 28，圆角 6」，旧的 26/7 作废）。
+pub(crate) const BTN_H: f32 = 28.0;
+pub(crate) const BTN_R: f32 = 6.0;
 pub(crate) const BTN_MIN_W: f32 = 64.0;
+/// 分段选择那排页签的容器高（§4.4「容器 `BG_INSET` 圆角 8，高 30」）。
+/// 和输入框同高不是巧合：卡里同一竖排上挨着的两格本来就该一样高。旧值是 `MODAL_ROW_H - 6`
+/// 再 `shrink(1.0)` = 24，spec 里没有这一档。
+pub(crate) const SEG_H: f32 = 30.0;
 /// 卡里一枚勾选方框见方多大（同时也是它的命中矩形：egui 的 checkbox 取
 /// `interact_size.y` 和 `icon_width` 里大的那一档，卡这一层把两者配成同一个数）。
 pub(crate) const CHK_CARD: f32 = 18.0;
@@ -332,7 +395,6 @@ pub(crate) const DESC_ROWS: usize = 3;
 /// 偏好卡按**页里最多那一条**摆高度（「推送与拉取」两枚弹出 + 两枚勾 = 四行）：
 /// 换页时卡不跟着跳，这是唯一一处「不为内容收缩」的取舍，换来的是页签稳定。
 pub(crate) const SETTINGS_ROWS: usize = 4;
-pub(crate) const PREF_W: f32 = 520.0;
 
 /// 主按钮那枚蓝：底色、悬停、按下、焦点那一圈光晕。
 /// §3.1 给的是 `ACCENT` #0969DA（旧值 = SourceTree 那枚 `SELECTED` 蓝，随实心选中行一起作废）。
@@ -347,13 +409,12 @@ pub(crate) const ACCENT_INK: Color32 = Color32::from_rgb(0x05, 0x50, 0xAE);
 /// §2「选中 = 主色浅底深字」= `ACCENT_SOFT` 铺底 + `ACCENT_INK` 落字。
 pub(crate) const ACCENT_SOFT: Color32 = Color32::from_rgb(0xE8, 0xF1, 0xFD);
 /// 焦点那一圈光晕 = `ACCENT_LINE`（§3.1 那枚浅蓝，取代旧的 `ACCENT_RING`）。
-/// §3.5 写的是「外圈 2px `ACCENT_SOFT`」，但半透明做不了——`Color32` 的元组字段是私有的、
-/// `from_rgba_unmultiplied` 又不是 const fn，所以取同色相的浅蓝实心描边。
+/// §3.5 写的是「外圈 2px `ACCENT_SOFT`」，这里画的是 2.5px `ACCENT_LINE` 实心描边：
+/// 半透明在 const 里做得了（`Color32::from_rgba_unmultiplied_const`，旧注释那句「做不了」是错的），
+/// 但浅一档的 `ACCENT_SOFT` 描在**白卡**上几乎看不见，取色板里同色相那枚线才出得来预览稿的效果。
 pub(crate) const ACCENT_LINE: Color32 = Color32::from_rgb(0xB9, 0xD6, 0xF9);
 // 次按钮（§4.1 幽灵按钮）= 白底 + `BORDER_STRONG` 描边 + `TEXT_SECONDARY` 字，
 // 三样都是 token，这里不再单设 `BTN_EDGE`。
-/// 页签那一排的底（未选中的那一段住在灰槽里，选中那段浮成白）。
-pub(crate) const SEG_BG: Color32 = Color32::from_rgb(0xf1, 0xf2, 0xf5);
 /// 表格表头那一条的底色。
 pub(crate) const TABLE_HEAD_BG: Color32 = Color32::from_rgb(0xf6, 0xf7, 0xf9);
 
@@ -363,16 +424,15 @@ pub(crate) const TABLE_HEAD_BG: Color32 = Color32::from_rgb(0xf6, 0xf7, 0xf9);
 // 但**格子摆在哪**是这一版自己排的：nib 那套坐标是给一张 650×271 的空窗口排的，
 // 我们按内容收缩以后那些数就不再成立（2026-10-24）。
 
-/// 推送卡：内容区宽 600，高度**跟分支行数走**（`push_body_h`）。
-pub(crate) const PUSH_W: f32 = 600.0;
+/// 推送卡：宽度走 §5.1 的宽卡档（`CARD_W_WIDE`），高度**跟分支行数走**（`push_body_h`）。
 /// 「推送到仓库：」那一行的顶边（标签 / 弹出按钮 / URL 三件控件同一行）。
 pub(crate) const PUSH_ROW1_Y: f32 = 14.0;
 pub(crate) const PUSH_LABEL_X: f32 = 16.0;
 pub(crate) const PUSH_REMOTE_X: f32 = 132.0;
 pub(crate) const PUSH_REMOTE_W: f32 = 120.0;
-/// 那一格显示所选远端的 URL。
+/// 那一格显示所选远端的 URL：从弹出按钮右边一路铺到内容区右缘。
 pub(crate) const PUSH_URL_X: f32 = 264.0;
-pub(crate) const PUSH_URL_W: f32 = 320.0;
+pub(crate) const PUSH_URL_W: f32 = CARD_BODY_RIGHT - PUSH_URL_X;
 /// 「要推送的分支」那一行：左边标题，右边「全选」。
 pub(crate) const PUSH_HEAD_LABEL_Y: f32 = 48.0;
 /// 表格：外框顶边（= 表头顶边）、表头高、行高、四列宽。
@@ -383,7 +443,13 @@ pub(crate) const PUSH_HEAD_H: f32 = 26.0;
 pub(crate) const PUSH_ROW_H: f32 = 22.0;
 pub(crate) const PUSH_COL_PICK: f32 = 46.0;
 pub(crate) const PUSH_COL_LOCAL: f32 = 172.0;
-pub(crate) const PUSH_COL_REMOTE: f32 = 292.0;
+/// 远程分支那一列是**剩下那一格**：外框右缘必须钉在内容区右缘上，所以它由另外三列算出来，
+/// 不自己拍数（旧 292 是 600 宽那一档量的，收进 560 档就溢出了）。
+pub(crate) const PUSH_COL_REMOTE: f32 = CARD_BODY_RIGHT
+    - PUSH_TABLE_X
+    - PUSH_COL_PICK
+    - PUSH_COL_LOCAL
+    - PUSH_COL_TRACK;
 pub(crate) const PUSH_COL_TRACK: f32 = 50.0;
 /// 表格外框右缘 = 四列加起来。
 pub(crate) const PUSH_TABLE_RIGHT: f32 = PUSH_TABLE_X
@@ -405,13 +471,13 @@ pub(crate) fn settings_body_h() -> f32 {
     MODAL_ROW_H + MODAL_GAP + MODAL_ROW_H * SETTINGS_ROWS as f32
 }
 
-/// 拉取卡：内容区宽 520，四行 + 「选项」那只框，正文高度固定（`PULL_BODY_H`）。
-pub(crate) const PULL_W: f32 = 520.0;
+/// 拉取卡：宽度同样走宽卡档（§5.1），四行 + 「选项」那只框，正文高度固定（`PULL_BODY_H`）。
 pub(crate) const PULL_LABEL_X: f32 = 16.0;
 pub(crate) const PULL_FIELD_X: f32 = 176.0;
-pub(crate) const PULL_REMOTE_W: f32 = 328.0;
-/// 远程分支那一列窄一档，右边让给「刷新」。
-pub(crate) const PULL_BRANCH_W: f32 = 246.0;
+/// 远端那一格和它的 URL 一路铺到内容区右缘。
+pub(crate) const PULL_REMOTE_W: f32 = CARD_BODY_RIGHT - PULL_FIELD_X;
+/// 远程分支/本地分支那两格窄一档，右边让给「刷新」（BTN_MIN_W + 一道 8pt 缝）。
+pub(crate) const PULL_BRANCH_W: f32 = CARD_BODY_RIGHT - PULL_FIELD_X - BTN_MIN_W - 8.0;
 /// 四行的顶边：远端、它的 URL、远程分支、本地分支。
 pub(crate) const PULL_REMOTE_Y: f32 = 14.0;
 pub(crate) const PULL_URL_Y: f32 = 44.0;
@@ -490,21 +556,17 @@ pub(crate) fn badge_layouts() -> usize {
     BADGE_LAYOUTS.with(|c| c.get())
 }
 
-/// 车道配色。**第 0 道是量出来的**：参考图那条线性历史全是 `#005FBD`（0,95,189），
-/// 而旧 React 版那圈调色板（`src/graph.ts`，随 Tauri 层一起删了，还能在 git 历史里翻到）
-/// 第一枚是紫色 `#7C5CFC`——并排一比就知道差在哪儿。后面七道**没有依据**：那张截图里
-/// 只有一条道，多车道的配色顺序要等一张有分叉的参考图来钉。
-/// 别随手改：按**颜色**认领图元的那条判据（`graph_marks`）认的就是这八种。
-pub(crate) const LANE_COLORS: [Color32; 8] = [
-    Color32::from_rgb(0x00, 0x5f, 0xbd),
-    Color32::from_rgb(0x3f, 0xb9, 0x50),
-    Color32::from_rgb(0xf8, 0x51, 0x49),
-    Color32::from_rgb(0xd2, 0x99, 0x22),
-    Color32::from_rgb(0x5a, 0x8b, 0xff),
-    Color32::from_rgb(0xdb, 0x61, 0xa2),
-    Color32::from_rgb(0x2d, 0xd4, 0xbf),
-    Color32::from_rgb(0xe3, 0xb3, 0x41),
-];
+/// 车道配色：§3.3 给了四枚——蓝 `#0969DA` / 绿 `#1A7F37` / 紫 `#8250DF` / 橙 `#CF6A00`。
+/// 旧那八枚是复刻期从参考图 + 旧 React 调色板拼的（第 0 道 `#005FBD` 是量出来的，后面七枚
+/// 台账自己写了「没有依据」），§6 迁移表「图序列 4 色 + `RING_GREY` → §3.3」说的就是这一批。
+/// **第 5 道起按 4 取模循环**：spec 只给了四枚，而 `layout_graph` 裁尾巴后实际很少超过四道
+/// （`the_graph_never_escapes_its_column` 钉的就是这个上限）——同色相循环比再造四枚没依据的色诚实。
+/// 别随手改：按**颜色**认领图元的那条判据（`graph_marks`）认的就是这四种。
+pub(crate) const LANE_1: Color32 = Color32::from_rgb(0x09, 0x69, 0xDA);
+pub(crate) const LANE_2: Color32 = Color32::from_rgb(0x1A, 0x7F, 0x37);
+pub(crate) const LANE_3: Color32 = Color32::from_rgb(0x82, 0x50, 0xDF);
+pub(crate) const LANE_4: Color32 = Color32::from_rgb(0xCF, 0x6A, 0x00);
+pub(crate) const LANE_COLORS: [Color32; 4] = [LANE_1, LANE_2, LANE_3, LANE_4];
 
 pub(crate) fn lane_color(lane: usize) -> Color32 {
     LANE_COLORS[lane % LANE_COLORS.len()]

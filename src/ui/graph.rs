@@ -33,7 +33,7 @@ pub(crate) struct GraphRow {
 /// * 否则找空道，空道不够才开新道；
 /// * 第一个父提交接在本行道底下，多出来的父提交各占一条道并留下一条弯线；
 /// * 尾巴上的空道一律裁掉。旧 React 版的 `layoutGraph` **从不释放车道**，
-///   每合并一次就多占一条，几百次合并后列宽早爆了；裁尾巴才能把 `COL_GRAPH` 那 49pt 守住。
+///   每合并一次就多占一条，几百次合并后列宽早爆了；裁尾巴才能把 `COL_GRAPH` 那 48pt 守住。
 /// * 同一个提交被排在几条道上（日期序会把分支交错）→ 只认第一条，其余腾出来。
 pub(crate) fn layout_graph(commits: &[Commit]) -> Vec<GraphRow> {
     bump_graph_layouts();
@@ -94,9 +94,9 @@ pub(crate) fn layout_graph(commits: &[Commit]) -> Vec<GraphRow> {
     rows
 }
 
-/// 车道中心落在图序列列里的 x。
+/// 车道中心落在图序列列里的 x（第 0 道在 `LANE0_X`，往后每 `LANE_W` 一条）。
 pub(crate) fn lane_x(min_x: f32, lane: usize) -> f32 {
-    min_x + GRAPH_PAD + lane as f32 * LANE_W + LANE_W / 2.0
+    min_x + LANE0_X + lane as f32 * LANE_W
 }
 
 /// 画这一行的图元：先线后点，点盖在线头上看着才像「一个提交」。

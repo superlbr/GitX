@@ -10,10 +10,11 @@ use crate::ui::data::*;
 use crate::ui::graph::*;
 use crate::ui::diffmodel::{DiffLine, Kind};
 
-/// 一行要画的东西。**带所有权**：绘制时只画视口里那几十行，从 `Commit` 拷出四段字符串
+/// 一行要画的东西。**带所有权**：绘制时只画视口里那几十行，从 `Commit` 拷出三段字符串
 /// 比把整份提交搬进闭包再处理生命周期便宜得多。
+/// **没有提交号那一段**：§2 的四列是 图 48 | 提交信息 | 作者 96 | 日期 78，提交号不在其中
+/// （筛选条按 `short_id` 前缀过滤、右键菜单里能读全号，所以信息没丢）。
 pub(crate) struct Cells {
-    pub(crate) sha: String,
     pub(crate) subject: String,
     pub(crate) author: String,
     pub(crate) date: String,
@@ -32,6 +33,10 @@ pub(crate) struct Cells {
 /// `every_rune_the_shell_paints_has_a_glyph` 会把每一枚被画的字对着字体表查一遍，
 /// 换了个字体表里没有的就当场红——`▾`（U+25BE）就是这么死的，这份字体链里只有 `▼`。
 pub(crate) const ARROW: &str = "▼";
+/// 卡标题带右端那一枚关闭字形（§5.2「右上 ×」）。`×`（U+00D7）和 `ARROW` 同一类风险：
+/// 卡打开着的那些帧不在 `every_rune_the_shell_paints_has_a_glyph` 的取景范围里（它跑常态壳），
+/// 所以由 `the_card_closes_from_the_x_in_its_title` 自己对着字体表查一次。
+pub(crate) const CLOSE_GLYPH: &str = "×";
 // 下面这几条文案**逐字抄自**本机 SourceTree 4.2.19
 // `Contents/Resources/zh_CN.lproj/Localizable.strings`（UTF-16LE，要 `iconv -f UTF-16 -t UTF-8`）。
 // 键名注在后面，下次核对直接按键搜；自己改一个"更顺口的"就是破坏复刻契约第③条。
@@ -44,6 +49,11 @@ pub(crate) const TOPO_ORDER: &str = "层级顺序"; // LogAncestorOrder
 pub(crate) const PENDING_SORTED_BY_PATH: &str = "待定的文件, 已依照路径排序"; // PendingFiles + SortedByPath
 /// 日志右侧那格 SHA 跳转框的提示。官方原文**没有冒号**，别自己补。
 pub(crate) const JUMP_TO_SHA: &str = "转到Commit的SHA-1"; // JumpToRevisionLabelGit
+/// 历史页那一格**搜索**的提示。这一格不是 SourceTree 那一档（它的搜索是侧栏「搜索」
+/// 下面那块带作用域条的独立面板，本机没有安装包、控件一个数都没量到）——
+/// 按 PROCESS 2026-10-21 规则②，这是**我们的增强**，文案因此是自己写的，
+/// 登记在 `DESIGN.md §7`。
+pub(crate) const SEARCH_HINT: &str = "搜索提交（说明 / 文件名）";
 
 /// 范围那一档在按钮上写什么：两态（所有分支/当前分支）用官方文案，第三条「具体分支」
 /// 是我们自己加的（SourceTree 那一档只切两态），所以按钮上直接是分支名。
@@ -96,13 +106,14 @@ pub(crate) fn pill_glyph(kind: RefKind) -> &'static str {
     }
 }
 
-/// 药丸底色。分支与远程跟踪在参考图里是**同一种**浅蓝（`upstream/main` 和 `main` 一个色），
-/// 差别只在名字；「超前 N 个版本」是深藏青白字。标签那一枚没有参考图依据（那张图里没标签）。
-pub(crate) fn pill_fill(kind: RefKind) -> Color32 {
+/// 药丸的三件套：底 / 描边 / 字（§4.5「浅底 + 同色描边 + 深色字」）。
+/// 分支与远程跟踪同一档浅蓝；标签单独一档浅绿；「超前/落后」是深藏青底**白字**，
+/// 它不吃浅底那一套，spec 表里也是这么分行的。
+pub(crate) fn pill_colors(kind: RefKind) -> (Color32, Color32, Color32) {
     match kind {
-        RefKind::Branch | RefKind::Remote => PILL_BG,
-        RefKind::Tag => PILL_TAG_BG,
-        RefKind::Ahead => PILL_AHEAD_BG,
+        RefKind::Branch | RefKind::Remote => (PILL_BG, PILL_EDGE, PILL_INK),
+        RefKind::Tag => (PILL_TAG_BG, PILL_TAG_EDGE, PILL_TAG_INK),
+        RefKind::Ahead => (PILL_AHEAD_BG, PILL_AHEAD_BG, Color32::WHITE),
     }
 }
 
@@ -111,7 +122,9 @@ pub(crate) fn pill_fill(kind: RefKind) -> Color32 {
 /// 宽度只能现量（`layout_no_wrap`）：药丸要贴着文字收口，而字宽归字体管——
 /// 这和「车道在 worker 上排」不是一类开销，一帧最多十枚。
 pub(crate) fn pill_row(p: &egui::Painter, row: Rect, badges: &[RefBadge], x: f32) -> f32 {
-    let font = FontId::proportional(PILL_FONT);
+    // §4.5 的「11/600」：字号 11、真字重走 Inter SemiBold。中文那半没有粗体（§3.4 明写），
+    // 落回 Noto Regular——分支名基本是拉丁，这一档在意料之内。
+    let font = FontId { size: PILL_FONT, family: crate::ui::fonts::semibold_family() };
     let top = row.center().y - PILL_H / 2.0;
     let mut x = x;
     for (i, badge) in badges.iter().enumerate() {
@@ -121,8 +134,8 @@ pub(crate) fn pill_row(p: &egui::Painter, row: Rect, badges: &[RefBadge], x: f32
             x += PILL_GAP;
         }
         let text = format!("{}{}", pill_glyph(badge.kind), badge.label);
-        let fg = if badge.kind == RefKind::Ahead { Color32::WHITE } else { Color32::from_rgb(0x1a, 0x1a, 0x1a) };
-        let galley = p.layout_no_wrap(text, font.clone(), fg);
+        let (fill, edge, ink) = pill_colors(badge.kind);
+        let galley = p.layout_no_wrap(text, font.clone(), ink);
         let w = galley.size().x + 2.0 * PILL_PAD;
         let rect = Rect::from_min_max(pos2(x, top), pos2(x + w, top + PILL_H));
         // 被 Ahead 贴住的那一枚右边收平，Ahead 自己左边收平——不然接缝处是两道圆弧。
@@ -132,15 +145,27 @@ pub(crate) fn pill_row(p: &egui::Painter, row: Rect, badges: &[RefBadge], x: f32
             (false, true) => egui::CornerRadius { nw: PILL_R, ne: 0, sw: PILL_R, se: 0 },
             _ => egui::CornerRadius::same(PILL_R),
         };
-        p.rect(rect, corners, pill_fill(badge.kind), egui::Stroke::new(1.0, PILL_EDGE), egui::StrokeKind::Inside);
+        p.rect(rect, corners, fill, egui::Stroke::new(1.0, edge), egui::StrokeKind::Inside);
         p.galley(
             pos2(rect.min.x + PILL_PAD, row.center().y - galley.size().y / 2.0),
             galley,
-            fg,
+            ink,
         );
         x += w;
     }
     x
+}
+
+/// 整行灰底该不该画。**不许只问 `resp.hovered()`**：行里的文字是 `put_left` 里那个子
+/// `Label`（要走 `truncate` 就必须是 Label），它自带 `Sense`，会把 hover 从行矩形上抢走——
+/// 实测鼠标停在提交信息那一格时整行 `hovered()` 是 false，灰底不画，看上去就是「一行里
+/// 只有文字那一小块有反应」，和「鼠标移到描述上就点不中」是同一族坑（子控件压在行矩形上）。
+/// `container_contains_pointer()` 问的是「指针在这一行的矩形里，且这一行所在的层没被别的层
+/// 压住」（egui-0.37.0/src/context.rs:3656，最后比的是 `layer_id_at`，**比到层为止、不比到
+/// 单个控件**），子 Label 和父行同层，所以它认得这一行。
+/// `hovered()` 留在或号左边：按下后拖出格子时 egui 只给 `hovered` 那份粘性，`container` 那份立刻断。
+pub(crate) fn row_hot(resp: &egui::Response) -> bool {
+    resp.hovered() || resp.container_contains_pointer()
 }
 
 /// 日志一行的画法：整行一个可点矩形，格子里用 painter 直接落字，
@@ -152,16 +177,24 @@ pub(crate) fn pill_row(p: &egui::Painter, row: Rect, badges: &[RefBadge], x: f32
 pub(crate) fn log_row(ui: &mut egui::Ui, width: f32, cells: &Cells, active: bool, graph: Option<&GraphRow>) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, ROW_H), Sense::click());
     let p = ui.painter_at(rect);
+    // §4.6 选中态：`ACCENT_SOFT` 铺底 + 左缘 2pt `ACCENT` 竖条，**文字不反白**。
+    // 旧写法是实心蓝铺满整行、四列全白——§6 那条「实心蓝底白字作废」说的就是它。
+    // hover 那一档（§2「hover 浅灰」）排在选中之后、虚拟行之后：选中优先，
+    // 而虚拟行本来就有一层 `BG_INSET`，鼠标扫过去不必再换一次色。
     if active {
-        p.rect_filled(rect, 0.0, SELECTED);
+        p.rect_filled(rect, 0.0, ACCENT_SOFT);
+        p.rect_filled(
+            Rect::from_min_max(pos2(rect.min.x, rect.min.y), pos2(rect.min.x + SELECT_BAR_W, rect.max.y)),
+            0.0,
+            ACCENT,
+        );
     } else if cells.ring.is_some() {
         // 虚拟行**不选中也是灰底**（§3.1 把它和 hunk 头归到同一枚 `BG_INSET`），
         // 它表示的是「这一行不是提交」，不是「鼠标在这儿」。
         p.rect_filled(rect, 0.0, BG_INSET);
+    } else if row_hot(&resp) {
+        p.rect_filled(rect, 0.0, BG_HOVER);
     }
-    // 日志行**不画 hover 底色**（沿用旧决定）：这一列的行本来就靠选中色区分，鼠标扫过去整条带子跟着闪，
-    // 反而让用户以为「亮起来的那行才是我点到」。§2 把 hover 记在 LOG 那一行里，
-    // 那一档跟着 LOG 带落地（顺带把 `BG_HOVER` 画上）。
     if let Some(g) = graph {
         graph_cell(&p, rect, g);
     } else if let Some(lane) = cells.ring {
@@ -172,33 +205,41 @@ pub(crate) fn log_row(ui: &mut egui::Ui, width: f32, cells: &Cells, active: bool
     // 没有真粗体（Noto 只带 Regular，第二份 8MB 不值），§3.4 明写了这条限制——
     // 所以这里**不再用更深一档的字色补层次**（DESIGN.md §6：`INK_STRONG` → 加粗）。
     let strong = active || cells.ring.is_some();
-    // §3.4 的层级：提交信息（正文）走 `TEXT_PRIMARY`，提交号 / 作者 / 日期走「次要」那一档。
-    // 旧的写法是四列同色、「不靠颜色分主次」——那是 SourceTree 复刻期的规则，
-    // DESIGN.md 原则②「信息靠层级」把它换掉了。选中行整行白字，不分档。
-    let meta = if active { Color32::WHITE } else { TEXT_SECONDARY };
-    let font = ui.style().text_styles[&TextStyle::Body].clone();
-    let th = ui.text_style_height(&TextStyle::Body);
+    // §3.4 的层级：提交信息走「正文」13px，作者 / 日期走「次要」12px，全是 `TEXT_PRIMARY`
+    // 与 `TEXT_SECONDARY` 两档灰度（§2 原则②）。选中那一行**不换色**，只加粗（§4.6）。
     let right = rect.max.x;
-    // 四列全部**靠左**，且提交号从图列右边起（参考图量的：图表列 242、提交 284.5、描述 361.5、
-    // 作者 825、日期 1017——每一格的数据都从自己列的左缘开始，没有右对齐的）。
-    // 之前 sha 与日期/作者走 `RIGHT_CENTER`，还把提交列画在图列**里面**（`rect.min.x`），
-    // 圆点正好压在提交号上。
-    p.text(band(rect, rect.min.x + COL_GRAPH + COL_INSET, COL_SHA - COL_INSET, th).left_center(), Align2::LEFT_CENTER, &cells.sha, font.clone(), meta);
-    p.text(band(rect, right - COL_DATE + COL_INSET, COL_DATE - COL_INSET, th).left_center(), Align2::LEFT_CENTER, &cells.date, font.clone(), meta);
-    p.text(band(rect, right - COL_DATE - COL_AUTHOR + COL_INSET, COL_AUTHOR - COL_INSET, th).left_center(), Align2::LEFT_CENTER, &cells.author, font, meta);
-    let x0 = rect.min.x + COL_GRAPH + COL_SHA + COL_INSET;
-    // 药丸占掉描述列的开头，文字从药丸后面起笔（参考图量的：药丸 357.5..476、文字起笔 481）。
+    // §2 四列：图 48 | 提交信息（弹性）| 作者 96 | 日期 78。文字一律从自己列的左缘
+    // 往里缩 `COL_INSET` 起笔（提交号那一列整列删了，见 `theme.rs` 的 `COL_GRAPH` 那段）。
+    let author_x = right - COL_DATE - COL_AUTHOR;
+    let date_x = right - COL_DATE;
+    // 作者 / 日期这两格也走 `put_left` + `Label::truncate`，**不用 `p.text`**：
+    // `Painter::text` 不截断，长作者名（`包融 <br@example.com>` 实测 142.5pt）会从自己那格
+    // （96 − 内缩 = 84pt）一路压到右边「日期」那一格上——`no_visible_text_overlaps_at_the_smallest_allowed_window`
+    // 在 860pt 窄窗下量的就是这一条。band 的高取**整行**而不是字号：`Label` 的 galley
+    // 比字号高（13px 的中文行高实测 16），按字号摆会把文字中心压到行中心下面 1.5pt，
+    // 而药丸、底色、hover 那几块都是按行中心摆的——差这 1.5pt 时按 y 认领图元的判据会认空。
+    let meta = FontId { size: 12.0, family: ui.style().text_styles[&TextStyle::Body].family.clone() };
+    for (x, w, txt) in [
+        (author_x + COL_INSET, COL_AUTHOR - COL_INSET, &cells.author),
+        (date_x + COL_INSET, COL_DATE - COL_INSET, &cells.date),
+    ] {
+        put_left(ui, band(rect, x, w, ROW_H), |ui| {
+            ui.add(Label::new(RichText::new(txt.as_str()).font(meta.clone()).color(TEXT_SECONDARY)).truncate().selectable(false));
+        });
+    }
+    let x0 = rect.min.x + COL_GRAPH + COL_INSET;
+    // 药丸占掉提交信息列的开头，文字从药丸后面起笔。
     let x = if cells.badges.is_empty() { x0 } else { pill_row(&p, rect, &cells.badges, x0) + PILL_AFTER };
-    let w = (right - COL_DATE - COL_AUTHOR - x - 20.0).max(60.0);
-    let mut rich = RichText::new(cells.subject.as_str()).size(12.5);
+    let w = (author_x - x - 8.0).max(60.0);
+    let mut rich = RichText::new(cells.subject.as_str()).size(13.0);
     if strong {
         rich = rich.family(crate::ui::fonts::semibold_family());
     }
     // §6 迁移表那条「`INK_STRONG` → 加粗」：虚拟行不再取更深的一档字色，
     // 它和正文同色，靠 `semibold_family()` 那面真字重拉开（中文那半没有粗体，
     // 落回 Noto Regular——§3.4 明写了这条限制）。
-    rich = rich.color(if active { Color32::WHITE } else { TEXT_PRIMARY });
-    put_left(ui, band(rect, x, w, th), |ui| {
+    rich = rich.color(TEXT_PRIMARY);
+    put_left(ui, band(rect, x, w, ROW_H), |ui| {
         // `selectable(false)` 不是「不许选文字」这么轻：egui 默认 `selectable_labels = true`
         // （style.rs:1599），开着文字选择的 `Label` 会给自己叠一层 `Sense::click_and_drag()`
         // （label.rs:154-170），它就压在整行那个 `Sense::click()` 矩形**上面**，
@@ -320,7 +361,10 @@ pub(crate) fn card_field(
     rows: usize,
 ) -> egui::Response {
     let inner = r.shrink(1.0);
-    ui.painter().rect_filled(inner, FIELD_R, Color32::WHITE);
+    // 底色铺在**整格** `r` 上，不铺在缩了一号的 `inner`：描边按 `r` 走 `StrokeKind::Inside`
+    // 吃进外缘 1px，两者同格才是 §4.2 那一格 30 高的盒子。以前底色是 28、描边是 30，
+    // 中间空出一道透明环——画出来看不出来，量出来「框子多高」有两个答案。
+    ui.painter().rect_filled(r, FIELD_R, Color32::WHITE);
     let te = if rows > 1 {
         egui::TextEdit::multiline(text)
     } else {
@@ -392,6 +436,31 @@ pub(crate) fn card_button(
     (resp.clicked(), w)
 }
 
+/// 标题带右端那一枚 ×（§5.2「标题 14/600 + 右上 ×（幽灵图标按钮）」）。
+/// 命中 28×28、圆角 6、图标 14、hover `BG_HOVER`——和 §4.1 顶栏那组图标按钮同一档，只是住在卡里。
+/// 为什么非要有它：偏好卡按 §5.2 **没有**「取消」，那张卡剩下的两个出口就是 Esc 和这一枚 ×；
+/// 少了它，鼠标就没有任何一处能关掉偏好卡。
+pub(crate) fn card_close(ui: &mut egui::Ui, card: Rect) -> bool {
+    let right = card.max.x - MODAL_PAD;
+    let cy = card.min.y + MODAL_TITLE_H / 2.0;
+    let rect = Rect::from_min_max(
+        pos2(right - ICON_BTN, cy - ICON_BTN / 2.0),
+        pos2(right, cy + ICON_BTN / 2.0),
+    );
+    let resp = ui.allocate_rect(rect, Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, ICON_BTN_R, BG_HOVER);
+    }
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        CLOSE_GLYPH,
+        FontId::proportional(ICON_PX),
+        TEXT_SECONDARY,
+    );
+    resp.clicked()
+}
+
 /// 卡里那一排页签：整条住在灰槽里，选中那一段浮成白、描边、字变深。
 /// `selectable_label` 的底色铺满整格又不收口，三条并排看着像三行而不是「换页」，所以自己画。
 /// 返回被选中的那一档。
@@ -402,8 +471,11 @@ pub(crate) fn seg_tabs<T: PartialEq + Clone>(
     current: &mut T,
 ) {
     let w = r.width() / items.len() as f32;
-    ui.painter()
-        .rect_filled(r.shrink(1.0), 7.0, SEG_BG);
+    // §4.4：容器 = `BG_INSET` 圆角 **8**、高 **30**（调用方给的那一格就是 30，见下）。
+    // 以前这里是一枚没上 token 的裸色 `SEG_BG`（#f1f2f5，和 `BG_INSET` #f0f1f3 差一两档灰）
+    // 配 7 的圆角，还 `shrink(1.0)` 收成 24——同一份 spec 里的两处，跟着 token 走。
+    // 段与段之间那 2pt 缝由下面 `seg` 自己收，容器不再往里缩。
+    ui.painter().rect_filled(r, 8.0, BG_INSET);
     for (i, (label, value)) in items.iter().enumerate() {
         let seg = Rect::from_min_max(
             pos2(r.min.x + w * i as f32 + 2.0, r.min.y + 2.0),
@@ -525,18 +597,35 @@ pub(crate) fn primary_closes(m: &Modal) -> bool {
     matches!(m.form, Form::Settings { .. })
 }
 
-/// 一张卡摆多大。**高度跟着内容走**（2026-10-24）：这三张卡以前各自钉死在本机那三张 nib 的
-/// 窗口尺寸（855×441 / 650×271 / 614×299），可里面的控件只有两三行，剩下的全是一片空白。
-/// 现在只有「行高 / 标题带 / 卡脚」这三档是常量，其余按行数算；`rows()` 那套账适用于动作卡，
+/// 这张卡属于 §5.1 三档里的哪一档。**单独一处**：判据要问的是「哪一类卡多宽」，
+/// 摊在 `card_rect` 的 match 里就没法一条不漏地点名（宽卡那一档 spec 列了五种，
+/// 标准卡列了四种，剩下只有重置卡没点名——它跟着标准档，理由见 DESIGN.md §7）。
+pub(crate) fn card_w(form: &Form) -> f32 {
+    match form {
+        Form::Confirm { .. } => CARD_W_CONFIRM,
+        Form::Commit { .. }
+        | Form::Pull { .. }
+        | Form::Push { .. }
+        | Form::Settings { .. }
+        | Form::AddRepo { .. } => CARD_W_WIDE,
+        _ => CARD_W_STD,
+    }
+}
+
+/// 一张卡摆多大。**宽度 = §5.1 的三档**（`card_w`），**高度跟着内容走**（2026-10-24）：
+/// 这三张卡以前各自钉死在本机那三张 nib 的窗口尺寸（855×441 / 650×271 / 614×299），
+/// 可里面的控件只有两三行，剩下的全是一片空白。
+/// 只有「行高 / 标题带 / 卡脚」这三档是常量，其余按行数算；`rows()` 那套账适用于动作卡，
 /// 推送卡按表里那几行算，偏好卡按**页里最多那一条**算（换页不让卡跳）。
 pub(crate) fn card_rect(m: &Modal, screen: Rect) -> Rect {
     let clamp = |w: f32, h: f32| vec2(w.min(screen.width() - 40.0), h.min(screen.height() - 40.0));
     let fits = |body: f32| MODAL_TITLE_H + body + MODAL_FOOT_H;
+    let w = card_w(&m.form);
     let size = match m.form {
-        Form::Settings { .. } => clamp(PREF_W, fits(settings_body_h())),
-        Form::Push { ref rows, .. } => clamp(PUSH_W, fits(push_body_h(rows.len()))),
-        Form::Pull { .. } => clamp(PULL_W, fits(PULL_BODY_H)),
-        _ => clamp(MODAL_W, fits(MODAL_ROW_H * m.rows() as f32)),
+        Form::Settings { .. } => clamp(w, fits(settings_body_h())),
+        Form::Push { ref rows, .. } => clamp(w, fits(push_body_h(rows.len()))),
+        Form::Pull { .. } => clamp(w, fits(PULL_BODY_H)),
+        _ => clamp(w, fits(MODAL_ROW_H * m.rows() as f32)),
     };
     Rect::from_center_size(screen.center(), size)
 }
@@ -738,7 +827,7 @@ pub(crate) fn pull_card(
     let refresh = card_button(
         ui,
         "刷新",
-        top.x + PULL_W - MODAL_PAD,
+        top.x + CARD_BODY_RIGHT,
         top.y + PULL_BRANCH_Y + FIELD_H / 2.0,
         false,
     )
@@ -755,7 +844,7 @@ pub(crate) fn pull_card(
     modal_label(ui, top, PULL_LABEL_X, PULL_OPT_LABEL_Y + 4.0, "选项");
     let box_rect = Rect::from_min_max(
         pos2(top.x + PULL_LABEL_X, top.y + PULL_BOX_TOP),
-        pos2(top.x + PULL_W - MODAL_PAD, top.y + PULL_BOX_BOTTOM),
+        pos2(top.x + CARD_BODY_RIGHT, top.y + PULL_BOX_BOTTOM),
     );
     ui.painter().rect_filled(box_rect, 6.0, Color32::from_rgb(0xfb, 0xfc, 0xfd));
     ui.painter().rect_stroke(
@@ -795,7 +884,7 @@ fn modal_label(ui: &mut egui::Ui, top: Pos2, x: f32, y: f32, text: &str) {
 fn modal_switch(ui: &mut egui::Ui, top: Pos2, x: f32, y: f32, label: &str, on: &mut bool) {
     check_row(
         ui,
-        cell(top, x, y, 480.0, CHK_CARD),
+        cell(top, x, y, CARD_BODY_RIGHT - x, CHK_CARD),
         |ui| ui.checkbox(on, RichText::new(label).size(11.5)),
     );
 }
@@ -822,32 +911,28 @@ pub(crate) fn hunk_button(ui: &mut egui::Ui, text: &str, right: f32, cy: f32) ->
 pub(crate) fn header_row(ui: &mut egui::Ui, width: f32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, LOG_HEAD_H), Sense::hover());
     let p = ui.painter();
-    let font = &ui.style().text_styles[&TextStyle::Small];
     let right = rect.max.x;
-    // 表头文字走 §3.4 的「次要」档（预览稿 `.lh` 同一条），列的排法仍跟着数据走：参考图那四个词（提交 / 描述 / 作者 / 日期）离自己列的左边线
-    // 都是 5pt，跟数据一模一样；只有「图表」是在列里**居中**的（159..185，列 141..198）。
+    // 表头文字走 §3.4「次要」档（12px `TEXT_SECONDARY`，预览稿 `.lh{font-size:12}`），
+    // 列的排法**跟着数据那一行同一条竖线起笔**：四列的文字都离自己列的左边线 `COL_INSET`。
+    // 「图表」仍旧整格居中（预览稿 `.lh .g` 空着、`.lr` 那一格画的是图元）。
     let g = band(rect, rect.min.x, COL_GRAPH, 13.0);
-    p.text(g.center_top(), Align2::CENTER_TOP, "图表", font.clone(), TEXT_SECONDARY);
+    p.text(g.center_top(), Align2::CENTER_TOP, "图表", FontId::proportional(12.0), TEXT_SECONDARY);
+    let author_x = right - COL_DATE - COL_AUTHOR;
+    let date_x = right - COL_DATE;
     for (x, w, label) in [
-        (rect.min.x + COL_GRAPH + COL_INSET, COL_SHA - COL_INSET, "提交"),
-        (rect.min.x + COL_GRAPH + COL_SHA + COL_INSET, 200.0, "描述"),
-        (right - COL_DATE - COL_AUTHOR + COL_INSET, COL_AUTHOR - COL_INSET, "作者"),
-        (right - COL_DATE + COL_INSET, COL_DATE - COL_INSET, "日期"),
+        (rect.min.x + COL_GRAPH + COL_INSET, author_x - rect.min.x - COL_GRAPH - COL_INSET, "提交信息"),
+        (author_x + COL_INSET, COL_AUTHOR - COL_INSET, "作者"),
+        (date_x + COL_INSET, COL_DATE - COL_INSET, "日期"),
     ] {
-        p.text(band(rect, x, w, 13.0).left_top(), Align2::LEFT_TOP, label, font.clone(), TEXT_SECONDARY);
+        p.text(band(rect, x, w, 13.0).left_top(), Align2::LEFT_TOP, label, FontId::proportional(12.0), TEXT_SECONDARY);
     }
-    // 列边界上的四条竖线（1pt 宽、16pt 高）。参考图：198 / 275 / 739 / 929，正好是
-    // 提交、描述、作者、日期四列的左缘各减 `COL_INSET`。
+    // 列边界上的**三条**竖线（1pt 宽、16pt 高）：图 \| 提交信息、提交信息 \| 作者、作者 \| 日期。
+    // 旧的四条里「提交 \| 描述」那一条跟着提交号那一列一起删了。
     let y0 = rect.center().y - RULE_H / 2.0;
-    for x in [
-        rect.min.x + COL_GRAPH,
-        rect.min.x + COL_GRAPH + COL_SHA,
-        right - COL_DATE - COL_AUTHOR,
-        right - COL_DATE,
-    ] {
+    for x in [rect.min.x + COL_GRAPH, author_x, date_x] {
         p.line_segment([pos2(x, y0), pos2(x, y0 + RULE_H)], Stroke::new(1.0, BORDER_SUBTLE));
     }
-    // 表头上下各一条横线，把这一条从筛选条与日志里隔开（参考图 y=78、y=103）。
+    // 表头上下各一条横线，把这一条从筛选条与日志里隔开。
     p.line_segment(
         [pos2(rect.min.x, rect.min.y + 0.5), pos2(right, rect.min.y + 0.5)],
         Stroke::new(1.0, BORDER_SUBTLE),
@@ -993,6 +1078,9 @@ pub(crate) struct Intent {
     /// 侧栏「远端」里要点开/收起的**那一条的名字**。放在 `Intent` 而不是就地改
     /// `self.remote_open`：这一段跑在面板闭包里，`self` 正被借走。
     pub(crate) toggle_remote: Option<String>,
+    /// 侧栏「搜索」那一行：把日志条右边那一格换成搜索框。同样因为闭包借走了 `self`，
+    /// 只能递一个布尔出去。开着的时候再点那一行不重算命中（见 `open_search`）。
+    pub(crate) open_search: bool,
 }
 
 impl Intent {
@@ -1267,7 +1355,7 @@ pub(crate) fn section(
     // 分类行：方框钉在面板左缘 +8、标签再往后 7pt（参考图 x 149 / 169.5，面板左缘 141）。
     // 不用 `ui.checkbox`：egui 那枚跟着字号长（11.5 号撑出 18pt 的框），缩进也由前一格说了算，
     // 三列对不齐；而且它的 `changed()` 会把「整组勾掉」和「用户点了别的」混成一个信号。
-    let (hrect, _) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::hover());
+    let (hrect, _) = ui.allocate_exact_size(vec2(ui.available_width(), FILE_ROW_H), Sense::hover());
     let head_hit = check_box(ui, hrect.min.x + CHK_HEAD_X, hrect.center().y, on);
     put_left(
         ui,
@@ -1324,7 +1412,7 @@ pub(crate) fn conflict_section(
     if files.is_empty() {
         return;
     }
-    let (hrect, _) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::hover());
+    let (hrect, _) = ui.allocate_exact_size(vec2(ui.available_width(), FILE_ROW_H), Sense::hover());
     put_left(
         ui,
         Rect::from_min_max(
@@ -1486,16 +1574,22 @@ pub(crate) fn history_row(
     let (rect, resp) = ui.allocate_exact_size(vec2(width, HIST_ROW_H), Sense::click());
     let p = ui.painter_at(rect);
     if active {
-        p.rect_filled(rect, 0.0, SELECTED);
-    } else if resp.hovered() {
+        // §4.6 说的是**所有列表**：文件历史这一列和日志同一套选中态，不再单独留实心蓝。
+        p.rect_filled(rect, 0.0, ACCENT_SOFT);
+        p.rect_filled(
+            Rect::from_min_max(pos2(rect.min.x, rect.min.y), pos2(rect.min.x + SELECT_BAR_W, rect.max.y)),
+            0.0,
+            ACCENT,
+        );
+    } else if row_hot(&resp) {
         p.rect_filled(rect, 0.0, BG_HOVER);
     }
     let (fill, glyph) = badge_of(&entry.change);
     let badge = Rect::from_min_size(pos2(rect.min.x + HIST_PAD, rect.min.y + 7.0), Vec2::splat(BADGE_S));
     p.rect_filled(badge, BADGE_R, fill);
     p.text(badge.center(), Align2::CENTER_CENTER, glyph, FontId::proportional(11.0), Color32::WHITE);
-    let ink = if active { Color32::WHITE } else { TEXT_PRIMARY };
-    let meta = if active { Color32::WHITE } else { TEXT_SECONDARY };
+    let ink = TEXT_PRIMARY;
+    let meta = TEXT_SECONDARY;
     let left = rect.min.x + HIST_PAD + BADGE_S + 7.0;
     put_left(
         ui,
@@ -1537,7 +1631,7 @@ pub(crate) fn history_row(
 /// 作者与内容都走 `Label::truncate`，不靠 `painter.text` 硬排——不然长名字会压到下一列上。
 pub(crate) fn blame_row(ui: &mut egui::Ui, width: f32, line: &BlameLine) {
     let (rect, resp) = ui.allocate_exact_size(vec2(width, HIST_BLAME_ROW_H), Sense::hover());
-    if resp.hovered() {
+    if row_hot(&resp) {
         ui.painter_at(rect).rect_filled(rect, 0.0, BG_HOVER);
     }
     let p = ui.painter_at(rect);

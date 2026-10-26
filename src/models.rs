@@ -20,6 +20,11 @@ pub struct Repo {
     pub added_at: Option<String>,
     /// When a fetch last completed, so the list can say how current it is.
     pub last_fetched_at: Option<String>,
+    /// 侧栏首页「分组」那一层用。**组只有一层，不嵌套**（DESIGN.md §2.1）。
+    /// 空串读作「未分组」——spec 选的是「列总在有值，缺省是空串」而不是 `NULL`，
+    /// 这样 `ORDER BY group_name` 和 `WHERE group_name <> ''` 都不用处理三值逻辑。
+    /// 改名/移出组都是对这一列的一条 UPDATE，没有单独的组表。
+    pub group_name: String,
 }
 
 /// 首屏「最近打开」的一行。`opened_at` 是 Unix 毫秒而不是 `added_at` 那种 RFC3339 串：

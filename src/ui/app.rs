@@ -77,6 +77,13 @@ impl Gitx {
             log_more: true,
             log_more_busy: false,
             log_seq: 0,
+            // 搜索一上来是关着的：那一格连日志条都不在（点开侧栏「搜索」才换上去）。
+            search_open: false,
+            search_q: String::new(),
+            search_hits: Vec::new(),
+            search_busy: false,
+            search_seq: 0,
+            search_focus: false,
             commit_msg: String::new(),
             commit_desc: String::new(),
             amend: false,
@@ -138,6 +145,7 @@ impl Gitx {
                 name,
                 added_at: None,
                 last_fetched_at: None,
+                group_name: String::new(),
             });
         }
         self.open(&root);
@@ -163,6 +171,13 @@ impl Gitx {
         self.log_seq += 1;
         self.log_more = true;
         self.log_more_busy = false;
+        // 搜索整档跟着仓库清零：上一本的命中列表对着这一本的提交号，画出来是假结果。
+        // 序号加一同时让**在途**的那次查询作废（`Msg::Search` 对不上号就丢）。
+        self.search_seq += 1;
+        self.search_open = false;
+        self.search_q.clear();
+        self.search_hits.clear();
+        self.search_busy = false;
         // 历史面板跟着仓库走：上一个仓库的文件路径在这里没有意义，在途的回复也作废。
         self.history = None;
         self.hist_seq += 1;
@@ -220,15 +235,62 @@ impl Gitx {
         });
     }
 
+    /// 侧栏「搜索」那一行：把日志条右边那一格换成搜索框。
+    /// 已经开着就不动命中列表——人只是又点了一下那一行（想不起搜索在哪），
+    /// 把上一次的结果抹掉等于告诉他「你刚才搜的那一下不算」。
+    pub(crate) fn open_search(&mut self) {
+        self.search_open = true;
+        self.search_focus = true;
+    }
+
+    /// 关掉这一档：词与命中一起清，在途那次查询也作废（序号加一）。
+    /// 留着上一次的词会让「再打开时那一格写着什么」变成看运气——列表已经跟着仓库清了。
+    pub(crate) fn close_search(&mut self) {
+        self.search_open = false;
+        self.search_q.clear();
+        self.search_hits.clear();
+        self.search_busy = false;
+        self.search_seq += 1;
+    }
+
+    /// 搜索框里回车那一下：把词打到 git（说明一路 + 文件名一路）。
+    /// 空词不发查询，直接把命中清空——`git log --grep=` 那个空串是**全命中**，
+    /// 画出来会看着像「搜索坏了，把整本历史都算成结果」。
+    pub(crate) fn run_search(&mut self) {
+        let q = self.search_q.trim().to_owned();
+        self.search_seq += 1;
+        let seq = self.search_seq;
+        if q.is_empty() {
+            self.search_hits.clear();
+            self.search_busy = false;
+            return;
+        }
+        let Some(repo) = self.repo.clone() else { return };
+        let detached = self
+            .snap
+            .as_ref()
+            .map(|s| s.status.detached_at.is_some())
+            .unwrap_or(false);
+        // 范围跟着日志条**当前那一档**（所有分支 / 当前分支 / 某条支线）：搜索结果和
+        // 用户正在看的那本历史得是同一批提交，不然「我明明在 main 上，搜出来的却是
+        // 支线独有的那条」。
+        let scope = eff_scope(&self.scope, detached);
+        self.search_busy = true;
+        spawn_search(&self.tx, &repo, &q, &scope, seq);
+    }
+
     pub(crate) fn oid(&self, i: usize) -> Option<String> {
         self.snap.as_ref().and_then(|s| s.commits.get(i)).map(|c| c.id.clone())
     }
 
-    /// 唯一一处「选行」：日志行、侧栏「文件状态 / 历史 / 已贮藏」都走这里。
+    /// 唯一一处「选行」：日志行、搜索结果行、侧栏「文件状态 / 历史 / 已贮藏」都走这里。
     pub(crate) fn select(&mut self, sel: Sel) {
-        let (index, stash) = match &sel {
-            Sel::Commit(i) => (*i, false),
-            Sel::Stash(i) => (*i, true),
+        // 三份列表共用一个下标位，所以「这一格是从哪本列表数出来的」必须**跟着走**：
+        // 只按下标回话，上一本的在途回复就能盖到这一本的选中行上（见 `Msg::CommitFiles.search`）。
+        let (index, stash, search) = match &sel {
+            Sel::Commit(i) => (*i, false, false),
+            Sel::Search(i) => (*i, false, true),
+            Sel::Stash(i) => (*i, true, false),
             Sel::Uncommitted => {
                 self.sel = Sel::Uncommitted;
                 self.file = None;
@@ -237,9 +299,11 @@ impl Gitx {
                 return;
             }
         };
-        // 贮藏不在日志里，得从侧栏那份列表取它的提交号；提交则按下标问日志。
+        // 贮藏不在日志里，得从侧栏那份列表取它的提交号；提交则按下标问日志 / 问命中。
         let oid = if stash {
             self.snap.as_ref().and_then(|s| s.stashes.get(index)).map(|s| s.oid.clone())
+        } else if search {
+            self.search_hits.get(index).map(|h| h.commit.id.clone())
         } else {
             self.oid(index)
         };
@@ -262,7 +326,7 @@ impl Gitx {
                         let msg = if stash {
                             Msg::StashFiles { repo: repo2, index, files }
                         } else {
-                            Msg::CommitFiles { repo: repo2, index, files }
+                            Msg::CommitFiles { repo: repo2, index, files, search }
                         };
                         let _ = tx.send(msg);
                     }
@@ -619,38 +683,21 @@ impl Gitx {
                 // 这一格铺满整屏的可点矩形就是遮罩：它把这一层的命中区域撑到全屏，
                 // 卡片后面的行才点不着；点它自己也等于「关掉卡片」。
                 let (bg, bg_resp) = ui.allocate_exact_size(screen.size(), Sense::click());
-                ui.painter().rect_filled(bg, 0.0, Color32::from_black_alpha(120));
+                ui.painter().rect_filled(bg, 0.0, MODAL_SCRIM);
                 // `Painter` 外面套的是 Arc，clone 一份就不占着 `ui` 的借用（卡里要横跨
-                // 一整层控件，最后那两条分隔线还得回到卡底来画）。
+                // 一整层控件）。
                 let p = ui.painter().clone();
-                // 卡底 + 一圈描边 + 外面那两档渐隐的光。以前遮罩只有 80 的黑、卡只有一圈
-                // `BORDER_SUBTLE` 灰边，整张卡像浮在页面上的一块白；遮罩压深、边收重一档，再补两圈
-                // 越来越淡的描边当作投影（`card_back` 那条判据只认**有底色**的圆角矩形，
-                // 所以这里全部用空心描边，不会冒充卡底）。
+                // §5.1 那一套：白底 + 圆角 12 + 1px `BORDER_SUBTLE` + **真阴影**
+                // （offset 0/8、blur 24、黑 40%）。上一版画的是遮罩 `from_black_alpha(120)`
+                // 加**两圈越来越淡的空心描边冒充投影**，spec 的遮罩是带色的、投影是能画的
+                // （`Shadow::as_shape` 出一条带 `blur_width` 的 `RectShape`），两样都换了真的。
+                // 阴影那一笔先落，才压在卡底下面。
+                p.add(CARD_SHADOW.as_shape(card, CARD_R));
                 p.rect_filled(card, CARD_R, Color32::WHITE);
                 p.rect_stroke(card, CARD_R, Stroke::new(1.0, BORDER_SUBTLE), egui::StrokeKind::Inside);
-                p.rect_stroke(
-                    card.expand(1.0),
-                    CARD_R + 1.0,
-                    Stroke::new(1.0, Color32::from_black_alpha(26)),
-                    egui::StrokeKind::Outside,
-                );
-                p.rect_stroke(
-                    card.expand(3.0),
-                    CARD_R + 3.0,
-                    Stroke::new(2.0, Color32::from_black_alpha(12)),
-                    egui::StrokeKind::Outside,
-                );
                 let mut y = card.min.y;
-                // 标题带：字比正文大一档、压一道下沿，卡里第一行才不至于是「一行小字直接
-                // 接一片控件」。
-                p.line_segment(
-                    [
-                        pos2(card.min.x, card.min.y + MODAL_TITLE_H),
-                        pos2(card.max.x, card.min.y + MODAL_TITLE_H),
-                    ],
-                    Stroke::new(1.0, BORDER_SUBTLE),
-                );
+                // 标题带。§5.2「标题/正文/按钮区之间**只靠间距分组，不画分隔线**（现实现里的
+                // 标题带下划线与 footer 上划线废除）」——这两条线以前都在。
                 put_left(
                     ui,
                     Rect::from_min_max(pos2(card.min.x + MODAL_PAD, y), pos2(card.max.x - MODAL_PAD, y + MODAL_TITLE_H)),
@@ -659,28 +706,33 @@ impl Gitx {
                             .selectable(false));
                     },
                 );
+                // §5.2 标题带右端那一枚 ×。偏好卡按同一条**没有**「取消」，这一枚就是它唯一的
+                // 鼠标出口（Esc 还在，但那是键盘）。
+                if card_close(ui, card) {
+                    close = true;
+                }
                 y += MODAL_TITLE_H;
                 if let Some(d) = &m.detail {
                     modal_text(ui, card, y, d, TEXT_SECONDARY, 11.0);
                     y += MODAL_ROW_H;
                 }
                 // 「添加仓库」那三档排在主输入**上面**：先说要办哪件事，再填对应那一格。
+                // 走 §4.4 那套**分段选择**（容器 `BG_INSET` 圆角 8、选中段浮成白药丸），
+                // 和重置卡、偏好卡同一枚 `seg_tabs`——以前这三档是三枚 `selectable_label`，
+                // 底色铺满整格又不收口，看着像三行而不是「换档」。
                 if let Form::AddRepo { tab, .. } = &mut m.form {
-                    put_left(
+                    seg_tabs(
                         ui,
-                        Rect::from_min_max(pos2(card.min.x + MODAL_PAD, y), pos2(card.max.x - MODAL_PAD, y + MODAL_ROW_H)),
-                        |ui| {
-                            ui.spacing_mut().item_spacing.x = 6.0;
-                            for (label, which) in [
-                                ("打开已有", AddTab::Open),
-                                ("克隆到本地", AddTab::Clone),
-                                ("新建仓库", AddTab::New),
-                            ] {
-                                if ui.selectable_label(*tab == which, RichText::new(label).size(11.5)).clicked() {
-                                    *tab = which;
-                                }
-                            }
-                        },
+                        Rect::from_min_max(
+                            pos2(card.min.x + MODAL_PAD, y + (MODAL_ROW_H - SEG_H) / 2.0),
+                            pos2(card.max.x - MODAL_PAD, y + (MODAL_ROW_H + SEG_H) / 2.0),
+                        ),
+                        &[
+                            ("打开已有", AddTab::Open),
+                            ("克隆到本地", AddTab::Clone),
+                            ("新建仓库", AddTab::New),
+                        ],
+                        tab,
                     );
                     y += MODAL_ROW_H;
                 }
@@ -728,8 +780,8 @@ impl Gitx {
                         seg_tabs(
                             ui,
                             Rect::from_min_max(
-                                pos2(card.min.x + MODAL_PAD, y + 3.0),
-                                pos2(card.max.x - MODAL_PAD, y + MODAL_ROW_H - 3.0),
+                                pos2(card.min.x + MODAL_PAD, y + (MODAL_ROW_H - SEG_H) / 2.0),
+                                pos2(card.max.x - MODAL_PAD, y + (MODAL_ROW_H + SEG_H) / 2.0),
                             ),
                             &git::ResetMode::ALL.map(|m| (reset_words(m).0, m)),
                             mode,
@@ -778,8 +830,8 @@ impl Gitx {
                         seg_tabs(
                             ui,
                             Rect::from_min_max(
-                                pos2(card.min.x + MODAL_PAD, y + 3.0),
-                                pos2(card.max.x - MODAL_PAD, y + MODAL_ROW_H - 3.0),
+                                pos2(card.min.x + MODAL_PAD, y + (MODAL_ROW_H - SEG_H) / 2.0),
+                                pos2(card.max.x - MODAL_PAD, y + (MODAL_ROW_H + SEG_H) / 2.0),
                             ),
                             &[
                                 ("通用", PrefPage::General),
@@ -914,13 +966,7 @@ impl Gitx {
                 }
                 // 底部那枚主按钮在最右（macOS 那套）。偏好卡没有「取消」——开关是当场落的，
                 // 说「取消」会谎报还没算的那部分能回退。
-                p.line_segment(
-                    [
-                        pos2(card.min.x, card.max.y - MODAL_FOOT_H),
-                        pos2(card.max.x, card.max.y - MODAL_FOOT_H),
-                    ],
-                    Stroke::new(1.0, BORDER_SUBTLE),
-                );
+                // §5.2：卡脚上面**不画线**，那 52pt 带子自己就是分组。
                 let cy = card.max.y - MODAL_FOOT_H / 2.0;
                 let mut right = card.max.x - MODAL_PAD;
                 if !m.primary().is_empty() {
@@ -1005,6 +1051,10 @@ impl Gitx {
                     // 提交数可能变了（刚切了分支）：下标越界就退回工作区行。
                     self.sel = match &self.sel {
                         Sel::Commit(i) if *i < snap.commits.len() => Sel::Commit(*i),
+                        // 命中那本列表**不跟着快照重取**（重取要再跑一遍 git，而人没让你搜第二遍）。
+                        // 所以这一档的越界只可能是列表自己变短了——那时退回工作区行，
+                        // 别让选中行停在一格已经不存在的命中上。
+                        Sel::Search(i) if *i < self.search_hits.len() => Sel::Search(*i),
                         Sel::Stash(i) if *i < snap.stashes.len() => Sel::Stash(*i),
                         _ => Sel::Uncommitted,
                     };
@@ -1043,8 +1093,42 @@ impl Gitx {
                         append_page(snap, commits);
                     }
                 }
-                Msg::CommitFiles { repo, index, files } => {
-                    if self.repo.as_deref() == Some(repo.as_str()) && self.sel == Sel::Commit(index) {
+                Msg::Search { repo, seq, query, commits } => {
+                    // 三道闸，缺一都会把**上一次**那一下回车的结果画成这一次的答案：
+                    // 号对不上（又回车了 / 换了仓库）、仓库不对、词已经改了（人在框里
+                    // 又敲了几个字，但还没回车）。
+                    if seq != self.search_seq
+                        || self.repo.as_deref() != Some(repo.as_str())
+                        || self.search_q.trim() != query
+                    {
+                        continue;
+                    }
+                    self.search_busy = false;
+                    // 药丸和日期文案在**这一刻**算，不在帧里算：那本账是「命中数 × 引用数」
+                    // 遍字符串比较，每帧现算就是拿它换一次滚动（和快照那两本同一理由）。
+                    // 快照没到手（`None`）时算不出药丸——那时连搜索框都不该在，
+                    // 真走到这儿就把药丸留空，别拿一份假账糊上去。
+                    let (branches, tags, remote_refs, taken) = match &self.snap {
+                        Some(s) => (&s.branches, &s.tags, &s.remote_refs, s.taken_at),
+                        None => {
+                            self.search_hits.clear();
+                            continue;
+                        }
+                    };
+                    let badges = ref_badges(&commits, branches, tags, remote_refs);
+                    self.search_hits = commits
+                        .into_iter()
+                        .zip(badges)
+                        .map(|(c, b)| SearchHit {
+                            date: date_label(&c.date, taken),
+                            commit: c,
+                            badges: b,
+                        })
+                        .collect();
+                }
+                Msg::CommitFiles { repo, index, files, search } => {
+                    let want = if search { Sel::Search(index) } else { Sel::Commit(index) };
+                    if self.repo.as_deref() == Some(repo.as_str()) && self.sel == want {
                         self.commit_files = files;
                     }
                 }
@@ -1723,6 +1807,11 @@ impl Gitx {
         if let Some(n) = it.note {
             self.note = Some(n);
         }
+        // 侧栏「搜索」那一行。放在 `goto` 之前：那一行点的是**开一格**，不是选一行，
+        // 两者同一帧里不会互相覆盖（开着搜索再点某一行，选中的还是那一行）。
+        if it.open_search {
+            self.open_search();
+        }
         if let Some(hit) = it.goto {
             self.select(hit);
         }
@@ -1771,6 +1860,9 @@ impl Gitx {
         };
         let sel = self.sel.clone();
         let mut filter = self.side_filter.clone();
+        // 「搜索」那一行开着的时候它得看起来是选中的：`Sel` 里没这一档（搜索不是一个**行**，
+        // 是日志条那一格的另一种状态），所以单独读一份布尔进来。
+        let search_open = self.search_open;
         // 展开着的那几条远端的名字，**开局读一份**：面板闭包里 `self` 正被借走，
         // 而这一份只用来决定画不画，改它走 `Intent::toggle_remote`（见 `land`）。
         let remote_open = self.remote_open.clone();
@@ -1794,8 +1886,13 @@ impl Gitx {
                             intent.goto = Some(hit);
                         }
                     }
-                    if side_row(ui, "搜索", false, false).clicked() {
-                        intent.note = Some("egui 版还没接：搜索面板（SourceTree 是带作用域条的独立面板）".to_owned());
+                    // SourceTree 这一行点开的是它自己那块**带作用域条的搜索面板**。本机没有
+                    // SourceTree.app（`/Applications` 和 `mdfind` 都查过），那块面板的控件一个数
+                    // 都没量到，参考图也只拍到这一行本身——所以这里**不照抄它**，按 2026-10-21
+                    // 规则②做成我们的增强：把日志条右边那一格换成搜索框，搜整本历史的
+                    // 提交说明 + 改动过的文件名。文案与档位都是自定，登记在 DESIGN §7。
+                    if side_row(ui, "搜索", search_open, false).clicked() {
+                        intent.open_search = true;
                     }
                     side_category(
                         ui,
@@ -1929,10 +2026,22 @@ impl Gitx {
                     );
                 });
                 ui.add_space(SIDE_FILTER_GAP);
-                ui.add_sized(
-                    Vec2::new(ui.available_width(), SIDE_FILTER_H - SIDE_FILTER_GAP),
-                    TextEdit::singleline(&mut filter).hint_text("筛选器"),
-                );
+                // 这格 26pt 的框要**单独把 `interact_size.y` 压回 26**：egui 0.37 的 `TextEdit`
+                // 底框高度取 `max(行高+内边距, 主题的 atom_layout.min_size.y)`，而那个 min_size
+                // 就是全局 `spacing.interact_size`（default_style.rs:161「Same as a button」），
+                // 全局那份又是 `Vec2::new(..., ROW_H)`（data.rs 里 style 那一坨）——日志行距从 26
+                // 换成 §2 的 28 之后，这格框会**偷偷跟着日志行高长**（实测画出来 28）。
+                // `TextEdit::min_size` 救不了：builder 那份只能**抬高**主题的地板（builder.rs:544
+                // 「the builder's own `min_size` can only raise it」）。所以只能开一个子作用域，
+                // 在里面把地板改回 §2 的 26，不动全局——全局一动，顶栏那 28×28 的图标按钮跟着塌。
+                let box_h = SIDE_FILTER_H - SIDE_FILTER_GAP;
+                ui.scope(|ui| {
+                    ui.spacing_mut().interact_size.y = box_h;
+                    ui.add_sized(
+                        Vec2::new(ui.available_width(), box_h),
+                        TextEdit::singleline(&mut filter).hint_text("筛选器"),
+                    );
+                });
             });
         self.side_filter = filter;
         self.land(intent);
@@ -1982,7 +2091,7 @@ impl Gitx {
             // 参考图第 5 条：列表上方一条「待定的文件, 已依照路径排序」。这一行和下面的提交框
             // 都不跟着列表滚——SourceTree 的关系是「列表滚，两头钉」。
             ui.horizontal(|ui| {
-                // 参考图这一条的文字起在 x 169.5，和下面分类行的标签**同一列**（面板左缘 141 + 28.5）。
+                // 参考图这一条的文字起在 x 169.5，和下面分类行的标签**同一列**（面板左缘 + 8 + 13 + 7 = 28）。
                 ui.add_space(CHK_HEAD_X + CHK_S + 7.0);
                 ui.label(RichText::new(PENDING_SORTED_BY_PATH).size(11.0).color(TEXT_MUTED));
                 ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
@@ -2059,6 +2168,7 @@ impl Gitx {
             let stash = matches!(sel, Sel::Stash(_));
             let oid = match &sel {
                 Sel::Commit(i) => self.oid(*i),
+                Sel::Search(i) => self.search_hits.get(*i).map(|h| h.commit.id.clone()),
                 Sel::Stash(i) => self
                     .snap
                     .as_ref()
@@ -2066,15 +2176,20 @@ impl Gitx {
                     .map(|st| st.oid.clone()),
                 Sel::Uncommitted => None,
             };
-            let subject = self
-                .snap
-                .as_ref()
-                .and_then(|s| match &sel {
-                    Sel::Commit(i) => s.commits.get(*i).map(|c| c.subject.clone()),
-                    Sel::Stash(i) => s.stashes.get(*i).map(|st| st.message.clone()),
-                    Sel::Uncommitted => None,
-                })
-                .unwrap_or_default();
+            let subject = match &sel {
+                Sel::Search(i) => self.search_hits.get(*i).map(|h| h.commit.subject.clone()),
+                _ => self
+                    .snap
+                    .as_ref()
+                    .and_then(|s| match &sel {
+                        Sel::Commit(i) => s.commits.get(*i).map(|c| c.subject.clone()),
+                        Sel::Stash(i) => s.stashes.get(*i).map(|st| st.message.clone()),
+                        Sel::Uncommitted => None,
+                        // 上面那一档已经接走它了。
+                        Sel::Search(_) => None,
+                    }),
+            }
+            .unwrap_or_default();
             let head = if stash {
                 format!("这条贮藏改了 {} 个文件", files.len())
             } else {
@@ -2148,7 +2263,7 @@ impl Gitx {
                 }),
             None => None,
         };
-        // 差异区顶上一格 = 参考图那条 (236,236,236) 的灰带：状态色块 + **加粗、靠左**的文件名。
+        // 差异区顶上一格 = §3.1 `BG_INSET` 的灰带：状态色块 + **加粗、靠左**的文件名。
         // 左对齐是用户 2026-10-20 特别点过的一条（「描述、文件 diff 展示都是左对齐的」）。
         let head = rect_of(ui, DIFF_HEAD_H);
         let p = ui.painter();
@@ -2430,6 +2545,15 @@ impl Gitx {
         };
         // 环下面那条竖线接的是**第一条提交**的车道，所以取 graph 第一行。
         let stem_lane = snap.graph.first().map(|g| g.lane).unwrap_or(0);
+        // 搜索那一档的几位，全在面板闭包**外面**读好：闭包里 `self` 正被 `snap` 借走，
+        // 写不了（理由同 `Intent`）。`hits` 和 `snap` 是两个不可变借用，可以并存。
+        let searching = self.search_open;
+        let hits = &self.search_hits;
+        let search_busy = self.search_busy;
+        let focus_search = self.search_focus;
+        let mut sq = self.search_q.clone();
+        let mut run_search = false;
+        let mut close_search = false;
         let width = ui.available_width();
         let mut want_topo = self.topo;
         let mut want_scope = self.scope.clone();
@@ -2476,11 +2600,56 @@ impl Gitx {
                         intent.note = Some("egui 版还没接：紧凑视图".to_owned());
                     }
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        if searching {
+                            // ✕ 先加：右到左的排布里它因此落在**最右**，正好是这一档的出口。
+                            // 字形复用卡片那枚 `CLOSE_GLYPH`（`×` U+00D7 的字体表已在 S6-6
+                            // 那条判据里验过有字形，别换一个没验过的叉）。
+                            if ui
+                                .add(egui::Button::new(RichText::new(CLOSE_GLYPH).size(14.0)).frame(false))
+                                .clicked()
+                            {
+                                close_search = true;
+                            }
+                            let w = (ui.available_width() - 8.0).clamp(90.0, 260.0);
+                            let resp = ui.add_sized(
+                                Vec2::new(w, 20.0),
+                                TextEdit::singleline(&mut sq)
+                                    .hint_text(SEARCH_HINT)
+                                    .id_salt("log-search"),
+                            );
+                            // 光标落在这一格：点侧栏「搜索」的人下一步就是打字，不该再点一下框。
+                            // `focus_search` 是上一帧 `open_search()` 立的牌子，这一帧消费掉。
+                            if focus_search {
+                                resp.request_focus();
+                            }
+                            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                run_search = true;
+                            }
+                            // 状态那一格（在途 / 几条 / 没搜到）跟着框一起换位置，
+                            // 免得搜索开着的时候日志条左半边多出一个会跳的数。
+                            let status = if search_busy {
+                                "搜索中…".to_owned()
+                            } else if sq.trim().is_empty() {
+                                "回车开搜".to_owned()
+                            } else if hits.is_empty() {
+                                "没搜到".to_owned()
+                            } else {
+                                format!("{} 条命中", hits.len())
+                            };
+                            ui.label(RichText::new(status).size(11.0).color(TEXT_SECONDARY));
+                            return;
+                        }
                         let w = (ui.available_width() - 8.0).clamp(90.0, 260.0);
                         ui.add_sized(Vec2::new(w, 20.0), TextEdit::singleline(&mut query).hint_text(JUMP_TO_SHA));
                     });
                 });
                 header_row(ui, width);
+                // 搜索开着、这一次什么都没捞到：列表那一块是空的，`show_rows` 一个字都不画。
+                // 空态得写明，不然看着像「搜索坏了」而不像「没有命中」——尤其框里那个词
+                // 是人自己打的，他会怀疑自己敲错了地方。
+                if searching && hits.is_empty() && !search_busy {
+                    ui.label(RichText::new(format!("没有提交命中「{}」：说明和改过的文件名都不含它", sq.trim())).size(11.0).color(TEXT_MUTED));
+                }
                 let q = query.trim().to_lowercase();
                 let keep: Vec<usize> = snap
                     .commits
@@ -2495,24 +2664,55 @@ impl Gitx {
                     .map(|(i, _)| i)
                     .collect();
                 // 虚拟行永远在第一位，不参与过滤（参考图第 2 条）。
-                let total = keep.len() + 1;
+                // 搜索开着时**没有虚拟行**：那一行是「工作区里还没提交的东西」，
+                // 它不属于任何一次搜索命中——按文件名搜「a.txt」把它列出来是骗人的，
+                // 那些改动还没落到任何提交里。
+                let total = if searching { hits.len() } else { keep.len() + 1 };
                 // 筛过的日志**不画图序列**：行与行断开了，竖线会连到一条没被显示的提交上，
                 // 看着像 bug。SourceTree 筛选时那一列同样空着。
                 let unfiltered = keep.len() == snap.commits.len();
                 ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, ROW_H, total, |ui, range| {
                     // 视口的最后一行追平列表尾 = 滚到底了。这里只能记在局部变量上：
                     // `snap` 还借用着 `self`，闭包里碰不了 `self.log_*`。
-                    if range.end >= total {
+                    // 搜索开着时这一位不算：命中列表不是分页日志，`ask_for_more` 会把
+                    // 日志的下一页接进快照，画面上却没人看它——白跑一次 git。
+                    if !searching && range.end >= total {
                         need_more = true;
                     }
                     for r in range {
                         bump_rows_painted();
+                        if searching {
+                            // 命中行和日志行**同一种行**（同一枚 `log_row`、同一套列宽），
+                            // 只是来源不同、不画图序列。这样搜索结果点下去和点日志行
+                            // 是同一件事：选中它、右边出它的文件表与补丁。
+                            let h = &hits[r];
+                            let cells = Cells {
+                                subject: h.commit.subject.clone(),
+                                author: format!("{} <{}>", h.commit.author, h.commit.author_email),
+                                date: h.date.clone(),
+                                badges: visible_badges(&h.badges, show_remote),
+                                ring: None,
+                                stem: false,
+                            };
+                            let hit = Sel::Search(r);
+                            // `push_id` 吃的是下标，和日志那一档 `Sel::Commit(i) => *i` 共用一个
+                            // 数字空间——两份列表不会在同一帧里出现，所以撞不上；真哪天并排画，
+                            // 这里要换成按提交编号发。
+                            let resp = ui
+                                .push_id(r, |ui| log_row(ui, width, &cells, sel == hit, None))
+                                .inner;
+                            if resp.clicked() && hit != sel {
+                                intent.goto = Some(hit);
+                            }
+                            let (oid, subject) = (h.commit.id.clone(), h.commit.subject.clone());
+                            resp.context_menu(|ui| commit_menu(ui, &oid, &subject, &mut intent));
+                            continue;
+                        }
                         let hit = if r == 0 { Sel::Uncommitted } else { Sel::Commit(keep[r - 1]) };
                         let cells = if r == 0 {
                             // 参考图这一行只有「Uncommitted changes」五个词，日期是**拍照时刻**
                             // （「今天 14:46」）而不是分支名。几个文件待提交写在下面文件表那一格里。
                             Cells {
-                                sha: "*".to_owned(),
                                 subject: "Uncommitted changes".to_owned(),
                                 author: "*".to_owned(),
                                 date: date_label(&snap.taken_at.to_rfc3339(), snap.taken_at),
@@ -2525,9 +2725,10 @@ impl Gitx {
                             let i = keep[r - 1];
                             let c = &snap.commits[i];
                             Cells {
-                                sha: c.short_id.clone(),
                                 subject: c.subject.clone(),
-                                // 作者列参考图给的是 `baorong <superlbr@126.com>`：名字带尖括号邮箱。
+                                // 作者列：名字带尖括号邮箱（旧参考图这一格是
+                                // `baorong <superlbr@126.com>`；§2 只给了列宽 96，超出的部分
+                                // 由 `band` 截断）。
                                 author: format!("{} <{}>", c.author, c.author_email),
                                 date: snap.dates.get(i).cloned().unwrap_or_default(),
                                 badges: snap.badges.get(i).map(|b| visible_badges(b, show_remote)).unwrap_or_default(),
@@ -2553,6 +2754,9 @@ impl Gitx {
                             // 「选中项不是日志行」，不发 Id 就够。
                             Sel::Stash(_) => usize::MAX,
                             Sel::Commit(i) => *i,
+                            // 搜索结果那一档在**上面**单独发了 Id（`push_id(r)`），走不到这儿；
+                            // 真被走到就是「选中项不是日志行」，不发 Id 就够。
+                            Sel::Search(_) => usize::MAX,
                         };
                         let resp = ui
                             .push_id(key, |ui| log_row(ui, width, &cells, sel == hit, graph))
@@ -2574,12 +2778,30 @@ impl Gitx {
         if need_more {
             self.ask_for_more();
         }
+        // 搜索那几位，顺序是有讲究的：先把框里的字写回去（`run_search` 读的就是它），
+        // 再消费「这一帧要请求焦点」那块牌子，最后才开搜/关档。
+        self.search_q = sq;
+        self.search_focus = false;
+        if run_search {
+            self.run_search();
+        }
+        if close_search {
+            self.close_search();
+        }
         // 远程药丸只是**画不画**，列表一个字都没改，所以这一枚不重取快照。
         self.show_remote = want_remote;
         if want_topo != self.topo {
             self.set_topo(want_topo);
         }
         if want_scope != self.scope {
+            // 搜索开着时换范围 = 命中那一批的**前提**变了（它们是按旧范围取的两条 `git log`）。
+            // 留着旧命中会画出「范围写着所有分支、列表却是当前分支」这种自相矛盾的帧，
+            // 所以清掉并让在途那次作废；框里的词留着，换完范围回车就是新的。
+            if self.search_open {
+                self.search_hits.clear();
+                self.search_busy = false;
+                self.search_seq += 1;
+            }
             self.set_scope(want_scope);
         }
         self.land(intent);
@@ -2636,14 +2858,17 @@ impl Gitx {
                 }
                 // 一段一段画而不是拼成一条：段与段之间要能被判据单独认出来
                 // （「↑2 跟没跟在分支名后面」按文字起点比，拼成一串就无从比）。
+                // 字级跟着 §2「STATUS：11px 灰字」和 §3.4（辅助 11/400 的用途列写着「状态栏」）；
+                // 灰 = §3.1 `TEXT_MUTED`，它那行用途同样明写了「状态栏」。
+                // 旧档是分支名 12px `TEXT_PRIMARY`，比内容区正文还重，状态栏读起来像在抢日志区的话。
                 let mut x = rect.min.x + 8.0;
                 for part in left {
                     let r = ui.painter().text(
                         pos2(x, rect.center().y),
                         Align2::LEFT_CENTER,
                         part,
-                        FontId::proportional(12.0),
-                        TEXT_PRIMARY,
+                        FontId::proportional(11.0),
+                        TEXT_MUTED,
                     );
                     x = r.max.x + 4.0;
                 }
@@ -2652,7 +2877,7 @@ impl Gitx {
                         pos2(x + 8.0, rect.center().y),
                         Align2::LEFT_CENTER,
                         format!("回到 {b}"),
-                        FontId::proportional(12.0),
+                        FontId::proportional(11.0),
                         ACCENT,
                     );
                     let spot =
@@ -2664,12 +2889,21 @@ impl Gitx {
                         go_back = Some(b);
                     }
                 }
+                // 版本号常驻最右：空态（没开仓库）也要能看见这一版是哪个。
+                let version = ui.painter().text(
+                    pos2(rect.max.x - 8.0, rect.center().y),
+                    Align2::RIGHT_CENTER,
+                    format!("v{}", crate::ui::VERSION),
+                    FontId::proportional(11.0),
+                    TEXT_MUTED,
+                );
                 if let Some(path) = &self.repo {
+                    // 路径让出右边这一格版本号，不再贴死右缘。
                     ui.painter().text(
-                        pos2(rect.max.x - 8.0, rect.center().y),
+                        pos2(version.min.x - 10.0, rect.center().y),
                         Align2::RIGHT_CENTER,
                         path,
-                        FontId::proportional(11.5),
+                        FontId::proportional(11.0),
                         TEXT_MUTED,
                     );
                 }

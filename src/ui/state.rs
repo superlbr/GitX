@@ -18,6 +18,10 @@ use crate::ui::diffmodel::*;
 pub(crate) enum Sel {
     Uncommitted,
     Commit(usize),
+    /// **搜索结果**列表里的第几格（`Gitx::search_hits`）。不并进 `Commit` 那一档：
+    /// 同一个下标在两份列表里指的是不同的提交，并起来之后「上一本列表的回复盖到
+    /// 这一本的选中行上」这种脏数据就没有闸能拦了（见 `Msg::CommitFiles` 那个 `search`）。
+    Search(usize),
     /// 侧栏「已贮藏」那条的下标（`snapshot.stashes` 里的位置）。
     Stash(usize),
 }
@@ -720,11 +724,24 @@ pub(crate) struct Snapshot {
     pub(crate) taken_at: chrono::DateTime<chrono::Local>,
 }
 
+/// 历史页那一格搜索的一条命中，连同**落地那一刻**算好的药丸与日期文案。
+/// 单独一个结构体而不是三份平行数组：`commit`/`badges`/`date` 必须一一对应，
+/// 拆成三个 `Vec` 的话「多算一行少推一个」这类错位没人拦（`Snapshot` 那三本账
+/// 是 worker 一次算完的，所以它敢拆）。
+pub(crate) struct SearchHit {
+    pub(crate) commit: Commit,
+    pub(crate) badges: Vec<RefBadge>,
+    pub(crate) date: String,
+}
+
 pub(crate) enum Msg {
-    Loaded { repo: String, snap: Box<Snapshot> },
-    /// 日志的下一页。带 `seq`：切仓库/换排序之后旧页作废，不能往新列表尾巴上接。
+    Loaded { repo: String, snap: Box<Snapshot> },    /// 日志的下一页。带 `seq`：切仓库/换排序之后旧页作废，不能往新列表尾巴上接。
     More { repo: String, seq: u64, commits: Vec<Commit> },
-    CommitFiles { repo: String, index: usize, files: Vec<DiffEntry> },
+    CommitFiles { repo: String, index: usize, files: Vec<DiffEntry>, search: bool },
+    /// 历史页那一格搜索的回复。`seq` 是发出去那一次的号：切仓库、换范围、又敲一次都会
+    /// 让它变，对不上号的回复直接丢——不然人会看到「搜 A 出 B」。
+    /// `query` 带回发出去那个词，落地时对一眼：词已经改了的回复同样作废（`search_q != query`）。
+    Search { repo: String, seq: u64, query: String, commits: Vec<Commit> },
     /// 侧栏点开的那条贮藏改了哪些文件。和 `CommitFiles` 分开：选中项不是同一种行。
     StashFiles { repo: String, index: usize, files: Vec<DiffEntry> },
     Patch { repo: String, seq: u64, label: String, lines: Vec<DiffLine> },
@@ -789,6 +806,24 @@ pub struct Gitx {
     pub(crate) log_more_busy: bool,
     /// 分页的序号：`open` 一次加一，回复对不上号就丢掉（切了仓库/换了排序，旧页作废）。
     pub(crate) log_seq: u64,
+    /// 历史页那一格搜索**开着吗**。单独一个布尔而不是「有命中就算开着」：搜了但零命中时
+    /// 那一格必须还留着，不然人会以为搜索自己关掉了，再敲一遍同样的词。
+    pub(crate) search_open: bool,
+    /// 搜索框里的词。和 `log_filter`（日志条那格「转到Commit的SHA-1」，只在**已加载**的
+    /// 那几页里筛）是两件事：这一格回车之后打到 git，找的是整本历史 + 文件名。
+    pub(crate) search_q: String,
+    /// 上一次搜索的命中（两路合并、新的在上）。空列表 = 没搜到，也 = 还没搜过。
+    /// 药丸和日期文案**在落地那一刻算好**：那本账是「命中数 × 引用数」遍字符串比较，
+    /// 和快照里 `badges` / `dates` 同一个理由（见 `ref_badges` 上面那段注释）——每帧现算
+    /// 就是拿它换一次滚动，而这一档命中上限是 400 条。
+    pub(crate) search_hits: Vec<SearchHit>,
+    /// 搜索回复在路上。不立这块牌子，回车之后到落地之间那几帧会连着发好几遍同一个查询。
+    pub(crate) search_busy: bool,
+    /// 搜索的序号：一次回车加一，`open()` 换仓库也加一（旧回复作废，理由同 `log_seq`）。
+    pub(crate) search_seq: u64,
+    /// 「这一帧要不要把光标送进搜索框」。和 `modal_focus` 同一套：那一格是在面板闭包里
+    /// 才存在的，而请求焦点要在它存在之后——所以「刚点开搜索」这件事得先记一笔，下一帧消费掉。
+    pub(crate) search_focus: bool,
     /// 文件表下方那格提交信息。放在壳里而不是控件里有两个理由：提交成功后要由回复来清空
     /// （见 `clear_msg_on_load`），以及无头门禁要能直接读它。
     /// SourceTree 那格是**两个框**：摘要 + 描述。落进 git 是一条 `-m`，中间隔一个空行。

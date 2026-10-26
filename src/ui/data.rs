@@ -147,6 +147,24 @@ pub(crate) fn spawn_snapshot(tx: &Sender<Msg>, repo: &str, topo: bool, scope: &g
 /// 再多就得上分页，而这一批的判据只需要「能列出改动过它的提交」。
 pub(crate) const FILE_LOG_MAX: u32 = 200;
 
+/// 历史页那一格搜索**每一路**取多少条（说明一路 + 文件名一路，合并后最多两倍）。
+/// 钉 200 和上面同一条理由：再多就得给结果列表做分页。注意这一档不是「够不够用」的数，
+/// 是「一帧画不画得下」的数——命中超过 200 条时列表顶部会写明「只显示前 200 条」。
+pub(crate) const SEARCH_MAX: u32 = 200;
+
+/// 历史页那一格搜索：两路（提交说明 / 改过的文件名）各跑一条 `git log`，合并放在核心层。
+/// 跑在工作线程上是有原因的：`git log --grep` 走的仍是**全历史**，200 那条上限只限住
+/// 输出、不限遍历，大仓库上就是几百毫秒——主线程点一下卡一下，那是性能轴上的倒退。
+pub(crate) fn spawn_search(tx: &Sender<Msg>, repo: &str, query: &str, scope: &git::Scope, seq: u64) {
+    let (tx, repo, query, scope) = (tx.clone(), repo.to_owned(), query.to_owned(), scope.clone());
+    std::thread::spawn(move || {
+        let _ = tx.send(match git::search_commits(&repo, &query, &scope, SEARCH_MAX) {
+            Ok(commits) => Msg::Search { repo, seq, query, commits },
+            Err(e) => Msg::Failed(format!("{repo}: {e}")),
+        });
+    });
+}
+
 pub(crate) fn spawn_file_log(tx: &Sender<Msg>, repo: &str, path: &str, seq: u64) {
     let (tx, repo, path) = (tx.clone(), repo.to_owned(), path.to_owned());
     std::thread::spawn(move || {
@@ -307,7 +325,7 @@ pub(crate) fn change_label(s: &ChangeStatus) -> &'static str {
 /// 返回「这一帧有没有人点它」。
 ///
 /// 为什么自己画而不用 `ui.checkbox`：egui 那枚的尺寸跟着字号走（11.5 号的字撑出 18pt 的框），
-/// 而参考图三枚量到都是 13.5 见方，且**钉在面板的固定列上**（分类行 8、文件行 25）——
+/// 而参考图三枚量到都是 13.5 见方（§2 把这一档钉成 **13**，差的半像素归 §7），且**钉在面板的固定列上**（分类行 8、文件行 25）——
 /// 交给布局系统排，缩进就由前面那格说了算，列就对不齐。
 ///
 /// 勾是两段折线，不是字形：字体里没有 U+2713，画成字会撞上
@@ -342,7 +360,7 @@ pub(crate) fn check_box(ui: &mut egui::Ui, x: f32, cy: f32, checked: bool) -> bo
 /// 各问各的就够，不要再叠一层 `&& !toggled`（把那个守卫删掉，`ticking_a_file_box_stages_only_that_file`
 /// 和 `a_click_on_a_rows_text_selects_the_row` 两条门禁照样绿——它们钉的是行为，不是这行代码）。
 pub(crate) fn file_row(ui: &mut egui::Ui, path: &str, st: &ChangeStatus, current: bool, tail: &str, check: Option<bool>) -> (egui::Response, bool) {
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), FILE_ROW_H), Sense::click());
     if current {
         ui.painter().rect_filled(rect, 5.0, PICK_BG);
     }
@@ -353,7 +371,7 @@ pub(crate) fn file_row(ui: &mut egui::Ui, path: &str, st: &ChangeStatus, current
     // **没有方框的那一栏，方框占的那一档要一起收掉**（用户 2026-10-21：「勾选的 box 没了，
     // 但是没有移动位置」）。某条提交的改动列表不能勾——早落库了，勾不动索引——可它一直按
     // 有方框的落点排，右边白留 22pt。所以色块挪到方框那一档（+8），文字挪到**分类标题同一列**
-    // （8 + 13.5 + 7 = 28.5，和「已暂存文件」那几个字对齐）。
+    // （8 + 13 + 7 = 28，和「已暂存文件」那几个字对齐）。
     let (icon_x, name_x) = if check.is_some() { (ICON_X, NAME_X) } else { (NO_BOX_ICON_X, NO_BOX_NAME_X) };
     let p = ui.painter();
     let (fill, glyph) = badge_of(st);

@@ -428,8 +428,12 @@ UI 不许出现 emoji、提交行高度只有一个来源、没有上游时绝�
   「当前分支」档 = HEAD 可达链）；**实测更正**：本机 git 2.54 的 unborn 占位符是 `(initial)`
   不是 `(none)`，而「分离 + 占位符」这个组合 git 永远不会自己产生，所以那道守卫只能拿文本当夹具。
   顺带抓到 `busy` 是**一面共用旗子**（`Msg::Patch` 也落它），等 `!busy` 的判据会读到旧快照（全文见下）
+- **图标 / 版本号 / 发布流水线** 打包出来的 `.app` 此前**根本没有图标**（仓库里
+  `gen-icon.mjs` 一直在，但从没跑过、`assets/icon.png` 也不存在）。本批把图标补上、
+  版本号收成一处、加 `bundle-macos.sh` 与 `release.yml`（全文见下）
 
 ---
+
 ## 接通分支 / 标签 / 贮藏 / 忽略 / 远端：模态卡 + 右键菜单（任务 #27，2026-10-21 凌晨）
 
 **这批是纯接线**：`create_branch`、`delete_branch`、`create_tag`、`stash_*`、`ignore_path`、
@@ -1792,7 +1796,7 @@ M18–M22 这五条一起改坏、跑一次全量，按红灯归属归因（7 �
   贴带外沿的那一条，所以先 `let outer = ui.max_rect()`，`.show()` 完之后用
   `ui.painter_at(...)` 画。
 - **中文标签从顶栏消失**：`TOOLS` 第二个字段只留给 tooltip 和（还没实现的）`»` 溢出菜单。
-  真线描 SVG 排在 S6-6，在那之前用字体链里确实存在的字形顶着——上一版有七个是豆腐块。
+  真线描 SVG 排在 S6-7（S6-6 已被弹窗体系占用），在那之前用字体链里确实存在的字形顶着——上一版有七个是豆腐块。
 
 **判据（162 条，比这批开始前多 6 条）**
 
@@ -1844,7 +1848,7 @@ M18–M22 这五条一起改坏、跑一次全量，按红灯归属归因（7 �
   撞车判据在 800 仍绿、760 才红，所以 860 **不是**内容压力线，只由字面值判据钉。
   上一版注释里"往下调一个像素就红"是没验过的夸大，已改。
 - 新增欠账（都写进了 `DESIGN.md` §7）：虚线描边（egui 0.37 的 `Stroke` 没有 dash）、
-  圆角 999（只有 u8 半径，取半高 13）、SVG 图标（S6-6）、`»` 溢出菜单（没实现）、
+  圆角 999（只有 u8 半径，取半高 13）、SVG 图标（S6-7）、`»` 溢出菜单（没实现）、
   `STATUS_H` 还 26（S6-5）、日志表头还 24（S6-4）。
 
 **仍然没看到过的**
@@ -2102,4 +2106,336 @@ Current+分离→All、Current+在分支→Current、All+分离→All、**Rev+�
 **未决的文案不一致**：分离时取数偷偷走了 `--all`，筛选条那枚 chip 还写着「当前分支」。
 字和实参不一致，已记进 `DESIGN.md §7`，归下一刀（要么给 chip 一档「分离 HEAD（全部引用）」，
 要么在 chip 上写明实际口径）。
+
+
+## 换锚 S6-4：日志那一带（2026-10-26）
+
+### 决定与依据
+
+§2 给 LOG 的数：**表头 28 + 行 28**，四列 = 图 48 | 提交信息（弹性）| 作者 96 | 日期 78。
+§3.3 给图元自己的尺寸（圆点半径 4、线宽 2、四枚车道色），§4.5 给药丸，§4.6 给选中态
+（`ACCENT_SOFT` 铺底 + 左缘 2px `ACCENT` 条、**文字不反白**）。这一带的旧值全是四张 SourceTree
+参考图量的（行距 26、表头 24、图列 57、内缩 5、提交号另占 77），§6 迁移表逐条把它们换成 spec 的数。
+
+三处是 spec 没给、我们拍的，全数登记进 `DESIGN.md §7`：
+
+1. **车道几何 `LANE0_X 12` / `LANE_W 10`**。图列从 57 收到 48 之后旧档装不下四条道
+   （第 0 道中心 22.75 + 3×12 = 58.75 早越列）。拍成 12/22/32/42 四道，半径 4 的圆点最右到 46。
+2. **`COL_INSET 12`**（文字离自己列左缘）。§2 只给了列宽，内缩取自预览稿 `.lr{padding:0 12px}`。
+3. **药丸 `PILL_H 15` / `PILL_R 7`**。§4.5 只给「11/600、圆角 999」；u8 半径没有 999，半高即胶囊。
+
+另一条是**被 bug 逼出来的拆分**：文件行从前跟着 `ROW_H` 走，日志行距 26→28 把三条文件行连两个
+分类标题一起顶高 24pt，最后一条（`notes.md`）被挤出 `ScrollArea` 的裁剪框——`put_left` 里的子 `Ui`
+整块不可见时 egui **根本不落字**，于是状态色块（painter 直接画）还在、文件名没了。
+§2 明写文件表「行高 24」、§6 迁移表明写「文件行 24 另设 `FILE_ROW_H`」，于是新增那枚常量。
+
+### 改了什么
+
+- `theme.rs`：`ROW_H` 26→**28**、`LOG_HEAD_H` 24→**28**、`COL_GRAPH` 57→**48**（`COL_SHA` 整列删）、
+  `COL_INSET` 5→**12**、`LANE_W`/`LANE0_X` 重拍、新增 `FILE_ROW_H 24`、`SELECT_BAR_W 2`（旧 `SELECTED`
+  实心蓝作废）、药丸四套颜色全部换成 §3.1 现成 token、`LANE_COLORS [LANE_1..4]` + `lane_color` 按 `% 4` 回绕。
+- `widgets.rs::log_row`：作者/日期从 `p.text` 换成 `put_left` + `Label::truncate`（`Painter::text` 不截断，
+  `包融 <br@example.com>` 实测 142.5pt 会从 84pt 那一格一路压到日期格上）；三格文字 band 的高取**整行**
+  而不是字号（13px 的中文行高实测 16，按字号摆会让文字中心比行中心低 1.5pt，按 y 认领图元的判据就认空）；
+  选中态改 `ACCENT_SOFT` + 2pt 左条；hover 走新的 `row_hot`。
+- `widgets.rs::row_hot`（新）：`hovered() || container_contains_pointer()`。行里的文字是子 `Label`，
+  它自带 `Sense` 会把 hover 抢走——**实测鼠标停在提交信息上时整行 `hovered()` 是 false、灰底不画**。
+  `container_contains_pointer` 只比到**层**为止（egui-0.37.0/src/context.rs:3656 末尾那句
+  `layer_id_at(pointer_pos) != Some(layer_id)`），子控件和父行同层，所以它认得这一行。
+  同一条改动顺手盖了 `history_row`、`blame_row`（结构一模一样）。
+- `app.rs` 侧栏筛选框：开一个 `ui.scope` 把 `spacing.interact_size.y` 单独压回 26。
+  egui 0.37 的 `TextEdit` 底框高取主题的 `atom_layout.min_size.y`，而那就是全局 `spacing.interact_size`
+  （default_style.rs:161「Same as a button」）；日志行距换成 28 之后这格框**偷偷跟着日志行高长**（实测 28）。
+  `TextEdit::min_size` 救不了：builder 那份只能**抬高**地板（builder.rs:544）。全局更不能动，一动顶栏
+  那 28×28 的图标按钮跟着塌。
+- `geometry.rs`：`graph_marks` 与两处内联 fold 加 `clip_rect.min.x >= SIDEBAR_W - 0.5` 这一道筛
+  （§3.3 第 0 道 = `#0969DA` = §3.1 `ACCENT`，**同一个蓝**，侧栏那颗当前分支点会被按颜色误认成提交点：
+  实测 3 条提交数出 4 个点、半径表多出一格 3.5）；`col_edges` 助手（内缩只有一个来源）；表头横线容差 ±1.5；
+  新判据 `four_lanes_stay_inside_the_forty_eight_point_column`、`the_filter_still_finds_a_commit_by_its_short_id`、
+  `lane_color` 回绕断言；hover 判据改**双落点**；删掉 4 条临时无头调试判据（`zz_dump*`，`#[test]` 数 174→170 核对过）。
+
+### 判据 + 反向变异表
+
+179 条无头判据全绿，`./scripts/gates.sh` 四条门禁全绿。变异逐条手打、每条跑该红的那一条窄门禁，
+全部还原后重跑：
+
+| # | 变异 | 红在 | 备注 |
+|---|---|---|---|
+| 1 | `ROW_H` 28→26 | `every_log_column_starts_at_its_own_header` | 只有这一条红：其余全是「间距 == ROW_H」的相对判据，常量挪它们跟着挪 |
+| 2 | `LOG_HEAD_H` 28→24 | 同上 | 同理，所以 §2 的两个 28 各钉一条字面值 |
+| 3 | `COL_GRAPH` 48→57 | `every_log_column_...` + `the_header_carries_the_design_spec_column_rules` | |
+| 4 | `COL_AUTHOR` 96→105 | 同上两条 | |
+| 5 | `COL_DATE` 78→70 | 同上两条 | |
+| 6 | `COL_INSET` 12→5 | `every_log_column_...` | 248/888/984 那三条绝对起笔 + 新加的 (48,96,78) 元组字面值 |
+| 7 | `LANE0_X` 12→16.75 | `every_log_column_...` + `graph_marks_are_the_design_spec_geometry` | 后者按字面量 `SIDEBAR_W + 12.0` 认第 0 道 |
+| 8 | `LANE_W` 10→12 | **一开始只红 1 条**（字面值那条），177 条全绿 | 假绿抓现行：旧夹具最多三条道，第 3 道圆心 236 正好压在列右边界上、圆点右沿 240 已越出 4pt，而 `the_graph_never_escapes_its_column` 比的是**圆心**、且拿 `COL_GRAPH` 比自己。补了 #8b |
+| 8b | 同上（新判据就位后重打） | `four_lanes_stay_inside_the_forty_eight_point_column`，红在 `x=236.0、右沿 232..240 越出 188..236` | 八爪合并（一提交四父亲）真占满四条道；边界写死 48 与半径 4。夹具自己先断言 `max lane == 3`，防「四条道没被真画出来」的空判 |
+| 9 | `FILE_ROW_H` 24→26 | `the_current_file_row_gets_the_grey_band` + `a_click_on_an_unpicked_file_row_switches_to_it` + `every_log_column_...` | 第一条判据本轮从 `ROW_H` 重锚到字面量 24（§2 的数） |
+| 10 | `SELECT_BAR_W` 2→3 | `a_selected_log_row_is_a_tinted_band_with_an_accent_bar` | |
+| 11 | `row_hot` 退成只认 `hovered()` | `a_hovered_log_row_gets_the_grey_band` | 红在 x=388 那个落点（正落在提交信息那块 `Label` 上） |
+| 12 | 提交信息 13px→12px | `the_log_list_tiers_its_text_by_weight_and_grey` | §3.4「正文 / 次要」的分界就是这一档 |
+| 13 | 作者那格退回 `p.text` 不截断 | `no_visible_text_overlaps_at_the_smallest_allowed_window` | 860pt 窄窗下量的正是这一条 |
+| 14 | `graph_marks` 里那道 `clip_rect` 筛去掉 | 五条同时红（`a_linear_history_...`、`a_filtered_log_...`、`graph_marks_...`、`the_graph_never_escapes_...`、`four_lanes_...`） | 侧栏那颗蓝点混进提交点 |
+| 15 | `lane_color` 的回绕 `% 4` 换成 `min(3)` 夹住 | `graph_marks_are_the_design_spec_geometry`（新加的回绕断言） | 写成 `LANE_COLORS[lane]` 是越界 panic、夹住是永远拿最后一枚，两种改法在四道以内的夹具里全绿 |
+| 16 | 删掉筛选谓词里 `c.short_id.starts_with(&q)` 那一挡 | `the_filter_still_finds_a_commit_by_its_short_id`（红在 `[]`） | 提交号列删了，信息不能跟着列一起丢 |
+| 17 | 同一谓词写成恒真 | 同上（红在捞出三条） | |
+
+### 仍然没看到过的
+
+- **`row_hot` 里 `hovered()` 那一半没有独立杀伤路径**：只留 `container_contains_pointer` 时 179 条全绿。
+  它独自为真的场景是「按住往别处拖」或「同一坐标被浮层压住」，无头帧没造过这类输入。
+  留这一半是为了按下时不丢高亮；真窗口没目视过。
+- **`the_filter_still_finds_a_commit_by_its_short_id` 的第二条断言（bogus 前缀捞不到）没有独立杀伤路径**，
+  16、17 两轮变异都先红在第一条上。它只是把「筛过真的变少」写进同一格。
+- **八爪合并（一提交四父亲）没在真仓库里画过**：夹具是手搓的 `Commit` 列表。git 真会不会给出
+  四条并发车道、弯线在第四条道上的形状，无头不知道。
+- **文件行 24 挤掉最后一行那件事只在无头里抓到过**（`notes.md` 的名字不落字）。真窗口的滚动的
+  裁剪行为、以及 `ScrollArea` 尾行半截 visible 时 egui 落不落字，都没目视。
+- **`four_lanes_...` 用 `WIN_H + STATUS_H` 加高窗口才塞得下六行**，正常 545pt 的窗口里八爪合并
+  那屏是滚动的——滚动时的车道重排没判据。
+- 顶栏 11 枚图标 + 分支 chip 在 760pt 以下真撞车，`»` 溢出菜单仍未实现（§7 那条旧账没结）。
+
+## 换锚 S6-5：暂存带与状态栏（2026-10-26）
+
+### 决定与依据
+
+§2 给 STAGING 的数：带 **240**（默认，可拖 `120 … 窗口余量`）、文件表 **330**、**行高 24**、
+状态色块 **12pt 圆角 3**、圆角勾选框 **13pt**、底置提交框（摘要 + 三行描述 + 修正勾 + 主按钮）。
+§2 给 STATUS 的数：**24pt**、**白底 + 上 1px 分隔线**、内容「左：分支 · ↑↓ · 进行中操作；右：仓库路径；
+**11px 灰字**」。11px 那一档不是猜的：§3.4 用途列写「分组头、**状态栏**、药丸、占位、行号」，
+§3.1 `TEXT_MUTED` 用途列写「占位、辅助、**状态栏**」，两处各自点名。
+差异区的底色 spec 也只给了 token：§3.1 `BG_INSET` 的用途列明写「输入底、**hunk 头**、虚拟行」。
+
+旧值全是四张参考图量的：带 245、文件表 435（1050pt 那张 141→576）、状态栏 26、勾选框 13.5、
+差异带头 `(236,236,236)`、状态栏分支名 12px `TEXT_PRIMARY` + 路径 11.5px（同一带子里两档）。
+
+三处 spec 没给、实现自拍，全数进 `DESIGN.md §7`：
+
+1. **`DIFF_HEAD_H 30` / `DIFF_HEAD_PAD 8`**：§2 只说「hunk 头灰底」，高和左边距仍是参考图量的。
+2. **`COMMIT_H 96` 预算**：参考图那张提交框只露出摘要一行，量不到三行描述该多高；实测内容 97.6，
+   多出的 1.6pt 是换 Inter 之后行盒变高带来的，由父面板 clip 切掉，**不抬预算**——抬了会把文件表
+   最后一行顶到视口边缘、点不中。
+3. **`CHK_S` 13 vs 量到的 13.5**：按 S6 的规矩以 spec 为准，那半像素连同派生的落点
+   （无方框那一栏文字 `8+13+7=28`，旧 28.5）一起挪。
+
+### 改了什么
+
+- `theme.rs`：`STAGING_H` 245→**240**、`FILES_W` 435→**330**、`STATUS_H` 26→**24**、
+  `CHK_S` 13.5→**13**（连带 `NO_BOX_NAME_X` 28.5→28）、`DIFF_HEAD_BG` 从 `from_rgb(236,236,236)`
+  改成 **`BG_INSET` 的别名**（用途跟着 token，高与边距留在自拍档）。`MIN_H 394` 那条注释里的公式
+  `46+84+240+24` 到这一批才真的四项对上（S6-4 前两项、这一批后两项）。
+- `app.rs::status_bar`：三段左文字 12px `TEXT_PRIMARY` → **11px `TEXT_MUTED`**、右边路径 11.5 → **11**、
+  分离那格「回到 {分支}」12 → **11**（颜色留 `ACCENT`：§3.1 把它写成「链接、主按钮、焦点」，
+  而它是这条带子里唯一可点的一段）。
+- `geometry.rs`：新判据 3 条（`the_staging_band_is_two_panes_wide_at_the_spec_numbers`、
+  `every_file_state_badge_is_drawn_in_its_row`、`the_status_bar_is_one_tier_of_muted_eleven_pointer_text`）、
+  重锚 2 条（`the_status_bar_bands_the_bottom_edge` 的 24、`the_current_file_row_gets_the_grey_band` 的 24）、
+  改名 1 条（`…_is_still_on_its_pre_spec_numbers` → `the_diff_head_band_is_on_the_spec_inset_grey`）、
+  收紧 2 处筛（方框边长 ±1.5→±0.6、hunk 带认领补 `height == 15`）。182 条无头判据全绿。
+
+### 判据 + 反向变异表
+
+变异逐条手打（只准 Edit）、每条跑该红的那一条窄门禁，全部还原后重跑整套：
+
+| # | 变异 | 红在 | 备注 |
+|---|---|---|---|
+| 1 | `FILES_W` 330→435 | `the_staging_band_is_two_panes_wide_at_the_spec_numbers`（左缘实测 623，该 518） | 判的是**画出来的带子**，不是常量 |
+| 2 | `STAGING_H` 240→245 | 同上（顶边实测 279，该 281..283） | |
+| 3 | `CHK_S` 13→12 | `the_section_box_sits_in_its_own_column` | **第一轮是绿的**：认方框跟着公共 `near` 的 ±1.5，12 的框照样被认成方框。单独收到 ±0.6（窗口 12.4..13.6，装得下 13、装不下 12 的色块和 15 的药丸）之后才红 |
+| 4 | `DIFF_HEAD_BG` 换回 `from_rgb(236,236,236)` | 只红在 `the_diff_head_band_is_on_the_spec_inset_grey` | 两条按绘制认领的判据（`the_diff_header_is_a_grey_band_with_the_status_badge`、`the_hunk_row_…`）**跟着常量一起绿**——这正是字面值钉要补的那类假绿 |
+| 5 | 标题带 `rect_filled(.., DIFF_HEAD_BG)` 换成 `BG_HOVER` | `the_diff_header_is_a_grey_band_with_the_status_badge` + `the_staging_band_…` | |
+| 6 | 折叠文件头那处换成 `BG_HOVER` | `the_hunk_row_has_two_measured_buttons_at_the_right` | **顺带抓出第二条假绿**：换锚后两条带同色，那条判据按「第一块 `#F0F1F3` 的带」认领，捞到的其实是 30pt 的标题带（里面两枚圆角是搜索框）。补 `height == 15` 后重打，红在 `expect(…)`，认的才是该认的那条 |
+| 7 | `Kind::Hunk => BG_INSET` 换成 `BG_HOVER` | 同 6，红在 `expect` | 补筛之后这条杀得掉才说明 #6 的杀是巧合不是判据 |
+| 8 | `badge_of` 里 `Deleted`→灰、`Renamed`→琥珀、`Unmerged`→灰 | `every_file_state_badge_is_drawn_in_its_row`，各红在自己那一行（`s/del.rs`、`s/ren.rs`、`s/con.rs`） | 冲突那行还连着认到「没方框那一栏 x=8」的落点 |
+| 9 | 色块里那颗字母 11px→12px | 同上，红在第一帧（`s/mod.rs`）就 panic | 循环里一 assert 就中止，**后面五帧不跑**——"六行全红"是吹的，已在判据注释里改成实测结论 |
+| 10 | 状态栏分支那段换回 `TEXT_PRIMARY` | `the_status_bar_is_one_tier_of_muted_eleven_pointer_text`（红在「main」） | |
+| 11 | 同一段换回 12px | 同上（也红在「main」，`↑2` 那格不再被问） | |
+| 12 | 只把右边路径换成 11.5 | 同上（红在「/fixture」） | 三处是三个字面量，各自独立杀得掉，不是靠一条蒙中全部 |
+
+### 仍然没看到过的
+
+- **「回到 main」那格的 `ACCENT` 例外没被判据认过**：`loaded()` 不分离，带子里根本没有那一格。
+  代码里它是 11px `ACCENT`，但 11 那一半和颜色那一半都没红过。
+- **状态栏换 11px 之后真窗口没目视**：24pt 的带子里放 11 号的字，靠 painter 的 `LEFT_CENTER` 垂直居中，
+  没截图对照过；§2 那句「11px 灰字」是不是还包括右边那格路径，spec 的断句本身有歧义（这里按整带一档处理）。
+- **六态色块判据是一帧一行造的**（六帧，每帧只放一个文件）。真仓库里同屏六种状态怎么排、
+  图标列会不会挤，没量过。
+- **`COMMIT_H` 那 1.6pt 溢出只在无头里推过**：「父 clip 切掉、所以看不见」这句没目视，
+  「抬预算会把尾行顶到点不中」也没实测。
+- **带子可拖（§2「120 … 窗口余量」）全无判据**：无头跑的都是默认档，拖动过程中的裁剪、
+  重排、以及拖到 120 时提交框和文件表怎么分那 96pt，都不知道。
+- 差异区现在**三处共用 `BG_INSET`**（输入底、hunk 头、虚拟行、加上新并进来的文件标题带）：
+  任何「按颜色认领形状」的判据都变脆，本轮已抓到两条。S6-7 换图标、暗色主题落色板时更容易踩。
+
+## 换锚 S6-6：弹窗体系（2026-10-26）
+
+（这一批占用了「S6-6」这个号。SVG 图标那一刀原本登记在 S6-6，现在改口叫 **S6-7**，
+上面 S6-2/S6-4/S6-5 三节里那句「排在 S6-6」跟着改成 S6-7。）
+
+### 决定与依据
+
+§5.1 给弹窗四件事：遮罩 `rgba(31,35,40,.48)`、卡白底 + **圆角 12** + 1px `BORDER_SUBTLE` +
+**真阴影**（offset 0/8、blur 24、黑 40%）、宽度**三档**（确认 380 / 标准 440 / 宽 560，
+并且逐张点名：宽卡 = 提交·拉取·推送·偏好·添加仓库）、打开时 120ms 淡入 + 上移 4pt。
+§5.2 给表单卡：内边距 16、标题 14/600 + 右上 ×、**「标题/正文/按钮区之间只靠间距分组，
+不画分隔线（现实现里的标题带下划线与 footer 上划线废除）」**、卡脚 52 右对齐间距 8、偏好卡无「取消」。
+§4.1 主按钮 28/圆角 6、§4.2 输入框 30/圆角 6、§4.4 分段选择容器 `BG_INSET` 圆角 8 高 30。
+
+换锚前**没有一个数字来自 spec**：`MODAL_W 420` 通吃所有动作卡，推送 600、拉取 520、偏好 520 三张
+各自为政；圆角 10；遮罩是无色黑 `from_black_alpha(120)`；「投影」画的是两圈 `expand(1.0)`/`expand(3.0)`
+越来越淡的**空心描边**（冒充）；行距 28 装不下 30 高的输入框；卡脚 50；按钮 26/7；分段容器是一枚
+没上 token 的裸色 `SEG_BG #f1f2f5` 配圆角 7、再被 `shrink(1.0)` 收成 24 高；标题带下面和卡脚上面
+两条线都在。
+
+用户这一批点的两件事已经定死（不再回问）：**图列不给拖**（拖只做作者/日期，归下一刀）、
+**推送卡与偏好卡并入 560 档**。
+
+八处 spec 没给 / 这一栈做不到，全数进 `DESIGN.md §7`：淡入的「上移 4pt」和 120ms 那档、正文行距 32、
+标题带 42、重置卡的档位归属、推送表列宽改成反推、× 的命中尺寸、§4.4 选中段那枚「细阴影」、
+`SEG_H 30` 与行距的关系。
+
+### 改了什么
+
+- `theme.rs`：`MODAL_W 420` / `PUSH_W 600` / `PULL_W 520` / `PREF_W 520` / `SEG_BG` **五条一起删**，
+  换 `CARD_W_CONFIRM 380` / `CARD_W_STD 440` / `CARD_W_WIDE 560` + `CARD_BODY_RIGHT`（= 560 − 16）；
+  `CARD_R` 10→**12**；`MODAL_ROW_H` 28→**32**；`MODAL_FOOT_H` 50→**52**；`FIELD_H`/`FIELD_R` 26/7→**30/6**；
+  `BTN_H`/`BTN_R` 26/7→**28/6**；新增 `MODAL_SCRIM`（`from_rgba_unmultiplied_const(31,35,40,122)`——
+  const 环境里不能调非常量版那个构造函数，`from_rgba_unmultiplied_const` 可以，顺手把上面那条
+  「const 里带色 alpha 做不到」的旧注释改掉）、新增 `CARD_SHADOW: Shadow{offset [0,8], blur 24,
+  from_black_alpha(102)}`、新增 `SEG_H 30`。推送/拉取两表的右列不再是量出来的常数：
+  `PUSH_URL_W`、`PUSH_COL_REMOTE`（292→**266**，旧四列加起来 576 溢出 560）、`PULL_REMOTE_W`、
+  `PULL_BRANCH_W` 全部由 `CARD_BODY_RIGHT` 反推。
+- `widgets.rs`：新增 `card_w(form)`（档位**只此一处**，`card_rect` 四个分支都问它）、`CLOSE_GLYPH "×"`、
+  `card_close(ui, card)`（28×28 命中格、不画底、hover 出 `BG_HOVER`、14px `TEXT_SECONDARY` 那枚 ×）；
+  `seg_tabs` 容器换 `BG_INSET` + 圆角 **8** + 不 `shrink`（高由调用方给的 `SEG_H` 30）；
+  `card_field` 的底色从 `inner`（28）挪到 `r`（30）——以前底色 28、描边 30，中间空一道透明环，
+  「这一格多高」有两个答案；`modal_switch` 的命中格右缘、`pull_card` 两处右缘从裸数 480/`PULL_W`
+  改成 `CARD_BODY_RIGHT`。
+- `app.rs::modal_layer`：遮罩换 `MODAL_SCRIM`；`p.add(CARD_SHADOW.as_shape(card, CARD_R))` 落在卡底**之前**；
+  两圈空心描边**删**；标题带下划线**删**、卡脚上划线**删**；标题带右端接 `card_close`；
+  「添加仓库」那三档从三枚 `selectable_label` 改成同一枚 `seg_tabs`（和重置卡、偏好卡一致）。
+  提交卡**没动**：它的高度本来就跟着 `Modal::rows()` 走，`MODAL_ROW_H` 28→32 之后描述框
+  （`MODAL_ROW_H × DESC_ROWS`）和账一起长，比例没变——这一句以前只是嘴上说，本批给它加了判据（见 #22）。
+- `geometry.rs`：新判据 **6** 条（`the_modal_cards_are_the_three_spec_widths`、
+  `the_card_is_a_round_twelve_surface_with_a_real_shadow`、`the_card_groups_by_space_alone`、
+  `the_card_closes_from_the_x_in_its_title`、`the_card_footer_is_52pt_with_28pt_buttons`、
+  `the_segmented_control_is_the_spec_inset_box`）；重写 1 条（`a_card_swallows_everything_behind_it`
+  以前要求遮罩 r=g=b=0，现在按 §5.1 问带色的那一枚，并且改用 `settled_frame`：淡入中的那一帧
+  实测 `(4,4,4,29)`，颜色不是本来的颜色）；收紧 3 处筛（`rects()` / `rounded()` 补 `blur_width == 0.0`
+  ——投影和卡底**同尺寸**，`card_back` 取最大以前只赢在图层顺序的运气；`locate_card` 改成
+  只认「卡底那一笔之后」的文字，见那儿 rewritten 的注释）。**188 条无头判据全绿**（本批 182→188）。
+
+产品改动落地时撞到并修好的旧判据 4 条：`a_card_swallows_everything_behind_it`（遮罩有色）、
+`a_commit_typed_in_the_card_lands_in_the_repo`、`the_commit_card_amend_goes_through_the_confirm_card`、
+`ticking_push_after_commit_lands_on_the_remote`——三条全红在「这会儿没有打开的卡」：卡变宽变高之后
+把内联提交框那格「提交摘要」装进了卡的矩形，`locate_card` 按图层顺序先撞上背景那层，点下去落在遮罩上
+= 关卡。**教训记在这儿**：「遮罩后面那层的同名词挡不了道」以前成立是**尺寸巧合**，不是机制。
+
+### 判据 + 反向变异表
+
+变异逐条手打（只准 Edit）、每条只跑该红的那一条窄门禁，全部 `cp` 还原 + `cmp` 逐字节确认之后重跑整套：
+
+| # | 变异 | 红在 | 备注 |
+|---|---|---|---|
+| 1 | `CARD_W_WIDE` 560→600 | `the_modal_cards_are_the_three_spec_widths`（红在字面那一行） | 字面先拦下，画出来那一半没跑到 |
+| 2 | 只把 `card_w` 里「偏好卡」挪出 560 档（常量不动） | 同上，红在**「偏好卡」画出来 440** | 这条才是「档位在 spec 里、接线在产品里」那一半的证明；只有 #1 的话改接线没人报 |
+| 3 | 卡底 `rect_filled(card, CARD_R, …)` 改成 `8.0` | `the_card_is_a_round_twelve_surface_with_a_real_shadow`（卡片圆角） | |
+| 4 | 摘掉 `p.add(CARD_SHADOW.as_shape(…))` | 同上（「整帧只该有一笔模糊矩形：[]」） | |
+| 5 | `CARD_SHADOW.blur` 24→12 | 同上（投影的模糊） | |
+| 6 | `CARD_SHADOW.offset` `[0,8]`→`[0,4]` | 同上（投影的落点） | 落点问的是 `sh.rect == card.translate((0,8))`，`Rect` 两边同源，等值比较安全 |
+| 7 | 加回一圈 `card.expand(3.0)` 空心圆角描边（真投影同时在） | 同上（「那是假的投影」） | 这一条专门守「描边冒充投影」回潮；只看模糊矩形是杀不掉它的 |
+| 8 | 标题带下面加回一条横线 | `the_card_groups_by_space_alone`（红在「偏好卡」，实测 `[245 181.5]→[805 181.5]`） | |
+| 9 | 卡脚上面加回一条横线 | 同上（红在同一张卡，`353.5` 那一格） | 阈值是 `card.width() − 1`：推送表内部那条 528 的框线照样活，四张卡里只有「横跨整卡」的算分隔线 |
+| 10 | `MODAL_SCRIM` 换成无色黑（α 同 122） | 已有的 `a_card_swallows_everything_behind_it`（实测 `[[0,0,0,122]]`） | 带色那一半 |
+| 11 | `MODAL_SCRIM` α 122→100（颜色不动） | 同上（实测 `[[31,36,41,100]]`） | 一条判据两半各杀得掉；35→36、40→41 是 `to_srgba_unmultiplied` 的 ±1，容差因此留着 |
+| 12 | 摘掉 `card_close` 那一笔 | `the_card_closes_from_the_x_in_its_title`（「× 没画出来」） | |
+| 13 | `CLOSE_GLYPH` `"×"`→`"✕"`（U+2715） | **第一轮是绿的** | 判据查的是**自己抄的 `'\u{d7}'`**，被测那枚换了它不知道——「判据钉自己的字面、不钉被测那枚」那一类假绿。改成查 `CLOSE_GLYPH.chars().next()` 之后重打：红在「字体链里没有「✕」的字形 U+2715」。**顺带实测**：`╳`(U+2573) 在这份字体链里**有**，所以「换个叉」不必然红，红的是没字那枚 |
+| 14 | `MODAL_FOOT_H` 52→44 | `the_card_footer_is_52pt_with_28pt_buttons`（字面那一行） | |
+| 15 | 只把卡脚正中改成 `card.max.y − 22.0`（常量不动） | 同上，红在**「主按钮不住在 52pt 带子的正中」** | 同 #2 的道理：落点那一半必须单独杀一次 |
+| 16 | `card_field` 底色从 `r` 缩回 `inner` | 同上（「30pt 高的输入框画不出唯一一块：[]」） | 就是本批产品改动真抓到的那件事 |
+| 17 | `BTN_H`/`BTN_R` 28/6→26/7 | 同上（§4.1 字面） | |
+| 18 | `FIELD_H`/`FIELD_R` 30/6→26/8 | 同上（§4.2 字面） | |
+| 19 | `SEG_H` 30→24 | `the_segmented_control_is_the_spec_inset_box`（「容器不是 30 高：24」） | 问的是画出来的那一块 |
+| 20 | `seg_tabs` 容器换回圆角 7 + 裸色 `#f1f2f5` | 同上（「灰槽画不出唯一一块：[]」） | 颜色筛先杀掉，圆角那一半没跑到 |
+| 21 | 只把容器圆角 8→7（颜色留 `BG_INSET`） | 同上（「圆角不是 8」） | 补 #20 只验了一半的空档——一条值两条出口只验一半，本批又踩了一次 |
+| 22 | 只把提交卡那本行数账多算一行（`Modal::rows` 里 `DESC_ROWS + 2`→`+ 3`） | **第一轮是绿的** | 判据用的是三条兄弟判据那一句阈值 `行距 + 缝 + 1 = 45`，而实测这道缝本来只有 **9**：凭空多一行才 41，照样过。**阈值跟着被测对象的常量走 = 阈值自己没刻度**。按实测收到 `MODAL_GAP + 1 = 13` 之后重打：红在「空了 41 pt」。**松的那三条到底松不松，量过基线**：偏好 41、拉取 22、推送 16（临时 `eprintln` + `--nocapture`，跑完已逐条 Edit 摘掉、`grep -c BASELINE` = 0），同一档 +32 分别读 73 / 54 / 48，全在 45 之外——所以那三条留原样，只有提交卡那一档的基线太干净（9）会被 45 蒙过去。偏好卡那 41 是**设计出来的**（卡按页里最多那条摆，默认页少一行），不是空白 |
+
+### 仍然没看到过的
+
+- **「上移 4pt」整件事没验过**：连代码都没有。判据只钉住「淡得完」；淡入时长用的是 egui 的
+  200ms，不是 §5.1 的 120ms，这一点在真窗口里是不是看着对，没目视。
+- **卡的真阴影只在无头里量过矩形**。blur 24 在 GPU 上糊成什么样、和遮罩叠起来会不会变成一片灰，
+  没截图对照过。`Shadow::as_shape` 的模糊是 epaint 的软件实现，`blur_width` 那条 `RectShape`
+  在 eframe 后端上究竟画成什么，本轮没实测。
+- **点遮罩 = 取消、Enter = 主按钮**这两条是 §5.1 的既有要求，本批没碰它们（各自的旧判据还在跑），
+  但「× 与遮罩与 Esc 三条出口对同一张卡都成立」这一整组没被一条判据一起问过。
+- **添加仓库那三档换成 `seg_tabs` 之后没目视**：三段各 ~176pt 宽装 5 个汉字（「克隆到本地」）
+  在 11.5px 下会不会挤，无头只验了点击与文字存在。
+- **推送/拉取两张卡的列宽改成反推以后，nib 那两个数（292 / 328）作废**：宽卡 560 里
+  「远程分支」那一列 266 够不够放一条 `feature/…` 长名，只有无头的字符串长度没量过，真窗口没看。
+- **偏好卡没有「取消」之后，× 是它唯一的鼠标出口**——本批验了「按 × 关卡且不动开关」，
+  但**没验**「按 × 之后有没有把已经拨过的开关落库落一半」（`apply_prefs` 是当场落的，
+  所以正确行为就是落了一半；spec 那句「开关当场生效」是否允许这个中间态，没问过用户）。
+- **确认卡 380 那一档是被「摆一张卡上去」量的**，不是从 amend 那条真通路开出来的卡量的；
+  amend 通路的宽度依赖同一处 `card_w`，这在本批的 #2 那类变异下才成立。
+
+---
+
+## 图标、版本号与发布流水线（2026-10-26）
+
+**根因不是「图标画得不好」，是本仓库从来没把图标接上过。** `gen-icon.mjs` 从 2026-10-21
+就躺在根目录，README 也写着「`node gen-icon.mjs` 重新生成 `assets/icon.png`」，但那个文件
+**从来没被跑过**，`assets/icon.png` 在仓库里也不存在（`.gitignore` 没挡它，是压根没生成）。
+于是 `cargo build` 出来的可执行文件、以及任何手工拷出来的二进制，Dock 里都是一张白纸。
+
+**决定与依据**
+
+- **复用现成的 `gen-icon.mjs`，不另起一套图标设计**：这一版是紫色底板 + 双车道交叉成 X 的
+  提交图，造型已经在脚本里写死（SDF 光栅化）。本批只把它从 512 升到 **1024**（`K = SIZE/512`
+  等比放大线宽/节点半径），因为 macOS 的 `icon_512x512@2x` 要的正是 1024 这一档；
+  512 也能被 `sips` 放大，但 Retina Dock 上会糊一圈。
+- **一张素材喂两处**：窗口图标（`with_icon`）在编译期 `include_bytes!` 嵌进二进制；
+  `.app` 的 `.icns` 由 `scripts/bundle-macos.sh` 拿同一张 PNG 用 `sips` + `iconutil` 现切。
+  两处读的是同一个 `assets/icon.png`，不会出现「窗口里是 A、Finder 里是 B」。
+- **解码只加一条 `png` 依赖**：`IconData` 要的是裸 RGBA，egui 0.37 没有「PNG → IconData」
+  的入口。`image` 那套太重，而依赖树里本来就有 `png`（epaint 用它），加一条直接依赖不多下一包。
+- **版本号收成一处**：`Cargo.toml` 是唯一来源，`ui::VERSION` 用 `env!("CARGO_PKG_VERSION")`
+  取；窗口标题、状态栏右下角、`.app` 的 `Info.plist`、release 标签核对全读它。
+  状态栏那一格**空态也在**——没开仓库时也得知道手上是哪个版本。
+- **发布走标签，不走手工触发**：`release.yml` 只在 `v*` 标签上跑，第一步先比对
+  `Cargo.toml` 与标签；对不上直接停，避免「名叫 v0.0.2、包里是 0.0.1」。
+  两个架构各打一个 zip，ad-hoc 签名（`codesign -s -`）只为同机可双击，
+  **不是** Developer ID，也没有公证——README 与 release 说明都写明了这一点。
+- **`dist/` 进 `.gitignore`**：打包产物随用随生成，不进仓库。
+
+**改了什么**
+
+- `gen-icon.mjs`：`SIZE 512 → 1024`，像素常量按 `K` 等比放大
+- `assets/icon.png`：首次生成并入库（1024×1024 RGBA，112 KB）
+- `src/ui/icon.rs`：`include_bytes!` + `png` 解码，附两条判据；`main.rs` 接 `with_icon`
+- `src/ui/mod.rs`：`VERSION` 常量（`CARGO_PKG_VERSION`）
+- `src/ui/app.rs`：状态栏最右常驻 `v0.0.1`，仓库路径让出位置
+- `scripts/bundle-macos.sh`：`.app` + `.icns` + `Info.plist` + ad-hoc 签名 + `ditto` 打 zip
+- `.github/workflows/release.yml`：标签触发、版本核对、双架构矩阵、创建 Release
+- `Cargo.toml`：`version = "0.0.1"`，新增 `png = "0.18"`
+
+**判据 + 反向变异表**
+
+- `ui::icon::tests::the_embedded_icon_decodes_to_a_square_rgba`：能解码、正方形、边长 ≥512、
+  RGBA 长度对得上。变异：把 `assets/icon.png` 换成 512 之外的非正方形 → 红。
+- `ui::icon::tests::the_icon_has_transparent_corners`：四角 alpha=0、中心 alpha=255。
+  变异：把底板改成整幅不透明 → 四角那条红（这条防的是「Dock 里方角」）。
+- `geometry_tests::the_status_bar_shows_the_package_version`：`v0.0.1` 贴右缘，**有仓库与空态各验一次**。
+  变异：删掉状态栏那一段 → `text_rect` panic；把文案硬编码成别的串 → 找不到。
+
+**仍然没看到过的**
+
+- **`.app` 没有在别人机器上打开过**：Gatekeeper 对「下载来的、ad-hoc 签名的包」到底弹
+  「无法验证开发者」还是「已损坏」，只在文档层面写了右键打开的办法，没实测。
+- **`release.yml` 一次都没跑过**：本地只验了 `bundle-macos.sh`（arm64）。x86_64 那条矩阵
+  依赖 `rustup target add`，交叉编出来的包没有真机跑过。
+- **窗口图标只在 macOS 上看不见**：macOS 的 Dock 图标来自 `.icns`，`with_icon` 那一行在
+  macOS 上等于没画；Linux/Windows 上没有窗口管理器可验，那个分支是照 API 写的。
+- **`.icns` 的 Retina 档**是从 1024 缩出来的，`iconutil` 会不会对 `512@2x` 再做一次缩放没量过；
+  Finder 里看过一次，Dock 里没有逐尺寸比对。
 

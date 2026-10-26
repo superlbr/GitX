@@ -8,7 +8,10 @@
 import { deflateSync } from "node:zlib";
 import { writeFileSync, mkdirSync } from "node:fs";
 
-const SIZE = 512;
+const SIZE = 1024;
+// 所有像素常量都是按 512 的稿子量的，升到 1024 只把线宽/半径按同一比例放大，
+// 造型一个不变（macOS 的 `icon_512x512@2x` 要的正是 1024 这一档，不必再放大一次）。
+const K = SIZE / 512;
 
 // CRC32 table
 const crcTable = (() => {
@@ -83,13 +86,13 @@ const GLYPH = [255, 255, 255];
 // plate (x/y in the loop below are too), so ±(HALF - INSET) keeps the ends
 // INSET pixels away from the plate edge.
 const HALF = SIZE / 2;
-const INSET = 152;
-const P = HALF - INSET; // 104
+const INSET = 152 * K;
+const P = HALF - INSET; // 104 @512
 const A = [-P, P, P, -P]; // bottom-left → top-right
 const B = [P, P, -P, -P]; // bottom-right → top-left
-const STROKE = 23;
-const END_NODE = 33;
-const MERGE_NODE = 43;
+const STROKE = 23 * K;
+const END_NODE = 33 * K;
+const MERGE_NODE = 43 * K;
 
 // --- rasterize ----------------------------------------------------------------
 const raw = Buffer.alloc((SIZE * 4 + 1) * SIZE);
@@ -101,15 +104,15 @@ for (let py = 0; py < SIZE; py++) {
     const x = px + 0.5 - HALF;
     const y = py + 0.5 - HALF;
 
-    const plate = roundedBox(x, y, HALF, 116);
-    const plateA = cover(plate, 1.5);
+    const plate = roundedBox(x, y, HALF, 116 * K);
+    const plateA = cover(plate, 1.5 * K);
 
     // Diagonal gradient, lighter at the top-left, plus a soft top-left glow.
     const g = clamp((px + py) / (2 * SIZE), 0, 1);
     let r = mix(LIGHT[0], DEEP[0], g);
     let gg = mix(LIGHT[1], DEEP[1], g);
     let b = mix(LIGHT[2], DEEP[2], g);
-    const glow = clamp(1 - Math.sqrt((x + 140) ** 2 + (y + 140) ** 2) / 460, 0, 1) * 0.16;
+    const glow = clamp(1 - Math.sqrt((x + 140 * K) ** 2 + (y + 140 * K) ** 2) / (460 * K), 0, 1) * 0.16;
     r = mix(r, 255, glow);
     gg = mix(gg, 255, glow);
     b = mix(b, 255, glow);
@@ -124,7 +127,7 @@ for (let py = 0; py < SIZE; py++) {
       circle(x, y, B[2], B[3], END_NODE),
       circle(x, y, 0, 0, MERGE_NODE),
     );
-    const glyphA = cover(glyph, 1.5);
+    const glyphA = cover(glyph, 1.5 * K);
 
     r = mix(r, GLYPH[0], glyphA);
     gg = mix(gg, GLYPH[1], glyphA);

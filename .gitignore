@@ -2,6 +2,8 @@
 /target
 **/target
 **/*.rs.bk
+# 打包产物：scripts/bundle-macos.sh 生成的 GitX.app 与 zip，随用随生成
+/dist
 
 # egui 版自带的 CJK 字体（8~15MB，从上游重新下载即可，见 src/ui/fonts.rs）
 assets/fonts/*.otf

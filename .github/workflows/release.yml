@@ -1,0 +1,85 @@
+name: 发布
+
+# 打 tag 就发一版，给用户体验用。版本号只有一处来源（`Cargo.toml`），
+# 标签必须和它一致——不一致直接停，别发一个「名叫 v0.0.2、包里是 0.0.1」的包。
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  check-version:
+    name: 标签与 Cargo.toml 的版本是否一致
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - name: 比对
+        run: |
+          want=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          have=${GITHUB_REF_NAME#v}
+          echo "Cargo.toml = $want，tag = $have"
+          if [ "$want" != "$have" ]; then
+            echo "::error::标签 $GITHUB_REF_NAME 与 Cargo.toml 的 $want 对不上"
+            exit 1
+          fi
+
+  macos:
+    name: macOS（${{ matrix.target }}）
+    needs: check-version
+    runs-on: macos-14
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+          key: ${{ matrix.target }}
+      - name: 打包 .app 与 zip
+        run: ./scripts/bundle-macos.sh ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GitX-${{ matrix.target }}
+          path: dist/GitX-*.zip
+          if-no-files-found: error
+
+  release:
+    name: 创建 GitHub Release
+    needs: macos
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: 列一下要发的文件
+        run: ls -lh dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: GitX ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          files: dist/GitX-*.zip
+          body: |
+            GitX 的第一个体验版。macOS 两个架构各一个包（Apple Silicon / Intel）。
+
+            **安装**：解压后把 `GitX.app` 拖进「应用程序」。这个包**没有签名和公证**，
+            第一次打开要：右键 → 打开，或 `xattr -dr com.apple.quarantine /Applications/GitX.app`。
+
+            系统要求：macOS 10.15 以上。Intel 机器请下 `x86_64` 那个包。

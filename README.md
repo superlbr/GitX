@@ -1,6 +1,11 @@
 # GitX
 
 [![门禁](https://github.com/superlbr/GitX/actions/workflows/gates.yml/badge.svg)](https://github.com/superlbr/GitX/actions/workflows/gates.yml)
+[![发布](https://github.com/superlbr/GitX/actions/workflows/release.yml/badge.svg)](https://github.com/superlbr/GitX/actions/workflows/release.yml)
+
+当前版本 **0.0.1**（版本号只在 `Cargo.toml` 写一次：窗口标题、状态栏右下角、release 标签都读它）。
+体验版安装包在 [Releases](https://github.com/superlbr/GitX/releases)：macOS 两个架构各一个 zip，
+解压后把 `GitX.app` 拖进「应用程序」。包没有签名与公证，第一次打开要右键 → 打开。
 
 用 Rust 写的原生 Git 桌面客户端：日志、提交图、暂存与差异、分支、标签、贮藏、远端操作都在一个窗口里。
 界面用 egui/eframe 直接绘制，git 操作一律走官方 CLI。
@@ -68,8 +73,10 @@ gitx/
 │       ├── toast.rs        #   操作反馈
 │       └── diffmodel.rs    #   差异渲染模型
 ├── assets/fonts/           # Inter（入库）+ CJK 字体声明（字体本体不入库）
+├── assets/icon.png         # 应用图标（1024，由 gen-icon.mjs 生成；窗口图标与 .icns 共用这一张）
 ├── scripts/gates.sh        # 四项门禁
-├── .github/                # CI 与 issue / PR 模板
+├── scripts/bundle-macos.sh # 打包 GitX.app（图标 + Info.plist + ad-hoc 签名）与 zip
+├── .github/                # CI（门禁 / 发布）、issue 与 PR 模板
 ├── docs/
 │   ├── PROCESS.md          # 开发台账：每批的决定、判据、反向变异与已知边界
 │   └── process-archive/    # 早期历史记录
@@ -91,9 +98,23 @@ cargo test --lib                  # 核心层单测
 cargo test --bin gitx             # 无头界面判据（不需要屏幕）
 ./scripts/gates.sh                # 四项门禁
 node gen-icon.mjs                 # 重新生成 assets/icon.png
+./scripts/bundle-macos.sh         # 打包 dist/GitX.app 与本机架构的 zip
 ```
 
 改了核心层函数签名后请跑 `cargo check --tests`（默认 `cargo check` 不编译测试代码）。
+
+### 发版
+
+版本号只有一处来源：`Cargo.toml` 的 `version`。改完版本号，打一个同名标签推上去即可：
+
+```bash
+# Cargo.toml: version = "0.0.2"
+git commit -am "bump version to 0.0.2"
+git tag v0.0.2 && git push origin main --tags
+```
+
+`release.yml` 会先核对标签与 `Cargo.toml`（不一致直接停），再在 macOS runner 上
+按 arm64 / x86_64 各打一个 zip，挂到 GitHub Release 上。
 
 ### 中文字体
 
