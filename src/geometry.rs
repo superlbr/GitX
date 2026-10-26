@@ -3066,6 +3066,10 @@ use crate::viewport;
             );
         };
         git(&["init", "-q"]);
+        // 默认分支名不能交给本机的 `init.defaultBranch`：本机配的是 `main`，CI 上是
+        // `master`，而判据里到处把 `main` 写死（推送的 refspec、命中行的 `⤴main` 药丸）。
+        // 用 `symbolic-ref` 而不是 `init -b`：前者任何 git 2.x 都有，后者要 2.28。
+        git(&["symbolic-ref", "HEAD", "refs/heads/main"]);
         git(&["config", "user.email", "t@t.com"]);
         git(&["config", "user.name", "tester"]);
         std::fs::write(dir.join("a.txt"), "一行\n").unwrap();
@@ -5716,6 +5720,9 @@ use crate::viewport;
         let _ = std::fs::remove_dir_all(&bare);
         std::fs::create_dir_all(&bare).expect("造裸仓库目录");
         git_in(&bare, &["init", "-q", "--bare", "."]);
+        // 裸仓库的 HEAD 也随本机默认分支起（CI 上是 `master`），而推上来的是 `main`：
+        // 不把它拧过去，下面 `git log -1` 读的就是那条还没有提交的 `master`。
+        git_in(&bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
         git_in(&dir, &["remote", "add", "origin", bare.to_str().unwrap()]);
         let branch = git_in(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]);
         git_in(&dir, &["push", "-q", "-u", "origin", &branch]);
