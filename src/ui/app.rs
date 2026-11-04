@@ -1778,7 +1778,8 @@ impl Gitx {
                     match r {
                         Ok(()) => {
                             self.push_state = Some(PushPhase::Done(now));
-                            self.note = Some(tr!("推送完成", "Push complete").to_owned());
+                            // 推送成功保持静默：不弹 toast（改之前就没有），只靠底部状态栏
+                            // 的「推送完成」提示（见 `status_bar`）。失败那一格才会进 toast。
                         }
                         Err(e) => {
                             self.push_state = Some(PushPhase::Failed(now));

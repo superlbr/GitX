@@ -27,6 +27,7 @@ use crate::viewport;
         // 是借一个已经搬走的值（编译不过，不是风格问题）。
         let has_data = snap.is_some();
         Gitx {
+            push_state: None,
             conn: None,
             repos: Vec::new(),
             repo: snap.as_ref().map(|_| "/fixture".to_owned()),
