@@ -68,4 +68,22 @@ mod tests {
         // 中心那块要实心，否则说明图画反了。
         assert_eq!(alpha_at(w / 2, w / 2), 255, "图标中心是空的");
     }
+
+    /// macOS 的图标网格：1024 的画布里圆角方块只占 824，四周各留 100 的透明边。
+    /// 满幅画出来的图标在 Dock 里会比别人**大一圈**——2026-10-26 用户反馈的就是这个。
+    /// 这条沿中心横线扫第一枚/最后一枚不透明像素，留的边少于 80px 就红。
+    #[test]
+    fn the_icon_leaves_a_transparent_margin_for_the_dock() {
+        let icon = decode(PNG).expect("assets/icon.png 应能解码");
+        let w = icon.width as usize;
+        let y = w / 2;
+        let alpha = |x: usize| icon.rgba[(y * w + x) * 4 + 3];
+        let left = (0..w).find(|&x| alpha(x) > 0).expect("中心横线上一片透明");
+        let right = (0..w).rev().find(|&x| alpha(x) > 0).expect("中心横线上一片透明");
+        assert!(
+            left >= 80 && w - 1 - right >= 80,
+            "左右透明边只有 {left} / {}，macOS 图标网格要 ~100（画布 {w}）",
+            w - 1 - right
+        );
+    }
 }

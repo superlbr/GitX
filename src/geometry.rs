@@ -2,12 +2,16 @@
 
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, pos2, vec2};
 use gitx::models::{
-    Branch, ChangeStatus, Commit, DiffEntry, FileStatus, Remote, RemoteRef, Repo, RepoStatus, Tag,
+    Branch, ChangeStatus, Ci, Commit, DiffEntry, FileLogEntry, FileStatus, PullRequest, Remote,
+    RemoteRef, Repo, RepoStatus, Stash, Tag,
 };
 use gitx::{db, git};
 use std::sync::mpsc::channel;
 
 use crate::ui::data::*;
+// 「unknown」那一格的上限写在壳里，判据要按同一个数摆夹具（写死 2 的话，改上限时
+// 判据会静默地跟着旧值走）。
+use crate::ui::app::{DETAIL_RETRY_MAX, DETAIL_RETRY_SECS};
 use crate::ui::diffmodel::*;
 use crate::ui::graph::*;
 use crate::ui::state::*;
@@ -26,6 +30,9 @@ use crate::viewport;
             conn: None,
             repos: Vec::new(),
             repo: snap.as_ref().map(|_| "/fixture".to_owned()),
+            // 夹具默认停在仓库视图：绝大多数判据量的都是日志/侧栏/暂存带，
+            // 首页那两页（仓库列表、代码托管）由专门的判据自己把这一位翻上来。
+            home: false,
             snap,
             sel: Sel::Uncommitted,
             commit_files: Vec::new(),
@@ -35,7 +42,9 @@ use crate::viewport;
             diff_search: String::new(),
             diff,
             diff_cols: 0,
-            patch_label: "全部未暂存变更".to_owned(),
+            // 和下面 `target` 那一格同一来源：夹具默认停在「全部未暂存变更」，
+            // 所以这一位**不能**写字面量——EN 判据扫的就是它（写着死中文=漏翻）。
+            patch_label: patch_label(&Target::Working { staged: false, path: None, untracked: false }),
             seq: 0,
             busy: false,
             note: None,
@@ -45,8 +54,11 @@ use crate::viewport;
             topo: false,
             scope: git::Scope::Current,
             show_remote: true,
-            // 侧栏「远端」默认全收着：展开状态是看仓库时的临时状态，夹具不该凭空摆一个开着的。
+            // 侧栏「远端」在夹具里是**收起**的：产品默认展开 `origin`（只露前 3 条），
+            // 但那样会给下面每条「侧栏第 n 行落在哪个 y」的判据各加 3 行，量到的就不是
+            // 原本那些钉死的数了。默认展开由 `the_origin_is_open_before_anyone_clicks_it` 单独验。
             remote_open: Vec::new(),
+            remote_all: Vec::new(),
             // 夹具没有数据库（`conn: None`），这一格只影响 `open()` 之后要不要再去摸上一次那本；
             // 默认按 `Gitx::new` 里 `Prefs::load(None)` 的结果填 true，免得夹具自己造一个新默认。
             restore_last: true,
@@ -56,6 +68,18 @@ use crate::viewport;
             default_remote: String::new(),
             push_tags: false,
             allow_force: true,
+            // 档位**跟着建夹具时线程上那一格走**：`shell()` 每帧开头会把 `self.lang` 刷回
+            // 线程局部（真程序里那是它唯一的语言来源），所以夹具写死 Zh 的话，双语判据
+            // 在 EN 档里画的每一帧都会被它自己拧回中文——那不是判据在测外壳，是判据在测夹具。
+            // 216 条中文判据跑在默认档（Zh）上，一条都不用改。
+            lang: gitx::lang::get(),
+            // 看板四格 + 令牌：夹具默认**关着**（左栏画大纲），要看板的判据自己翻。
+            // 令牌给空 = 没绑；那一路的判据自己填，别让默认值替它说话。
+            provider_tokens: Vec::new(),
+            board_open: false,
+            board: Board::default(),
+            board_seq: 0,
+            board_open_url: None,
             // 夹具里把「还有下一页」拧死：不然「滚到底要下一页」那格判据会在无头帧里真起线程，
             // 拿 `/fixture` 当仓库跑 git，回来的 `Msg::Failed` 会污染别的断言。
             log_more: false,
@@ -129,6 +153,20 @@ use crate::viewport;
     /// 自己决定喂多少行。虚拟化的判据比的是「数据翻一千倍、画出来的行数不变」，
     /// 所以数据量必须是参数，不能写死在 `loaded()` 里。
     fn filled(commits: usize, diff: &[DiffLine]) -> Gitx {
+        filled_from(true, commits, diff)
+    }
+
+    /// 数据换成 ASCII 的那一份夹具，和上面一模一样、只有仓库内容换了语言。
+    ///
+    /// 为什么要两套：`the_english_shell_paints_no_chinese` 扫的是 EN 档画出的**每个码位**，
+    /// 而提交说明、作者、差异正文是仓库内容，本来就该原样画——夹具自己带中文，它们就会
+    /// 伪装成漏翻。反过来把公共夹具改成 ASCII，那 34 条按「主题0：一条中文提交信息」的
+    /// 字数钉省略号、按「包融」钉作者列的判据就量不到东西了。两套都在，各按各的用。
+    fn filled_en(commits: usize, diff: &[DiffLine]) -> Gitx {
+        filled_from(false, commits, diff)
+    }
+
+    fn filled_from(chinese_data: bool, commits: usize, diff: &[DiffLine]) -> Gitx {
         let file = |path: &str, staged: bool, worktree: ChangeStatus| FileStatus {
             path: path.to_owned(),
             old_path: None,
@@ -139,8 +177,12 @@ use crate::viewport;
         let commit = |i: usize| Commit {
             id: format!("{i:040}"),
             short_id: format!("a{i:04}"),
-            subject: format!("主题{i}：一条中文提交信息"),
-            author: "包融".to_owned(),
+            subject: if chinese_data {
+                format!("主题{i}：一条中文提交信息")
+            } else {
+                format!("Subject {i}: a commit message long enough to be truncated")
+            },
+            author: if chinese_data { "包融".to_owned() } else { "Bao Rong".to_owned() },
             author_email: "br@example.com".to_owned(),
             date: "2026-10-20T11:41:07+08:00".to_owned(),
             // 列表是「新的在上」，所以提交 i 的父提交是**下面**那条 i+1，最底下那条才是根。
@@ -210,6 +252,37 @@ use crate::viewport;
                 staged: false,
             });
         }
+        app
+    }
+
+    /// `origin` + `count` 条远程分支（`origin/topic-1…`），用来量侧栏「默认展开、最多 3 条」。
+    /// 分支尾巴故意起成日志里不会出现的词：判据按文字整串找，撞上药丸就会假绿。
+    fn remote_branches(count: usize) -> Gitx {
+        remote_branches_from(true, count)
+    }
+
+    /// ASCII 数据那一版，同 `filled_en`：看板那条通路要真跑 provider 的两步解析，
+    /// 而 EN 判据不许夹具自己的中文混进扫描里。
+    fn remote_branches_en(count: usize) -> Gitx {
+        remote_branches_from(false, count)
+    }
+
+    fn remote_branches_from(chinese_data: bool, count: usize) -> Gitx {
+        let mut app = filled_from(
+            chinese_data,
+            3,
+            &layout(if chinese_data { PATCH } else { PATCH_EN }, false),
+        );
+        let snap = app.snap.as_mut().expect("filled 造好了快照");
+        let target = snap.commits[0].id.clone();
+        snap.remotes = vec![Remote {
+            name: "origin".to_owned(),
+            url: "git@github.com:acme/app.git".to_owned(),
+            push_url: None,
+        }];
+        snap.remote_refs = (1..=count)
+            .map(|i| RemoteRef { name: format!("origin/topic-{i}"), target: target.clone() })
+            .collect();
         app
     }
 
@@ -289,6 +362,15 @@ use crate::viewport;
     /// 一段最小的统一差异：一条 hunk 头、两行加、一行删、两行上下文。
     const PATCH: &str = "--- a/src/loose.rs\n+++ b/src/loose.rs\n@@ -8,4 +8,5 @@\n 上下文甲\n-删掉的一行\n+加上的一行\n+又加一行\n 上下文乙\n";
 
+    /// 同一份补丁的 ASCII 版（行结构一字不差，只换正文语言）。给 `the_english_shell_paints_no_chinese`
+    /// 用——差异正文是仓库内容，它画成什么样都不算漏翻；hunk 头前面那个「块」才是外壳的文案。
+    const PATCH_EN: &str = "--- a/src/loose.rs\n+++ b/src/loose.rs\n@@ -8,4 +8,5 @@\n context alpha\n-a line removed\n+a line added\n+another line\n context beta\n";
+
+    /// 英文档那份「三条提交 + 一段补丁」：数据是 ASCII，文案由 EN 档位现算。
+    fn loaded_en() -> Gitx {
+        filled_en(3, &layout(PATCH_EN, false))
+    }
+
     /// 无头跑一帧。为什么绕开截图：屏幕会锁屏/休眠，`screencapture` 拿回来的可能是一张无关的图；
     /// 而「边界差 1pt 就露馅」「行距不是 21pt 就是排版塌了」这种判据本来就该是断言。
     /// 截图留给颜色、字号那种主观核对。
@@ -302,22 +384,38 @@ use crate::viewport;
     /// 上一批的重叠就是这么量出来的：`书签 ▼` 压在 `⤴` 上、`添加仓库` 压在 `≡` 上，
     /// 目视只看到「顶部栏有点乱」，说不清是谁压了谁。
     /// 仓库给到 6 个、提示给到 30 字，是为了把这一条塞满——空列表那帧什么都压不到。
-    /// §2 写了「窗口收窄时溢出收进 `»` 菜单」，**那一档还没实现**；tab 组超出宽度会被面板
+    /// §2 写了「窗口收窄时溢出收进 `»` 菜单」，收纳那一条由 `fit_header_tabs` 加上
+    /// `the_more_button_holds_the_repos_that_did_not_fit` 那组判据结清；tab 组超出宽度会被面板
     /// 裁掉（预览稿 `.tabs{min-width:0}` 也是这个行为），裁掉不算压住。
-    #[test]
-    fn the_header_has_no_overlapping_widgets() {
-        let mut app = filled(3, &layout(PATCH, false));
+    ///
+    /// 抽成函数是因为同一条量两遍：中文档一遍、英文档一遍（见这两个 `#[test]`）。
+    /// 返回「认出几块文字 + 哪些两两压住了」。
+    fn header_overlap(chinese_data: bool) -> (usize, Vec<String>) {
+        let _lang = gitx::lang::scoped(if chinese_data { gitx::lang::Lang::Zh } else { gitx::lang::Lang::En });
+        let mut app = filled_from(
+            chinese_data,
+            3,
+            &layout(if chinese_data { PATCH } else { PATCH_EN }, false),
+        );
         for i in 0..6 {
             app.repos.push(Repo {
                 id: None,
                 path: format!("/fixture{i}"),
-                name: format!("仓库{i}"),
+                name: if chinese_data { format!("仓库{i}") } else { format!("repo-{i}") },
                 added_at: None,
                 last_fetched_at: None,
                 group_name: String::new(),
             });
         }
-        app.note = Some("egui 版还没接：搜索面板（SourceTree 是带作用域条的独立面板）".to_owned());
+        // 提示那句是**测试自己写的填充物**（为的是把顶栏塞满），不是外壳的文案：
+        // 外壳那句由 `没有仓库时按工具条` 那几帧去扫。两档各写一句差不多长的。
+        app.note = Some(
+            if chinese_data {
+                "egui 版还没接：搜索面板（SourceTree 是带作用域条的独立面板）".to_owned()
+            } else {
+                "Not wired in the egui shell: the search panel (SourceTree keeps it separate, with its own scope bar)".to_owned()
+            },
+        );
         let out = frame(&mut app);
         let items: Vec<(String, Rect)> = out
             .shapes
@@ -330,10 +428,6 @@ use crate::viewport;
                 _ => None,
             })
             .collect();
-        // 探针：这一条至少得认出 6 枚 tab + 1 枚幽灵 + 11 枚图标 + 分支名 + 计数 = 20 块文字。
-        // 以前是 `> 20`：那时 11 枚按钮**各带一个中文标签**（图标在上、中文在下），整条带有 30 几块。
-        // §4.1 把顶栏收成纯图标之后文字数掉了十块，阈值跟着 spec 走，不是放松判据。
-        assert!(items.len() >= 20, "顶栏只认出 {} 块文字（6 tab + 幽灵 + 11 图标 + 分支 + 计数），这一帧大概什么都没画", items.len());
         let mut bad = Vec::new();
         for i in 0..items.len() {
             for j in (i + 1)..items.len() {
@@ -344,7 +438,188 @@ use crate::viewport;
                 }
             }
         }
+        (items.len(), bad)
+    }
+
+    #[test]
+    fn the_header_has_no_overlapping_widgets() {
+        let (n, bad) = header_overlap(true);
+        // 探针：这一条至少得认出 6 枚 tab + 1 枚幽灵 + 11 枚图标 + 分支名 + 计数 = 20 块文字。
+        // 以前是 `> 20`：那时 11 枚按钮**各带一个中文标签**（图标在上、中文在下），整条带有 30 几块。
+        // §4.1 把顶栏收成纯图标之后文字数掉了十块，阈值跟着 spec 走，不是放松判据。
+        assert!(n >= 20, "顶栏只认出 {n} 块文字（6 tab + 幽灵 + 11 图标 + 分支 + 计数），这一帧大概什么都没画");
         assert!(bad.is_empty(), "顶部栏重叠：\n{}", bad.join("\n"));
+    }
+
+    /// 同一条量英文档：英文普遍比中文长，**中文排得下不代表英文排得下**。
+    /// 这一条不做的话，切到 English 的第一眼就是顶栏糊成一排。
+    ///
+    /// 它绿着的方式正是下面那条收纳判据：英文那枚「+ Add repository」比中文宽 20 出头，
+    /// 1050 的带上排不下全部六枚仓库 tab，`fit_header_tabs` 把溢出的收进 `»`。
+    /// 把收纳改回「一律平铺」（`fit_header_tabs` 恒返回 `(len, false)`），这条先红。
+    #[test]
+    fn the_header_still_fits_in_english() {
+        let (n, bad) = header_overlap(false);
+        assert!(n >= 20, "英文档的顶栏只认出 {n} 块文字，这一帧大概什么都没画");
+        assert!(bad.is_empty(), "顶部栏在英文档重叠：\n{}", bad.join("\n"));
+    }
+
+    /// 顶栏收窄时的收纳（§2「窗口收窄时溢出收进 `»` 菜单」）。四问，缺一问就是假绿：
+    /// `»` 画出来了 / 被收走那枚**确实不在栏里** / 真点 `»` 能在菜单里找到它 / 真点那一项仓库真换过去。
+    /// 前三问只证明「有个会摊开的东西」，第四问才证明它接在 `open()` 这条真路上。
+    #[test]
+    fn the_more_button_holds_the_repos_that_did_not_fit() {
+        let mut app = blank();
+        for i in 0..10 {
+            app.repos.push(Repo {
+                id: None,
+                path: format!("/overflow-{i}"),
+                name: format!("repository-{i}-with-a-long-name"),
+                added_at: None,
+                last_fetched_at: None,
+                group_name: String::new(),
+            });
+        }
+        // 全程共用一个 Context：`»` 的菜单开合记在它的 memory 里，
+        // 换一个 Context 就等于菜单已经关了，第二步永远找不到那一项（假绿，同 `menu_pick`）。
+        let ctx = egui::Context::default();
+        style(&ctx);
+        let last = "repository-9-with-a-long-name";
+        let out = run_at(&ctx, &mut app, MIN_W, WIN_H, Vec::new());
+        let band = band_texts(&out);
+        assert!(
+            band.iter().any(|(t, _)| t == MORE_GLYPH),
+            "地板宽 + 十枚长名字的仓库，顶栏却没画 `»`：{:?}",
+            band.iter().map(|(t, _)| t).collect::<Vec<_>>()
+        );
+        assert!(!band.iter().any(|(t, _)| t == last), "「{last}」还平铺在栏里：收纳根本没发生");
+        let at = band.iter().find(|(t, _)| t == MORE_GLYPH).map(|(_, r)| r.center()).unwrap();
+        click_at_size(&ctx, &mut app, at, MIN_W, WIN_H);
+        // 菜单挂在 `Order::Foreground`，按完那一帧才排进层里，所以要多跑一帧才数得到里面的字。
+        let opened = run_at(&ctx, &mut app, MIN_W, WIN_H, vec![egui::Event::PointerMoved(at)]);
+        let rows: Vec<(String, Rect)> = visible_texts(&opened);
+        assert!(
+            rows.iter().any(|(t, _)| t == last),
+            "点了 `»`，菜单里没有被收走的那一枚：{:?}",
+            rows.iter().map(|(t, _)| t).collect::<Vec<_>>()
+        );
+        let item = rows.iter().find(|(t, _)| t == last).map(|(_, r)| r.center()).unwrap();
+        click_at_size(&ctx, &mut app, item, MIN_W, WIN_H);
+        assert_eq!(app.repo.as_deref(), Some("/overflow-9"), "从 `»` 菜单点「{last}」没把仓库换过去");
+    }
+
+    /// 收纳的**另一半**：宽度够用时不许冒出 `»`。只写上一条的话，「永远收纳」和「从不收纳」
+    /// 一样是坏实现，而前者照样能让上一条绿着（它只问地板宽那一帧）。
+    #[test]
+    fn nothing_overflows_while_everything_fits() {
+        let mut app = blank();
+        for i in 0..3 {
+            app.repos.push(Repo {
+                id: None,
+                path: format!("/roomy-{i}"),
+                name: format!("app-{i}"),
+                added_at: None,
+                last_fetched_at: None,
+                group_name: String::new(),
+            });
+        }
+        let out = frame_at(&mut app, 1400.0, WIN_H);
+        let band = band_texts(&out);
+        let names = band.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>();
+        for i in 0..3 {
+            assert!(names.contains(&format!("app-{i}").as_str()), "1400 的顶栏放不下三枚短名字？栏里只有 {names:?}");
+        }
+        assert!(!names.contains(&MORE_GLYPH), "全都放得下却画了一枚没人需要的 `»`：{names:?}");
+    }
+
+    /// `»` 只在**收纳发生的那一帧**露面，而 `every_rune_the_shell_paints_has_a_glyph`
+    /// 跑的是常态壳（默认 1050、几枚短名字）——它扫不到这枚字形。`×`（卡上的关闭）当年
+    /// 就是这么漏成豆腐块的，所以这里对着字体表单独查一次。
+    #[test]
+    fn the_more_button_is_not_a_tofu_box() {
+        // 字体表要跑过一帧才装好（`No fonts available until first call to Context::run`）。
+        let mut app = blank();
+        let ctx = warm(&mut app);
+        let rune = MORE_GLYPH.chars().next().unwrap();
+        assert!(
+            ctx.fonts_mut(|f| f.has_glyph(&FontId::proportional(12.0), rune)),
+            "「{MORE_GLYPH}」不在字体链里：顶栏那枚溢出按钮会画成豆腐块"
+        );
+    }
+
+    /// 收纳这本账的三条规矩，直接量函数而不靠帧：帧只能证明「这一屏没撞」，
+    /// 证不了「`»` 那一格是从预算里**扣**出来的」。把第二遍的 `more_w` 写成 `0.0`
+    /// （等于「收纳不花钱」）在这里红，而不是等某个恰好卡在边界上的窗口尺寸才红。
+    #[test]
+    fn the_overflow_budget_is_spent_before_tabs_are_painted() {
+        let fit = crate::ui::app::fit_header_tabs;
+        // 全都放得下 → 不收纳，一枚都不许抽走。
+        assert_eq!(fit(&[50.0, 50.0], 200.0, 40.0), (2, false));
+        // 一枚放不下 → 收纳，且留下的是**前缀**（书签顺序不许被抽成 1、3）。
+        assert_eq!(fit(&[50.0, 50.0, 50.0, 50.0], 180.0, 46.0), (2, true));
+        // 预算是负的也走得通：一枚不留，`»` 还是要画（「首页」「添加仓库」不在这本账上）。
+        assert_eq!(fit(&[50.0], 0.0, 46.0), (0, true));
+        // 不变量：画出来的那一串（含 `»` 自己那格）永远不超预算。
+        for (widths, budget, more_w) in [
+            (&[50.0, 50.0, 50.0, 50.0][..], 180.0, 46.0),
+            (&[50.0, 50.0, 50.0, 50.0][..], 223.0, 46.0),
+            (&[120.0, 40.0, 120.0][..], 200.0, 32.0),
+            (&[10.0; 8][..], 120.0, 30.0),
+        ] {
+            let (n, more) = fit(widths, budget, more_w);
+            let used: f32 = widths[..n].iter().sum::<f32>() + n as f32 * TAB_GAP;
+            let used = if more { used + more_w + TAB_GAP } else { used };
+            assert!(
+                used <= budget,
+                "留下的 {n} 枚 + `»` 一共 {used}，预算只有 {budget}：右边那组会被压住（宽度 {widths:?}）"
+            );
+            assert!(n <= widths.len(), "留下的枚数超过了总数：{n} > {}", widths.len());
+        }
+    }
+
+    /// 顶栏那 46pt 里画出来的文字（含矩形）。栏外的（首页卡片、侧栏、菜单）一律不算。
+    fn band_texts(out: &egui::FullOutput) -> Vec<(String, Rect)> {
+        out.shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Text(t) => {
+                    let r = t.galley.rect.translate(t.pos.to_vec2());
+                    (r.center().y <= HEADER_H).then(|| (t.galley.text().to_owned(), r))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `frame_at` 的留住 Context 版：菜单、hover 这类记在 ctx memory 里的状态要跨帧活着才量得到。
+    fn run_at(
+        ctx: &egui::Context,
+        app: &mut Gitx,
+        w: f32,
+        h: f32,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let mut out = ctx.run_ui(raw_input_at(w, h, events), |ui| app.shell(ui));
+        out.textures_delta.clear();
+        out
+    }
+
+    /// `click_at` 的定尺寸版：地板宽那一帧的 `»` 不在默认窗口尺寸上，
+    /// 点它得把尺寸一起给——用默认 1050 点，按到的是另一枚 tab。
+    fn click_at_size(ctx: &egui::Context, app: &mut Gitx, at: Pos2, w: f32, h: f32) {
+        let btn = |pressed: bool| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        for events in [
+            vec![egui::Event::PointerMoved(at)],
+            vec![egui::Event::PointerMoved(at), btn(true)],
+            vec![egui::Event::PointerMoved(at), btn(false)],
+        ] {
+            run_at(ctx, app, w, h, events);
+        }
     }
 
     /// 顶栏的胶囊 tab 点一枚 = 开那个仓库。这一条是 #23 的全部行为：列表摊成 tab，点就是开。
@@ -603,13 +878,15 @@ use crate::viewport;
         *head_band(out).end()..=(WIN_H - STATUS_H - STAGING_H)
     }
 
-    /// 日志数据区**三列**的左缘（§2 的四列里「图」那一列画的是图元，没有文字起笔位）。
+    /// 日志数据区**四列**的左缘（图那一列画的是图元，没有文字起笔位）。
     /// `COL_INSET` 只有一个来源，判据不再各抄一份 `+8.0`——那一批改间距时，抄了常量的判据绿、
     /// 硬编码的那条恰好把旧值钉死了。
-    /// **提交号那一列整列删了**（§2：图 48 | 提交信息 | 作者 96 | 日期 78），所以这里从四条变三条。
-    fn col_edges(min_x: f32, right: f32) -> [f32; 3] {
+    /// 2026-10-26 起提交号那一列回来了（§2：图 48 | 提交号 66 | 提交信息 | 作者 96 | 日期 78），
+    /// 所以这里从三条变四条。
+    fn col_edges(min_x: f32, right: f32) -> [f32; 4] {
         [
             min_x + COL_GRAPH + COL_INSET,
+            min_x + COL_GRAPH + COL_SHA + COL_INSET,
             right - COL_DATE - COL_AUTHOR + COL_INSET,
             right - COL_DATE + COL_INSET,
         ]
@@ -947,7 +1224,7 @@ use crate::viewport;
         for label in ["工作区", "分支", "标签", "远端", "已贮藏"] {
             assert_eq!(side_galley(&out, label).3.min.x, SIDE_GROUP_X, "「{label}」是分组头，该起在 16");
         }
-        for label in ["文件状态", "历史", "搜索", "main"] {
+        for label in ["文件状态", "历史", "main"] {
             assert_eq!(side_galley(&out, label).3.min.x, SIDE_TEXT_X, "「{label}」是子项，该起在 24");
         }
     }
@@ -960,7 +1237,7 @@ use crate::viewport;
             let (color, size, _, _) = side_galley(&out, label);
             assert_eq!((size, color), (11.0, Color32::from_rgb(0x59, 0x63, 0x6E)), "分组头「{label}」不是 §3.4 的 11px 次要档");
         }
-        for label in ["文件状态", "历史", "搜索", "main"] {
+        for label in ["文件状态", "历史", "main"] {
             let (color, size, _, _) = side_galley(&out, label);
             assert_eq!((size, color), (13.0, Color32::from_rgb(0x1F, 0x23, 0x28)), "子项「{label}」不是 §3.4 的 13px 正文档");
         }
@@ -1078,13 +1355,13 @@ use crate::viewport;
             dots.iter().any(|p| (p.x - SIDE_DOT_X).abs() < 0.01 && (p.y - row.center().y).abs() < 0.6),
             "当前分支前面没有落在 x={SIDE_DOT_X} 的主色圆点：{dots:?}"
         );
-        // 非当前的子项行（「搜索」）不许也长出蓝点：一个值两条出口只验一半是假绿。
-        let search = side_galley(&out, "搜索").3;
-        assert!(!dots.iter().any(|p| (p.y - search.center().y).abs() < 0.6), "「搜索」那一行也画了蓝点");
+        // 非当前的子项行（「历史」）不许也长出蓝点：一个值两条出口只验一半是假绿。
+        let other = side_galley(&out, "历史").3;
+        assert!(!dots.iter().any(|p| (p.y - other.center().y).abs() < 0.6), "「历史」那一行也画了蓝点");
         // 字重同一条路：反向变异实测——把 `side_row` 里那句 `if current` 拆掉、给每一行都上
         // `medium`，上面「main 是 inter-medium」照样绿（它只验了一条出口）。这一条补上另一半。
-        let (_, _, search_family, _) = side_galley(&out, "搜索");
-        assert_ne!(search_family, "inter-medium", "「搜索」不是当前分支也中了中黑字：字重没按「当前」分流");
+        let (_, _, other_family, _) = side_galley(&out, "历史");
+        assert_ne!(other_family, "inter-medium", "「历史」不是当前分支也中了中黑字：字重没按「当前」分流");
     }
 
     /// 提示（`note`）现在是底部 toast：悬在状态栏上方、水平居中、8 秒自己消失。
@@ -1872,14 +2149,17 @@ use crate::viewport;
             .map(|(s, _)| s)
             .collect();
         assert!(under.is_empty(), "红绿灯底下有文字：{under:?}");
-        // 左组第一项现在是**仓库胶囊 tab**（以前是「xxx (Git)」那行标题；§2 删了标题，
-        // tab 自己就是仓库名）。胶囊的底从 92 起，里面的字再让 11 的内边距（`.tab{padding:3px 11px}`）。
-        let tab = vis.iter().find(|(s, _)| **s == *"comic").expect("顶栏没有第一枚仓库 tab");
+        // 左组第一项是**固定的「首页」tab**（2026-10-26：首页就是固定顶部 tab 左侧的首页 tab），
+        // 仓库 tab 排在它右边。胶囊的底从 92 起，里面的字再让 11 的内边距（`.tab{padding:3px 11px}`）。
+        let tab = vis.iter().find(|(s, _)| **s == *home_tab()).expect("顶栏没有最左那枚「首页」tab");
         assert!(
             (tab.1.min.x - 103.0).abs() < 1.0,
             "第一枚 tab 的文字左沿 {:+.1}pt，应该是 inset 92 + 内边距 11 = 103",
             tab.1.min.x
         );
+        // 「首页」必须真的在仓库 tab 左边：只钉 x=103 的话，把它挪到仓库后面照样绿。
+        let repo = vis.iter().find(|(s, _)| **s == *"comic").expect("顶栏没有仓库 tab");
+        assert!(tab.1.min.x < repo.1.min.x, "「首页」没有排在仓库 tab 左边");
     }
 
     /// §2 的胶囊 tab：选中那一枚**铺主色浅底 + 深字 + 真字重**，高 26、圆角 = 半高、
@@ -1904,7 +2184,15 @@ use crate::viewport;
         let (fill, rect, radius) = pills[0];
         assert_eq!(fill, Color32::from_rgb(0xE8, 0xF1, 0xFD), "选中胶囊的底色不是 §3.1 的 ACCENT_SOFT");
         assert!((rect.height() - 26.0).abs() < 1.0, "胶囊高 {}，§2 写的是 26", rect.height());
-        assert!((rect.min.x - 92.0).abs() < 1.0, "第一枚胶囊的左沿 {}，§2 的红绿灯 inset 是 92", rect.min.x);
+        // 2026-10-26 起最左是固定的「首页」tab，仓库胶囊不再从 92 起——所以不再钉死
+        // 那个数，改成「胶囊左沿 = 自己那枚文字左沿 − 内边距 11」，仍然能抓住「胶囊没包住字」。
+        let name = text_rect(&out, "gitx", band.clone());
+        assert!(
+            (rect.min.x - (name.min.x - TAB_PILL_PAD)).abs() < 1.0,
+            "选中胶囊的左沿 {}，没有包住自己的名字（字左沿 {}）",
+            rect.min.x,
+            name.min.x
+        );
         assert_eq!(radius.nw, 13, "圆角不是半高（§2 的 999 就是胶囊）");
         assert_eq!(text_color(&out, "gitx", band.clone()), Color32::from_rgb(0x05, 0x50, 0xAE), "选中的仓库名不是 §3.1 的 ACCENT_INK");
         assert_eq!(text_family(&out, "gitx", band.clone()), "inter-semibold", "选中的仓库名没走真字重（§3.4 的 600）");
@@ -1932,11 +2220,14 @@ use crate::viewport;
         // 先钉这条筛子**确实在收东西**（11 枚图标 + 分支名 + 计数），否则下面的空命中
         // 可能只是"什么都没筛到"的假绿。
         assert!(in_header.len() >= 12, "顶栏只筛出 {} 块文字，这条判据的筛子没生效", in_header.len());
-        for (_, label, _) in TOOLS.iter() {
-            assert!(
-                !in_header.iter().any(|t| t.starts_with(label)),
-                "顶栏还写着「{label}」：§4.1 的按钮是纯图标，中文归 tooltip"
-            );
+        for tool in TOOLS.iter() {
+            // 两种语言的名字都不许出现在顶栏：切到 English 时这里同样要过。
+            for label in [tool.1, tool.2] {
+                assert!(
+                    !in_header.iter().any(|t| t.starts_with(label)),
+                    "顶栏还写着「{label}」：§4.1 的按钮是纯图标，文案归 tooltip"
+                );
+            }
         }
         let band = 0.0..=HEADER_H;
         // ⊙ = 最右那枚（设置）。图标 14px（§4.1）。
@@ -2006,10 +2297,143 @@ use crate::viewport;
         let (edge, rect) = pills[0];
         assert_eq!(edge, Color32::from_rgb(0xD0, 0xD5, 0xDD), "幽灵 tab 的描边不是 §3.1 的 BORDER_STRONG");
         assert!((rect.height() - 26.0).abs() < 1.0, "幽灵 tab 高 {}，§2 的胶囊都是 26", rect.height());
-        assert!((rect.min.x - 92.0).abs() < 1.0, "空列表时它就该顶在 inset 92 起：{rect:?}");
         let band = 0.0..=HEADER_H;
+        // 最左那格现在归固定的「首页」tab，幽灵 tab 排在它后面——不再钉 92，
+        // 改成「描边包住自己那枚文字」：把内边距改坏照样红。
+        let label = text_rect(&out, "＋ 添加仓库", band.clone());
+        assert!(
+            (rect.min.x - (label.min.x - TAB_PILL_PAD)).abs() < 1.0,
+            "幽灵 tab 的左沿 {} 没有包住自己的文字（字左沿 {}）：{rect:?}",
+            rect.min.x,
+            label.min.x
+        );
         assert_eq!(text_color(&out, "＋ 添加仓库", band.clone()), Color32::from_rgb(0x8B, 0x94, 0x9E), "幽灵 tab 的字不是 §3.1 的辅助档");
         assert_eq!(text_size(&out, "＋ 添加仓库", band), 12.0, "幽灵 tab 的字不是 `.tab.add` 的 12px");
+    }
+
+    /// 2026-10-26：首页是顶栏**最左**那枚固定 tab。点它把主区换成仓库列表（侧栏 / 日志 /
+    /// 暂存带整块让位）；点仓库卡再回到仓库视图。首页主体是仓库列表（A），
+    /// 当前仓库能认出代码托管时再补一小块 provider（B）。
+    #[test]
+    fn the_home_tab_opens_the_repo_list_and_a_card_goes_back() {
+        let mut app = loaded();
+        app.repos.push(Repo {
+            id: None,
+            path: "/fixture".to_owned(),
+            name: "gitx".to_owned(),
+            added_at: None,
+            last_fetched_at: None,
+            group_name: String::new(),
+        });
+        app.repos.push(Repo {
+            id: None,
+            path: "/other".to_owned(),
+            name: "comic".to_owned(),
+            added_at: None,
+            last_fetched_at: None,
+            group_name: String::new(),
+        });
+        let out = frame(&mut app);
+        let home = text_rect(&out, home_tab(), 0.0..=HEADER_H);
+        let repo = text_rect(&out, "gitx", 0.0..=HEADER_H);
+        assert!(home.min.x < repo.min.x, "「首页」不是顶栏最左的 tab");
+
+        assert!(click_text_exact(&mut app, home_tab()), "点不到顶栏那枚「首页」");
+        assert!(app.home, "点了「首页」没换到首页");
+        let out = frame(&mut app);
+        let vis = visible_texts(&out);
+        let has = |needle: &str| vis.iter().any(|(s, _)| s == needle);
+        assert!(has("打开仓库…"), "首页没有「打开仓库…」那枚入口");
+        assert!(has("仓库"), "首页没有仓库列表的标题");
+        assert!(has("/fixture"), "首页没有列出书签里的仓库路径");
+        assert!(!has("文件状态"), "首页还在画仓库的侧栏（那三块该整块让位）");
+
+        // 点卡上的路径（不是顶栏 tab，也不是状态栏那格的当前仓库路径）回仓库视图。
+        assert!(click_text_exact(&mut app, "/other"), "点不到首页那张仓库卡");
+        assert!(!app.home, "点了仓库卡还停在首页");
+        assert_eq!(app.repo.as_deref(), Some("/other"), "点了仓库卡没换仓库");
+    }
+
+    /// 首页那块「代码托管」是**少量 B**：只画当前仓库快照里认得出的平台，
+    /// 认不出就整块不画。平台名与 `owner/repo` 都来自核心层那套 `provider::parse_remote`，
+    /// 不另写一份地址解析。
+    #[test]
+    fn the_home_page_names_the_github_project_of_the_open_repo() {
+        let mut app = loaded();
+        app.home = true;
+        app.snap.as_mut().expect("loaded 有快照").remotes = vec![Remote {
+            name: "origin".to_owned(),
+            url: "git@github.com:acme/app.git".to_owned(),
+            push_url: None,
+        }];
+        let out = frame(&mut app);
+        let vis = visible_texts(&out);
+        let has = |needle: &str| vis.iter().any(|(s, _)| s == needle);
+        assert!(has("代码托管"), "首页没有代码托管那一格");
+        assert!(has("GitHub"), "平台名不是 GitHub");
+        assert!(has("acme/app"), "没有画出 owner/repo");
+        assert!(has("在浏览器打开"), "没有那颗真能用的入口");
+
+        // 不认识的域名（gitlab）不许被硬归到 GitHub，也不许摆一个空壳。
+        app.snap.as_mut().expect("loaded 有快照").remotes = vec![Remote {
+            name: "origin".to_owned(),
+            url: "https://gitlab.example.com/a/b.git".to_owned(),
+            push_url: None,
+        }];
+        let out = frame(&mut app);
+        let vis = visible_texts(&out);
+        assert!(
+            !vis.iter().any(|(s, _)| s == "代码托管"),
+            "认不出的远端也画了「代码托管」空壳"
+        );
+    }
+
+    /// 用户 2026-10-26：左侧栏 **origin 默认展示分支**。初值走产品同一个
+    /// `default_remote_open()`——夹具自己摆一个 `origin` 也能绿，但那样产品把默认改空了没人红。
+    #[test]
+    fn the_origin_is_open_before_anyone_clicks_it() {
+        let mut app = remote_branches(3);
+        app.remote_open = crate::ui::app::default_remote_open();
+        let out = frame(&mut app);
+        let vis = visible_texts(&out);
+        for i in 1..=3 {
+            assert!(
+                vis.iter().any(|(s, _)| s == &format!("topic-{i}")),
+                "origin 收着：没看到 topic-{i}"
+            );
+        }
+    }
+
+    /// 搭同一份数据再验「默认不超过 3 条」：第 4 条起折进「还有 N 个分支」，
+    /// 点一下才摊开（用户 2026-10-26 的补充）。
+    #[test]
+    fn a_remote_shows_three_branches_until_the_rest_is_asked_for() {
+        let mut app = remote_branches(5);
+        app.remote_open = crate::ui::app::default_remote_open();
+        let out = frame(&mut app);
+        let vis = visible_texts(&out);
+        let has = |needle: &str| vis.iter().any(|(s, _)| s == needle);
+        for i in 1..=3 {
+            assert!(has(&format!("topic-{i}")), "前 3 条里有 topic-{i} 没露出来");
+        }
+        assert!(!has("topic-4"), "第 4 条没有折起来");
+        assert!(!has("topic-5"), "第 5 条没有折起来");
+        assert!(has("还有 2 个分支"), "没有「还有 2 个分支」这枚收口");
+
+        assert!(click_text_exact(&mut app, "还有 2 个分支"), "点不到「还有 2 个分支」");
+        assert_eq!(app.remote_all, vec!["origin".to_owned()], "点了「还有 N 个」没记住整组摊开");
+        let out = frame(&mut app);
+        let vis = visible_texts(&out);
+        for i in 1..=5 {
+            assert!(
+                vis.iter().any(|(s, _)| s == &format!("topic-{i}")),
+                "摊开后没有 topic-{i}"
+            );
+        }
+        assert!(
+            !vis.iter().any(|(s, _)| s == "还有 2 个分支"),
+            "摊开后收口还在"
+        );
     }
 
     /// 文件多到一屏装不下时，提交框**必须还在窗口里**。真窗口目视抓到过一次（2026-10-20）：
@@ -3601,16 +4025,16 @@ use crate::viewport;
     fn the_order_menu_switches_between_the_two_orders() {
         let (mut app, dir) = open_repo("order-menu");
         // 菜单没摊开时，按钮行上只该有**当前那一档**。
-        assert!(filter_text(&mut app, DATE_ORDER).is_some(), "默认那一档没写在按钮上");
-        assert_eq!(filter_text(&mut app, TOPO_ORDER), None, "菜单没摊开，另一档不该出现在按钮行上");
-        popup_pick(&mut app, DATE_ORDER, TOPO_ORDER);
+        assert!(filter_text(&mut app, date_order()).is_some(), "默认那一档没写在按钮上");
+        assert_eq!(filter_text(&mut app, topo_order()), None, "菜单没摊开，另一档不该出现在按钮行上");
+        popup_pick(&mut app, date_order(), topo_order());
         assert!(app.topo, "菜单里点「层级顺序」没换排序");
         assert!(app.busy && app.snap.is_none(), "换了排序没重取列表：日志会停在旧顺序上");
         pump(&mut app, |a| a.snap.is_some());
-        assert!(filter_text(&mut app, TOPO_ORDER).is_some(), "换了排序，按钮上还是旧那一项");
-        assert_eq!(filter_text(&mut app, DATE_ORDER), None, "按钮上两档同时出现：文案没跟着换");
-        popup_pick(&mut app, TOPO_ORDER, DATE_ORDER);
-        assert!(!app.topo, "点「{DATE_ORDER}」没换回来");
+        assert!(filter_text(&mut app, topo_order()).is_some(), "换了排序，按钮上还是旧那一项");
+        assert_eq!(filter_text(&mut app, date_order()), None, "按钮上两档同时出现：文案没跟着换");
+        popup_pick(&mut app, topo_order(), date_order());
+        assert!(!app.topo, "点「{}」没换回来", date_order());
         pump(&mut app, |a| a.snap.is_some() && !a.topo);
         let _ = dir;
     }
@@ -3628,7 +4052,7 @@ use crate::viewport;
                 .unwrap_or_else(|| panic!("筛选条上没有「{label}」这枚按钮"));
             t[label.len()..].chars().filter(|c| !c.is_whitespace()).count()
         };
-        for label in [CURRENT_BRANCH, SHOW_REMOTE, DATE_ORDER] {
+        for label in [current_branch(), show_remote(), date_order()] {
             assert_eq!(marks(label), 1, "「{label}」那枚的第二层标记不是一枚");
         }
         assert_eq!(marks("紧凑视图"), 0, "还没接的那枚不该带标记");
@@ -3696,10 +4120,10 @@ use crate::viewport;
         // 默认那一档 = 当前分支。**这一条同时钉住"没把默认偷偷换成 --all"**：
         // 换成 --all 的话支线的提交会在第一帧就出现在列表里。
         assert_eq!(app.scope, git::Scope::Current, "默认不该带范围");
-        assert!(filter_text(&mut app, CURRENT_BRANCH).is_some(), "按钮上没写「当前分支」");
+        assert!(filter_text(&mut app, current_branch()).is_some(), "按钮上没写「当前分支」");
         assert!(!line_of(&app).contains(&"只在支线".to_owned()), "HEAD 那条线里不该有支线的提交");
 
-        popup_pick(&mut app, CURRENT_BRANCH, ALL_BRANCHES);
+        popup_pick(&mut app, current_branch(), all_branches());
         assert_eq!(app.scope, git::Scope::All, "菜单里点「所有分支」没落到范围上");
         assert!(app.busy && app.snap.is_none(), "换了范围没重取列表：日志会停在旧范围上");
         pump(&mut app, |a| a.snap.is_some() && a.scope == git::Scope::All);
@@ -3709,10 +4133,10 @@ use crate::viewport;
         }
         let want = git_in(&dir, &["rev-list", "--all", "--count"]).parse::<usize>().expect("数字");
         assert_eq!(l.len(), want, "所有分支的条数和仓库里的对不上：app 说 {l:?}");
-        assert!(filter_text(&mut app, ALL_BRANCHES).is_some(), "换了档，按钮上还是旧那一项");
-        assert_eq!(filter_text(&mut app, CURRENT_BRANCH), None, "按钮上两档同时出现：文案没跟着换");
+        assert!(filter_text(&mut app, all_branches()).is_some(), "换了档，按钮上还是旧那一项");
+        assert_eq!(filter_text(&mut app, current_branch()), None, "按钮上两档同时出现：文案没跟着换");
 
-        popup_pick(&mut app, ALL_BRANCHES, "side");
+        popup_pick(&mut app, all_branches(), "side");
         assert_eq!(app.scope, git::Scope::Rev("side".to_owned()), "菜单里点了分支没落到范围上");
         pump(&mut app, |a| a.snap.is_some() && a.scope == git::Scope::Rev("side".to_owned()));
         let l = line_of(&app);
@@ -3722,7 +4146,7 @@ use crate::viewport;
         assert_eq!(l.len(), want, "列表长度和仓库里的对不上：app 说 {l:?}");
 
         // 回到「当前分支」= 范围清空，支线的提交得再消失一次。
-        popup_pick(&mut app, "side", CURRENT_BRANCH);
+        popup_pick(&mut app, "side", current_branch());
         assert_eq!(app.scope, git::Scope::Current, "点「当前分支」没把范围清空");
         pump(&mut app, |a| a.snap.is_some() && a.scope == git::Scope::Current);
         assert!(!line_of(&app).contains(&"只在支线".to_owned()), "回到「当前分支」还留着支线");
@@ -3748,7 +4172,7 @@ use crate::viewport;
         assert!(row_texts(&mut app).contains(&remote_pill), "远程药丸没画在行上");
         let before = app.snap.as_ref().unwrap().commits.len();
 
-        popup_pick(&mut app, SHOW_REMOTE, HIDE_REMOTE);
+        popup_pick(&mut app, show_remote(), hide_remote());
         assert!(!app.show_remote, "点「隐藏远程分支」没关掉");
         assert!(app.snap.is_some() && !app.busy, "这一枚只决定画不画，不该把列表重取一遍");
         let l = row_texts(&mut app);
@@ -3756,14 +4180,12 @@ use crate::viewport;
         assert!(l.iter().any(|t| t.starts_with(&branch_pill)), "本地分支药丸跟着没了：过滤写宽了");
         assert_eq!(app.snap.as_ref().unwrap().commits.len(), before, "提交列表被这枚动了");
 
-        popup_pick(&mut app, HIDE_REMOTE, SHOW_REMOTE);
+        popup_pick(&mut app, hide_remote(), show_remote());
         assert!(app.show_remote, "点回「显示远程分支」没打开");
         assert!(row_texts(&mut app).contains(&remote_pill), "重新打开后远程药丸没回来");
     }
 
-    /// 日志四列**全部靠左**：每一格的数据都贴住自己表头的左缘。
-    /// 参考图实测（1050pt 宽那张，logical pt）：表头左缘 提交 202.5 / 描述 280 / 作者 744 /
-    /// 日期 934，四条列边线分别在 198 / 275 / 739 / 929——每格数据与它的表头同一条竖线起笔。
+    /// 日志五列**全部靠左**：每一格的数据都贴住自己表头的左缘。
     /// 一条判据同时管三种错法：右对齐（左缘随文字宽度漂）、`Ui::put` 的居中与两端对齐、
     /// 以及把提交号画在图列**里面**（圆点压在提交号上）。数据必须长短不齐，见 `ragged()`。
     #[test]
@@ -3782,11 +4204,13 @@ use crate::viewport;
                 );
             }
         };
-        // 提交号那一列不再画了（§2 四列 = 图 48 | 提交信息 | 作者 96 | 日期 78），所以**认行**
-        // 这件事从「按提交号找」换成「按提交信息找」：这三条 subject 各自只在一行里出现。
+        // 提交号那一列回来了（§2 五列），但**认行**仍按提交信息找：这三条 subject 各自只在一行里出现。
         let subjects = ["短", "一条长得多的", "中等长度的一条"];
         let subject: Vec<f32> = subjects.iter().map(|s| x(s, rows.clone())).collect();
         let author = [x("包融", rows.clone()), x("baorong", rows.clone()), x("R", rows.clone())];
+        // 提交号：夹具给的是 2 / 3 / 4 位短号，长短不齐——右对齐的话左缘会漂。
+        let shas = ["a1", "b22", "c333"];
+        let sha: Vec<f32> = shas.iter().map(|s| x(s, rows.clone())).collect();
         let row_band = |label: &str| {
             let r = text_rect(&out, label, rows.clone());
             (r.center().y - ROW_H / 2.0 + 1.0)..=(r.center().y + ROW_H / 2.0 - 1.0)
@@ -3801,28 +4225,30 @@ use crate::viewport;
                 .fold(f32::NEG_INFINITY, f32::max)
         };
         let date: Vec<f32> = subjects.iter().map(|s| rightmost(row_band(s))).collect();
+        flush("提交号", x("提交号", head()), [(sha[0], "a1"), (sha[1], "b22"), (sha[2], "c333")]);
         flush("提交信息", x("提交信息", head()), [(subject[0], "短"), (subject[1], "一条长得多的…"), (subject[2], "中等长度的一条")]);
         flush("作者", x("作者", head()), [(author[0], "包融"), (author[1], "baorong <…>"), (author[2], "R")]);
         flush("日期", x("日期", head()), [(date[0], "第 1 行"), (date[1], "第 2 行"), (date[2], "第 3 行")]);
-        // 绝对位置钉在**字面量**上：表头三个词的左缘、数据跟自己的表头同一条竖线起笔。
+        // 绝对位置钉在**字面量**上：表头各词的左缘、数据跟自己的表头同一条竖线起笔。
         // 拿 `COL_*` 加加减减比给自己看等于没判——那一批改间距从 8 改成 5 时，那种写法照样绿。
         //
-        // S6-4 换锚：侧栏 188 + 图列 48 + 内缩 12 = **248**（提交信息起笔）；
-        // 作者/日期从右缘 1050 往左定 = **888** / **984**，与侧栏宽无关。
-        assert_eq!(subject[0], 248.0, "提交信息列的左缘（§2：侧栏 188 + 图 48 + 内缩 12）");
+        // 侧栏 188 + 图列 48 + 内缩 12 = **248**（提交号起笔）；再加提交号 66 = **314**
+        // （提交信息起笔）；作者/日期从右缘 1050 往左定 = **888** / **984**，与侧栏宽无关。
+        assert_eq!(sha[0], 248.0, "提交号列的左缘（§2：侧栏 188 + 图 48 + 内缩 12）");
+        assert_eq!(subject[0], 314.0, "提交信息列的左缘（248 + 提交号 66）");
         assert_eq!(author[0], 888.0, "作者列的左缘（1050 − 日期 78 − 作者 96 + 内缩 12）");
         assert_eq!(date[0], 984.0, "日期列的左缘（1050 − 日期 78 + 内缩 12）");
         // 行距与表头高钉 §2 的 28/28：上面那些判据全是「间距 == ROW_H」的相对关系，
         // 把 ROW_H 改回旧的 26 它们一个都不会红，所以这两个字面值各钉一条。
         assert_eq!(ROW_H, 28.0, "§2「表头 28 + 行 28 × N」里的行距");
         assert_eq!(LOG_HEAD_H, 28.0, "§2 的日志表头那一条");
-        // 三枚定宽列也各钉一条字面值。上面 248/888/984 那三条是**加减之后的和**：
+        // 三枚定宽列也各钉一条字面值。上面 248/314/888/984 那几条是**加减之后的和**：
         // 把 `COL_GRAPH` 48→50 同时把 `COL_INSET` 12→10，和不变、判据不红，但 §2 的列宽已经改了。
         // 各拆一条字面值之后，任何一枚单独动都会红。
         assert_eq!(
-            (COL_GRAPH, COL_AUTHOR, COL_DATE),
-            (48.0, 96.0, 78.0),
-            "§2 的三枚定宽列：图 48 | 作者 96 | 日期 78（提交信息那一列弹性）"
+            (COL_GRAPH, COL_SHA, COL_AUTHOR, COL_DATE),
+            (48.0, 66.0, 96.0, 78.0),
+            "§2 的定宽列：图 48 | 提交号 66 | 作者 96 | 日期 78（提交信息那一列弹性）"
         );
         // 下面三枚是 §2 **没给**、我们自己拍的数，出处见 DESIGN.md §7；
         // 钉在这儿是为了让「悄悄改一档」变成一次可见的红色，而不是无声的漂移。
@@ -3850,7 +4276,7 @@ use crate::viewport;
                 })
                 .1
         };
-        let x0 = col_edges(SIDEBAR_W, WIN_W)[0];
+        let x0 = col_edges(SIDEBAR_W, WIN_W)[1];
         let (main, subject) = (word("⤴main"), word("主题0"));
         // 底色矩形按颜色认领：这一行该有一枚浅蓝 + 一枚深藏青。
         let in_row = |c: Color32| {
@@ -3945,7 +4371,7 @@ use crate::viewport;
         let band = (y - ROW_H / 2.0 + 1.0)..=(y + ROW_H / 2.0 - 1.0);
         let today = all_text_rects(&out, band.clone(), &["今天 "]);
         assert_eq!(today.len(), 1, "虚拟行的日期该是「今天 HH:MM」：{:?}", all_text_rects(&out, band, &[""]));
-        assert_eq!(today[0].1.min.x, col_edges(SIDEBAR_W, WIN_W)[2], "日期列的左缘");
+        assert_eq!(today[0].1.min.x, col_edges(SIDEBAR_W, WIN_W)[3], "日期列的左缘");
     }
 
     /// 图元自己的尺寸与颜色钉 §3.3：圆点半径 4.0（「圆点半径 4pt 不变」）、竖线宽 2.0
@@ -4008,8 +4434,8 @@ use crate::viewport;
         assert!(rings(&out).iter().all(|p| (p.x - lane0).abs() < 0.01), "环不在第 0 道上");
     }
 
-    /// 表头那**三条**列边线：1pt 宽、16pt 高（`RULE_H`）、`BORDER_SUBTLE`，落在 §2 四列的
-    /// 边界上 236 / 876 / 972。上下各一条横线把表头那 28pt 从筛选条与日志里切出来。
+    /// 表头那**四条**列边线：1pt 宽、16pt 高（`RULE_H`）、`BORDER_SUBTLE`，落在 §2 五列的
+    /// 边界上 236 / 302 / 876 / 972。上下各一条横线把表头那 28pt 从筛选条与日志里切出来。
     /// 这条判据是来还债的：上一批我用**整带**阈值扫表头，判定「参考图没有竖线」，
     /// 于是把并排一比就能看见的边线漏掉了——线只有 16pt 高，按行取平均会被白盖掉。
     /// 名字里的「measured」跟着 §2 换锚一起作废：数现在是 spec 给的，不是参考图量的。
@@ -4042,15 +4468,14 @@ use crate::viewport;
         vertical.sort_by(|a, b| a.0.total_cmp(&b.0));
         // 这里**故意写字面量**：判据钉的是列边线落在哪，拿 `COL_*` 比 `COL_*` 等于没判。
         //
-        // **S6-4 换锚**：§2 的四列是 图 48 | 提交信息（弹性）| 作者 96 | 日期 78，
-        // 提交号那一整列连同它左边那条边线一起删了，所以只剩**三条**：
-        // `188 + 48 = 236`（图 | 提交信息）、`1050 − 78 − 96 = 876`（提交信息 | 作者）、
-        // `1050 − 78 = 972`（作者 | 日期）。旧的四条（245/322/739/929）是参考图在
-        // 图列 57 / 提交列 77 / 作者 190 / 日期 121 上量的，那一档随 §2 作废。
+        // **2026-10-26 加回提交号列**：§2 的五列是 图 48 | 提交号 66 | 提交信息（弹性）|
+        // 作者 96 | 日期 78，于是四条边线：
+        // `188 + 48 = 236`（图 | 提交号）、`236 + 66 = 302`（提交号 | 提交信息）、
+        // `1050 − 78 − 96 = 876`（提交信息 | 作者）、`1050 − 78 = 972`（作者 | 日期）。
         assert_eq!(
             vertical,
-            vec![(236.0, RULE_H), (876.0, RULE_H), (972.0, RULE_H)],
-            "表头的列边线不符（宽 1、高 {RULE_H}、三条在 236/876/972；见上 §2 四列）"
+            vec![(236.0, RULE_H), (302.0, RULE_H), (876.0, RULE_H), (972.0, RULE_H)],
+            "表头的列边线不符（宽 1、高 {RULE_H}、四条在 236/302/876/972；见 §2 五列）"
         );
         assert_eq!(horizontal.len(), 2, "表头该有上下两条横线把它切出来：{horizontal:?}");
         // 横线贴着行的**边框**（rect 86..110），而 `head_band` 是从文字中线量的（97.5），
@@ -4079,7 +4504,7 @@ use crate::viewport;
         let secondary = Color32::from_rgb(0x59, 0x63, 0x6E);
         assert_eq!(text_color(&out, "主题0", rows.clone()), primary, "提交信息不是正文色");
         assert_eq!(text_size(&out, "主题0", rows.clone()), 13.0, "提交信息不是 §3.4 的正文档 13px");
-        // 「次要」那一档现在只剩作者与日期：提交号不再画了（§2 四列没有它那一格）。
+        // 「次要」那一档是作者与日期；提交号低一档（`TEXT_MUTED` 11px），见下面那一条。
         for label in ["包融 <", "今天 "] {
             assert_eq!(
                 text_color(&out, label, rows.clone()),
@@ -4088,7 +4513,14 @@ use crate::viewport;
             );
             assert_eq!(text_size(&out, label, rows.clone()), 12.0, "「{label}」不是次要档 12px");
         }
-        for label in ["图表", "提交信息", "作者", "日期"] {
+        // 提交号：等宽 11px + `TEXT_MUTED`，比作者/日期再低一档——它是指认坐标，不是正文。
+        assert_eq!(
+            text_color(&out, "a0000", rows.clone()),
+            Color32::from_rgb(0x8B, 0x94, 0x9E),
+            "提交号不是 `TEXT_MUTED`"
+        );
+        assert_eq!(text_size(&out, "a0000", rows.clone()), 11.0, "提交号不是 11px");
+        for label in ["图表", "提交号", "提交信息", "作者", "日期"] {
             assert_eq!(text_color(&out, label, head_band(&out)), secondary, "表头「{label}」不是次要档");
             assert_eq!(text_size(&out, label, head_band(&out)), 12.0, "表头「{label}」不是次要档 12px");
         }
@@ -4740,6 +5172,58 @@ use crate::viewport;
         };
         frame_events(app, vec![key(true)]);
         frame_events(app, vec![key(false)]);
+    }
+
+    /// 差异区右键 →「整份差异」：菜单挂在差异区上，点完剪贴板命令里拿到的是整份补丁。
+    /// 这一条防的是「正文是 painter 画的，所以哪儿都不能选中/复制」——用户 2026-10-26 点名的。
+    /// 和 `menu_pick` 一样必须全程共用一个 `Context`：菜单开合记在 ctx 的 memory 里。
+    #[test]
+    fn the_diff_pane_copies_the_whole_patch_from_its_context_menu() {
+        let mut app = loaded();
+        let ctx = egui::Context::default();
+        style(&ctx);
+        let at = locate(&ctx, &mut app, "+加上的一行").expect("差异正文没画出来");
+        let right = |pressed: bool| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        for events in [
+            vec![egui::Event::PointerMoved(at)],
+            vec![egui::Event::PointerMoved(at), right(true)],
+            vec![egui::Event::PointerMoved(at), right(false)],
+            vec![egui::Event::PointerMoved(at)],
+        ] {
+            ctx.run_ui(raw_input(events), |ui| app.shell(ui))
+                .textures_delta
+                .clear();
+        }
+        let on = locate(&ctx, &mut app, "整份差异").expect("差异区右键菜单里没有「整份差异」");
+        let left = |pressed: bool| egui::Event::PointerButton {
+            pos: on,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut copied: Option<String> = None;
+        for events in [
+            vec![egui::Event::PointerMoved(on)],
+            vec![egui::Event::PointerMoved(on), left(true)],
+            vec![egui::Event::PointerMoved(on), left(false)],
+            vec![egui::Event::PointerMoved(on)],
+        ] {
+            let mut out = ctx.run_ui(raw_input(events), |ui| app.shell(ui));
+            out.textures_delta.clear();
+            for c in &out.platform_output.commands {
+                if let egui::OutputCommand::CopyText(t) = c {
+                    copied = Some(t.clone());
+                }
+            }
+        }
+        let text = copied.expect("点了「整份差异」但没发出剪贴板命令");
+        assert!(text.contains("-删掉的一行"), "剪贴板里缺删除行：{text}");
+        assert!(text.contains("+加上的一行"), "剪贴板里缺新增行：{text}");
     }
 
     /// 右键一行、再点它菜单里的某一项。**全程共用一个 `Context`**：菜单开合记在 ctx 的
@@ -6188,6 +6672,68 @@ use crate::viewport;
         let _ = std::fs::remove_file(&db_file);
     }
 
+    /// 「界面语言」那一格是整个 i18n 唯一的入口，而文案表那两条判据（`the_english_shell_*`）
+    /// 只证明**英文档画得出来**，不证明**拧得动**。这条管开关本身，五问：
+    /// 点 English 档位变了 / 下一帧整屏换成英文（侧栏组标题、卡标题、那一格自己的标签），
+    /// 旧的中文一个不剩 / **取数线程按当时语言烤好的那句 hunk 头也跟着换成英文**（换档要重取
+    /// 一次快照，只重画外壳留下的是半截翻译）/ 库里落 `"en"` 且 `Prefs::load` 读回同一份 /
+    /// 点「中文」换得回去。
+    /// 用真仓库而不是夹具：夹具那一帧没有可重取的东西，而「重取」正是这条判据里唯一盯不住
+    /// 「重画」的那一腿。差异区指到**已暂存**那一格：临时仓库在那儿有一条真改动，
+    /// hunk 头由 `request` 的线程拼好端上来（`layout`），是这屏上唯一一处缓存下来的文案。
+    #[test]
+    fn the_language_segment_switches_the_whole_shell_and_persists() {
+        let db_file = temp_db("lang");
+        let (mut app, dir) = open_repo("lang-switch");
+        app.conn = Some(db::open(db_file.to_str().unwrap()).expect("临时库"));
+        assert_eq!(app.lang, gitx::lang::Lang::Zh, "夹具默认该是中文档");
+        app.request(Target::Working { staged: true, path: None, untracked: false });
+        pump(&mut app, |a| !a.diff.is_empty());
+        let zh: Vec<String> = texts(&frame(&mut app)).into_iter().map(|(s, _)| s).collect();
+        assert!(
+            zh.iter().any(|s| s.starts_with("块 ")),
+            "换档前差异区没有那句中文 hunk 头，后面「换成英文」那条就成了无本之木：{zh:?}"
+        );
+        assert!(click_tool(&mut app, 10), "设置那枚工具按钮没点到");
+        assert!(click_card(&mut app, "English"), "「English」那一格没点到");
+        assert_eq!(app.lang, gitx::lang::Lang::En, "点了 English 档位没拧");
+        // 换语言会重开仓库（后台文案按新档重拼），等快照和差异都回来再量屏。
+        pump(&mut app, |a| a.snap.is_some() && !a.busy);
+        // 量屏必须走 `warm_frame`：卡画在 `Order::Foreground` 那层，全新 Context 的**第一遍**
+        // 不画它（见 `warm` 那段），用 `frame()` 问会得到「卡上一个字都没有」这种假红。
+        let out = warm_frame(&mut app);
+        let ts: Vec<String> = texts(&out).into_iter().map(|(s, _)| s).collect();
+        assert!(ts.iter().any(|s| s.contains("Working tree")), "侧栏还是中文：{ts:?}");
+        assert!(ts.iter().any(|s| s.contains("Settings")), "卡标题没跟着重拼：{ts:?}");
+        assert!(ts.iter().any(|s| s.contains("Language:")), "那一格自己的标签还是中文：{ts:?}");
+        assert!(
+            ts.iter().any(|s| s.starts_with("Hunk ")),
+            "差异区那句 hunk 头还是中文——换档没重取，屏上留下一半英文一半中文：{ts:?}"
+        );
+        for zh in ["工作区", "设置", "界面语言", "块 "] {
+            assert!(!ts.iter().any(|s| s.contains(zh)), "切完英文屏上还挂着「{zh}」：{ts:?}");
+        }
+        assert_eq!(
+            db::get_setting(app.conn.as_ref().unwrap(), Prefs::KEY_LANG)
+                .ok()
+                .flatten()
+                .as_deref(),
+            Some("en"),
+            "档位没落库"
+        );
+        assert_eq!(Prefs::load(app.conn.as_ref()), app.prefs(), "读回来的和屏上的不是同一份");
+        // 换回中文：同一个入口必须双向，否则英文档是个只进不出的坑。
+        assert!(click_card(&mut app, "中文"), "「中文」那一格没点到");
+        assert_eq!(app.lang, gitx::lang::Lang::Zh, "点了中文档位没回来");
+        pump(&mut app, |a| a.snap.is_some() && !a.busy);
+        let back: Vec<String> = texts(&warm_frame(&mut app)).into_iter().map(|(s, _)| s).collect();
+        assert!(back.iter().any(|s| s.contains("工作区")), "换回中文侧栏还是英文：{back:?}");
+        assert!(!back.iter().any(|s| s.contains("Working tree")), "换回中文了，英文组标题还挂着");
+        assert!(back.iter().any(|s| s.starts_with("块 ")), "换回中文，hunk 头却还是英文：{back:?}");
+        let _ = std::fs::remove_file(&db_file);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 「日志默认按层级顺序（而不是日期）」这条改的是**同一个** `topo`：屏上重排、筛选条那枚
     /// 按钮跟着换文案、库里落 `"true"`。它和弹出菜单那条路共用一份状态，不是第二套开关。
     #[test]
@@ -6196,12 +6742,12 @@ use crate::viewport;
         let (mut app, dir) = open_repo("topo-switch");
         app.conn = Some(db::open(db_file.to_str().unwrap()).expect("临时库"));
         assert!(!app.topo, "夹具默认该是日期序");
-        assert!(filter_text(&mut app, DATE_ORDER).is_some(), "按钮上写的不是默认那一档");
+        assert!(filter_text(&mut app, date_order()).is_some(), "按钮上写的不是默认那一档");
         assert!(click_tool(&mut app, 10));
         assert!(click_card(&mut app, "日志默认按层级顺序"), "那枚开关没点到");
         assert!(app.topo, "点了开关没换排序");
         pump(&mut app, |a| a.snap.is_some());
-        assert!(filter_text(&mut app, TOPO_ORDER).is_some(), "换了排序，按钮上还是旧那一项");
+        assert!(filter_text(&mut app, topo_order()).is_some(), "换了排序，按钮上还是旧那一项");
         assert_eq!(
             db::get_setting(app.conn.as_ref().unwrap(), Prefs::KEY_TOPO).ok().flatten().as_deref(),
             Some("true"),
@@ -7329,6 +7875,41 @@ use crate::viewport;
         );
     }
 
+    /// 上面那一条修的是**取数**口径，这一条修的是**字**：分离 HEAD 时筛选条那枚 chip 还写着
+    /// 「当前分支」，实参却是 `--all` —— 那是 §7 里登记过的「代价没结清」。
+    /// chip 说的话必须就是查的东西，否则用户读到的是「软件把我的提交筛掉了」。
+    ///
+    /// 反向变异记在这里：把 `scope_label_for` 的 detached 那一格删掉（永远回 `scope_label`），
+    /// 红的只有这一条，取数那几条一个字都不动 —— 字与实参是两件事，各要一条判据。
+    #[test]
+    fn the_scope_chip_says_what_a_detached_log_actually_queries() {
+        use git::Scope;
+        assert_eq!(
+            scope_label_for(&Scope::Current, true),
+            "分离 HEAD · 全部引用",
+            "分离时那一档查的是全部引用，chip 不许再写「当前分支」"
+        );
+        // 另外三档本来就没说假话：分离不许改它们的字。
+        assert_eq!(scope_label_for(&Scope::Current, false), current_branch());
+        assert_eq!(scope_label_for(&Scope::All, true), all_branches());
+        assert_eq!(scope_label_for(&Scope::Rev("side".to_owned()), true), "side");
+        // 而且筛选条那枚真的走这个函数（只测纯函数杀不掉「画的是另一份」）。
+        let mut app = loaded();
+        app.snap.as_mut().unwrap().status.detached_at = Some("a0001".to_owned());
+        app.scope = Scope::Current;
+        let out = frame(&mut app);
+        let painted: Vec<String> = texts(&out).into_iter().map(|(s, _)| s).collect();
+        assert!(
+            painted.iter().any(|s| s.starts_with("分离 HEAD · 全部引用")),
+            "分离那一帧的筛选条没换成实话：{painted:?}"
+        );
+        let lying = format!("{} {ARROW}", current_branch());
+        assert!(
+            !painted.iter().any(|s| *s == lying),
+            "chip 还挂着「{lying}」：字和实参（`--all`）又对不上了"
+        );
+    }
+
     /// 端到端：真仓库、真检出到**上一条**提交，然后回答用户那句「后面的历史都看不到了」。
     /// 日志必须还认得出上面那条更新的提交。杀伤路径是把 `snapshot_of` 里那句
     /// `eff_scope` 撤掉 —— 那样取回来的就是 `HEAD~1` 的可达链，只剩一条。
@@ -7515,53 +8096,41 @@ use crate::viewport;
     ///
     /// 这一行以前是个死桩（点下去只写一句「还没接」的 note）。桩改成真的唯一证据是
     /// note 不再被写、那一格换了人，两个方向都得断：少了「note 没变」，把桩留着也算接上；
-    /// 少了「跳框消失」，两格并排画也算接上。
+    /// 少了「跳框消失」，两格并排画也算接上。入口 2026-10-26 从侧栏挪到了日志条右端。
     #[test]
-    fn the_sidebar_search_row_swaps_the_jump_box_for_the_search_field() {
+    fn the_log_bar_search_button_swaps_the_jump_box_for_the_search_field() {
         let mut app = loaded();
         let out = frame(&mut app);
         assert!(
-            texts(&out).iter().any(|(s, _)| s == JUMP_TO_SHA),
-            "开搜之前那格该是跳框「{JUMP_TO_SHA}」"
+            texts(&out).iter().any(|(s, _)| s == jump_to_sha()),
+            "开搜之前那格该是跳框「{}」",
+            jump_to_sha()
         );
         assert!(
-            !texts(&out).iter().any(|(s, _)| s == SEARCH_HINT),
+            !texts(&out).iter().any(|(s, _)| s == search_hint()),
             "还没点就已经画出搜索框"
         );
+        // 侧栏那一行 2026-10-26 去掉了，日志条右端这枚是**唯一**入口。判据挑整串「搜索」：
+        // 占位词与「搜索中…」都以它开头，前缀匹配在这里不算证据。
         assert!(
             click_text_exact(&mut app, "搜索"),
-            "侧栏没有整串写着「搜索」的那一行（`click_text` 的前缀匹配在这里不算证据：\
-             「搜索提交…」「搜索中…」都以它开头）"
+            "日志条右端没有整串写着「搜索」的那一枚"
         );
-        assert!(app.search_open, "点了侧栏「搜索」，搜索那一档却没开");
+        assert!(app.search_open, "点了「搜索」，搜索那一档却没开");
         assert!(
             app.note.is_none(),
-            "点下去只写了一句 note：那一行还是个桩 —— {}",
+            "点下去只写了一句 note：那一枚还是个桩 —— {}",
             app.note.clone().unwrap_or_default()
         );
         let out = frame(&mut app);
         assert!(
-            texts(&out).iter().any(|(s, _)| s == SEARCH_HINT),
-            "开着却没画出搜索框（占位词「{SEARCH_HINT}」）"
+            texts(&out).iter().any(|(s, _)| s == search_hint()),
+            "开着却没画出搜索框（占位词「{}」）",
+            search_hint()
         );
         assert!(
-            !texts(&out).iter().any(|(s, _)| s == JUMP_TO_SHA),
+            !texts(&out).iter().any(|(s, _)| s == jump_to_sha()),
             "跳框没让位：两格同时挂在日志条右边"
-        );
-        // 再点一次那一行不该把命中列表抹掉。命中得由线程填，而夹具的 `/fixture` 跑不了 git，
-        // 所以这一位只能直接摆上字段——被验的是「第二次点击动不动它」，不是「能不能摆上去」。
-        let first = app.snap.as_ref().unwrap().commits[0].clone();
-        app.search_hits = vec![SearchHit {
-            commit: first,
-            badges: Vec::new(),
-            date: "今天 10:00".to_owned(),
-        }];
-        assert!(click_text_exact(&mut app, "搜索"), "第二次点不到那一行");
-        assert!(app.search_open, "又点一下那一行，搜索反而关了");
-        assert_eq!(
-            app.search_hits.len(),
-            1,
-            "又点一下那一行，上一次的结果被清空了"
         );
     }
 
@@ -7599,8 +8168,9 @@ use crate::viewport;
             "侧栏没有「搜索」那一行，搜索档开不了"
         );
         assert!(
-            type_into_and_enter(&mut app, SEARCH_HINT, "deploy"),
-            "搜索框没画出来（占位词「{SEARCH_HINT}」）"
+            type_into_and_enter(&mut app, search_hint(), "deploy"),
+            "搜索框没画出来（占位词「{}」）",
+            search_hint()
         );
         assert_eq!(app.search_q, "deploy", "敲的字没落到绑定上");
         assert!(app.search_open, "回车把搜索档关了");
@@ -7672,7 +8242,7 @@ use crate::viewport;
             "侧栏没有「搜索」那一行"
         );
         assert!(
-            type_into_and_enter(&mut app, SEARCH_HINT, "这个词一定不存在"),
+            type_into_and_enter(&mut app, search_hint(), "这个词一定不存在"),
             "搜索框没画出来"
         );
         pump(&mut app, |a| !a.search_busy);
@@ -7702,10 +8272,10 @@ use crate::viewport;
         let out = frame(&mut app);
         let painted: Vec<String> = texts(&out).iter().map(|(s, _)| s.clone()).collect();
         assert!(
-            painted.iter().any(|s| s == JUMP_TO_SHA),
+            painted.iter().any(|s| s == jump_to_sha()),
             "关掉搜索后跳框没回到原位"
         );
-        assert!(!painted.iter().any(|s| s == SEARCH_HINT), "搜索框没跟着收回去");
+        assert!(!painted.iter().any(|s| s == search_hint()), "搜索框没跟着收回去");
         assert!(!painted.iter().any(|s| s.contains("没有提交命中")), "空态那句还留在画面里");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7739,7 +8309,7 @@ use crate::viewport;
             "侧栏没有「搜索」那一行，搜索档开不了"
         );
         assert!(
-            type_into_and_enter(&mut app, SEARCH_HINT, "a.txt"),
+            type_into_and_enter(&mut app, search_hint(), "a.txt"),
             "搜索框没画出来"
         );
         pump(&mut app, |a| !a.search_busy && !a.search_hits.is_empty());
@@ -7810,5 +8380,1807 @@ use crate::viewport;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ------------------------------------------------------------------ 看板（§2.2）
+
+    /// 一条够用的假 PR：十二个字段全填（少一个就编译不过，这正是想要的——加了字段
+    /// 判据得跟着想清楚它算哪一档），`mergeable_state` 由判据自己挑。
+    /// `ci` 一律给 `NotFetched`：那是**列表端点给的真实样子**（检查要按 sha 再取一次），
+    /// 要看 CI 那一档的判据自己改这一格——不然「列表落地时状态列该说什么」就没人钉了。
+    /// `head_sha` 给一条真的像样的：补充请求按 `(号, sha)` 记账，空串在 `enrich_rows`
+    /// 那一处是「拼不出 URL，跳过」，夹具里全都填上才量得到「哪几行起了请求」。
+    fn pr(number: u32, title: &str, mergeable: &str) -> PullRequest {
+        PullRequest {
+            number,
+            title: title.to_owned(),
+            state: "open".to_owned(),
+            author: "lisa".to_owned(),
+            head: format!("acme:feat-{number}"),
+            base: "acme:main".to_owned(),
+            head_sha: format!("{number:0>7}"),
+            draft: false,
+            url: format!("https://github.com/acme/app/pull/{number}"),
+            updated: "2026-10-20T01:00:00Z".to_owned(),
+            mergeable_state: mergeable.to_owned(),
+            ci: Ci::NotFetched,
+        }
+    }
+
+    /// 看板夹具：GitHub 远端 + 现成的列表，**不走 `show_board()`**。
+    /// 理由和 `commit_list()` 那句一样：那条通路末尾的 `fetch_board()` 会起线程真的发一次
+    /// HTTP，而无头门禁不许连网（`/fixture` 也不是真仓库，回来的 `Failed` 会污染别的断言）。
+    /// 但 provider 那两步（`detect` / `repo_ref_for`）是纯字符串解析，所以这里**真调用**它们，
+    /// 不手填 `host`——那样「远端换成 Gitee 之后看板跟着换」这一条才量得到。
+    /// `fetching` 摆成 true：那正是 `fetch_board` 出门时的样子（列表是上一轮的、这一轮在飞）。
+    fn board_fix(prs: Vec<PullRequest>) -> Gitx {
+        board_from(true, prs)
+    }
+
+    /// 英文档的看板夹具：同 `board_fix`，只有快照里那三份数据换成 ASCII
+    /// （理由见 `filled_en`），PR 标题由判据自己给。
+    fn board_fix_en(prs: Vec<PullRequest>) -> Gitx {
+        board_from(false, prs)
+    }
+
+    fn board_from(chinese_data: bool, prs: Vec<PullRequest>) -> Gitx {
+        let mut app = remote_branches_from(chinese_data, 0);
+        let urls: Vec<String> = app
+            .snap
+            .as_ref()
+            .expect("remote_branches 造好了快照")
+            .remotes
+            .iter()
+            .map(|r| r.url.clone())
+            .collect();
+        let host = gitx::provider::detect(&urls).expect("夹具那条远端是 GitHub 形式");
+        // 令牌**故意不给**：`fetch_board` 和 `enrich_rows` 都在「拼请求」那一步之前先看这一格，
+        // 空着就当场把原因写在栏上、不起线程。给了令牌（哪怕是个假的）这些判据就会真的
+        // 连一次 api.github.com —— 无头门禁不许连网（理由见上面那段）。
+        // 要量「哪几行进过补取名单」的判据自带一个假 provider（见 `NoUrl`）。
+        app.board_open = true;
+        app.board.host = Some(host);
+        app.board.repo_ref = gitx::provider::repo_ref_for(host, &urls);
+        app.board.prs = prs;
+        app.board.loaded = true;
+        app.board.fetching = true;
+        app
+    }
+
+    /// 侧栏那一栏里的文字块（按 x 筛在 `SIDEBAR_W` 左边、y 在顶栏和状态栏之间）。
+    /// 「整栏换成看板」要问的是**大纲那几行不见了**，用全窗口的 `texts` 会被顶栏、
+    /// 日志、差异区里的同名词顶掉——那种假绿正好是这一条要防的事。
+    fn side_texts(out: &egui::FullOutput) -> Vec<(String, Rect)> {
+        out.shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Text(t) => {
+                    let r = t.galley.rect.translate(t.pos.to_vec2());
+                    let hit =
+                        r.min.x < SIDEBAR_W && r.center().y > HEADER_H && r.center().y < WIN_H - STATUS_H;
+                    hit.then(|| (t.galley.text().to_owned(), r))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// §2.2 第一档：点侧栏「看板」= **整栏**换掉，底置筛选框之外那套大纲一行都不许还在。
+    /// 走的是真通路（`click_text_exact` → `land` → `show_board` → `fetch_board`），
+    /// 夹具是 `remote_branches(0)`：认得出 GitHub、但**没绑令牌**——`fetch_board` 在那一格
+    /// 是提前 return，不起线程，所以无头里敢真点。
+    /// 没令牌时栏上写的是原因，不是转圈：这是它自己的判据，见下面那句注释。
+    #[test]
+    fn clicking_the_board_replaces_the_whole_sidebar() {
+        let mut app = remote_branches(0);
+        assert!(click_text_exact(&mut app, "看板"), "侧栏里没有「看板」那一行");
+        assert!(app.board_open, "点了「看板」但栏没换过去");
+        let out = frame(&mut app);
+        let shown = side_texts(&out);
+        for gone in ["工作区", "文件状态", "历史", "分支", "标签", "远端", "已贮藏"] {
+            assert!(
+                !shown.iter().any(|(s, _)| s.starts_with(gone)),
+                "换成看板之后，大纲那一行「{gone}」还留在栏里"
+            );
+        }
+        let words: Vec<&str> = shown.iter().map(|(s, _)| s.as_str()).collect();
+        assert!(
+            words.iter().any(|s| *s == "‹ 仓库"),
+            "看板栏里没有退回仓库的那一行：{words:?}"
+        );
+        assert!(words.iter().any(|s| s.starts_with("代码托管")), "看板栏里没写这是「代码托管」：{words:?}");
+        // 反向变异的另一半：只验「看板的东西在」不验「大纲的东西没」是假绿，所以两边都问。
+        assert!(
+            words.iter().any(|s| s.contains("未绑定 GitHub token")),
+            "没绑令牌时栏上没写出原因（那就是「转圈到超时」那条路）：{words:?}"
+        );
+        assert!(!app.board.fetching, "没令牌也照样把在途旗子立起来了：请求根本不该发出去");
+
+        assert!(click_text_exact(&mut app, "‹ 仓库"), "看板栏里点不动「‹ 仓库」");
+        assert!(!app.board_open, "点「‹ 仓库」没换回大纲");
+        let back = side_texts(&frame(&mut app));
+        assert!(
+            back.iter().any(|(s, _)| s.starts_with("文件状态")),
+            "换回大纲之后「文件状态」那一行反而没了"
+        );
+    }
+
+    /// 「没有行」的三种原因各说各的。这一条钉的是**认不出托管**那一档：夹具 `loaded()`
+    /// 的 `remotes` 是空的，`detect` 回 `None`。写成「没有开放的 PR」是骗人——那句的意思是
+    /// 「取过了、真的没有」。
+    #[test]
+    fn a_repo_no_host_can_work_out_says_so_instead_of_an_empty_list() {
+        let mut app = loaded();
+        assert!(click_text_exact(&mut app, "看板"), "侧栏里没有「看板」那一行");
+        let out = frame(&mut app);
+        let words: Vec<String> = side_texts(&out).into_iter().map(|(s, _)| s).collect();
+        assert!(
+            words.iter().any(|s| s.contains("不是认得出的代码托管")),
+            "认不出托管却没写出原因：{words:?}"
+        );
+        assert!(
+            !words.iter().any(|s| s.contains("没有开放的 PR")),
+            "认不出托管却写成「没有开放的 PR」（那是「取过了、真的没有」的意思）"
+        );
+        assert!(!app.board.fetching, "认不出托管还去发请求");
+    }
+
+    /// §2.2 那一行是**两行字**：`#号 + 标题` 在上、状态一句话紧贴在下、同一列起笔。
+    /// 状态文案本身由 `provider::pr_status` 的表驱动判据管；这里管的是它**落在行上**。
+    #[test]
+    fn every_pr_row_carries_its_own_one_line_status() {
+        let mut app = board_fix(vec![pr(12, "有冲突那条", "dirty"), pr(13, "可以合那条", "clean")]);
+        let out = frame(&mut app);
+        let rows = side_texts(&out);
+        for (number, title, status) in [
+            (12, "有冲突那条", "有冲突 · 需要作者处理"),
+            (13, "可以合那条", "可以合并"),
+        ] {
+            let head = format!("#{number} {title}");
+            let (_, t) = rows
+                .iter()
+                .find(|(s, _)| *s == head)
+                .unwrap_or_else(|| panic!("看板里没有「{head}」这一行"));
+            let (_, s) = rows
+                .iter()
+                .find(|(x, _)| x.starts_with(status))
+                .unwrap_or_else(|| panic!("「{head}」下面没有状态那句「{status}」"));
+            assert!(s.center().y > t.center().y, "状态写在标题上面了");
+            assert!(
+                (s.center().y - t.center().y) < BOARD_LINE_H + 1.0,
+                "状态不是紧贴标题下面那一行，差了 {}pt",
+                s.center().y - t.center().y
+            );
+            assert!(
+                (s.min.x - t.min.x).abs() < 0.01,
+                "状态那一句没和标题对齐在同一列：{} vs {}",
+                s.min.x,
+                t.min.x
+            );
+        }
+    }
+
+    /// 蓝点 = 「你上次看过之后它又动了」。两个出口各验一半：新动静的**有**、看过没动的**没有**。
+    /// 点按行取中点（标题中心在上半格、状态中心在下半格，各自的中心都不是行中心）。
+    /// 账本里那一份是**签名**（`state | head sha | CI 档 | 合并格`）而不是 `updated_at`：
+    /// 见 `PullRequest::signature` 那句 —— 检查跑完不改 `updated_at`，只看它就等于
+    /// 「CI 从在跑到全绿」这次用户亲眼看见的变化不亮点。
+    #[test]
+    fn the_board_dot_marks_only_the_pr_that_moved_since_you_last_saw_it() {
+        let mut app = board_fix(vec![pr(12, "看过那条", "clean"), pr(13, "新动那条", "blocked")]);
+        let seen = app.board.prs[0].signature();
+        app.board.seen.insert(12, seen);
+        let out = frame(&mut app);
+        let dots = board_dots(&out);
+        let row_y = |label: &str| {
+            // 标题那一半格以行中心为界（`put_left` 的 `Align::Center` 把字居中在 20pt 的上半格），
+            // 所以行中心 = 标题中心 + 半格。
+            let t = side_texts(&out)
+                .into_iter()
+                .find(|(s, _)| s.starts_with(label))
+                .unwrap_or_else(|| panic!("看板里没有「{label}」那一行"))
+                .1;
+            t.center().y + BOARD_LINE_H / 2.0
+        };
+        let y12 = row_y("#12");
+        let y13 = row_y("#13");
+        assert!(
+            dots.iter().any(|p| (p.x - SIDE_DOT_X).abs() < 0.01 && (p.y - y13).abs() < 2.0),
+            "有新旧事的 #13 那一行左缘没有落在 x={SIDE_DOT_X} 的蓝点：{dots:?}"
+        );
+        assert!(!dots.iter().any(|p| (p.y - y12).abs() < 2.0), "看过、且没新动静的 #12 也亮了蓝点");
+        assert_eq!(dots.len(), 1, "看板栏里画了 {} 枚蓝点，只该有那一条新动静的", dots.len());
+    }
+
+    /// 点开一条 PR 办两件事：把「看到这儿了」记进 `seen`（夹具 `conn: None`，落库那一步
+    /// 自然跳过），并把地址**交给 egui 的命令队列**——不是起进程 `open`，后者跑测试会真弹浏览器。
+    #[test]
+    fn clicking_a_board_row_remembers_it_and_asks_egui_to_open_the_pr() {
+        let mut app = board_fix(vec![pr(12, "打开那条", "clean")]);
+        let ctx = egui::Context::default();
+        style(&ctx);
+        let at = locate(&ctx, &mut app, "#12 打开那条").expect("看板栏里没有那条 PR");
+        click_at(&ctx, &mut app, at);
+        // 那一击攒下的地址要等**下一帧**的 `poll` 才交给 egui：`land` 手上没有 `Context`。
+        let mut out = ctx.run_ui(raw_input(Vec::new()), |ui| app.shell(ui));
+        out.textures_delta.clear();
+        let urls: Vec<String> = out
+            .platform_output
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                egui::OutputCommand::OpenUrl(u) => Some(u.url.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            urls,
+            vec!["https://github.com/acme/app/pull/12".to_owned()],
+            "点了一条 PR 但交给 egui 的不是那一条的地址"
+        );
+        assert_eq!(
+            app.board.seen.get(&12).map(String::as_str),
+            Some(pr(12, "打开那条", "clean").signature().as_str()),
+            "点过之后没记下「看到这儿了」（下次进来它还会亮着蓝点）"
+        );
+    }
+
+    /// 看板回复的三位认领号（同 `Msg::Search` 那条教训）：对不上号的一律丢，
+    /// 而且**丢掉的那条不许把在途旗子摘掉**——不然真正的回复还没落地，栏上就已经不转了。
+    fn board_reply(seq: u64, prs: Vec<PullRequest>) -> Msg {
+        Msg::PullRequests { seq, prs: Ok(prs) }
+    }
+
+    #[test]
+    fn a_stale_board_reply_is_dropped_and_a_matching_one_lands() {
+        let mut app = board_fix(Vec::new());
+        app.board_seq = 7;
+        app.tx.send(board_reply(6, vec![pr(9, "上一本的列表", "dirty")])).unwrap();
+        frame(&mut app);
+        assert!(app.board.prs.is_empty(), "对不上号的旧回复被采纳了：换仓库会把 A 的列表挂到 B 名下");
+        assert!(app.board.fetching, "丢掉旧回复却把「在途」解了：新回复回来之前栏上不转了");
+        app.tx.send(board_reply(7, vec![pr(21, "这一本的", "clean")])).unwrap();
+        frame(&mut app);
+        assert_eq!(app.board.prs.len(), 1, "三位都对的那一条反而被丢了");
+        assert!(!app.board.fetching, "落地了却还挂在在途");
+        assert!(app.board.loaded);
+    }
+
+    /// 取数失败不许把上一轮的列表留着装作没事：栏上要写清是哪一次失败了。
+    #[test]
+    fn a_failed_board_reply_clears_the_rows_and_shows_the_reason() {
+        let mut app = board_fix(vec![pr(12, "上一轮的列表", "clean")]);
+        app.board_seq = 3;
+        app.tx
+            .send(Msg::PullRequests { seq: 3, prs: Err("GitHub：401 Bad credentials".to_owned()) })
+            .unwrap();
+        frame(&mut app);
+        assert!(app.board.prs.is_empty(), "取数失败却还画着上一轮的列表");
+        let words: Vec<String> = side_texts(&frame(&mut app)).into_iter().map(|(s, _)| s).collect();
+        assert!(
+            words.iter().any(|s| s.contains("401 Bad credentials")),
+            "失败原因没落在栏上：{words:?}"
+        );
+        assert!(!app.board.fetching);
+    }
+
+    // ---------------------------------------------------------- 补取（每行的两格）
+    //
+    // 列表端点不给 `mergeable_state`，也不给检查（2026-10-31 实测），所以每一行还要
+    // 再问两次。这两次是**外壳**的决定（哪几行问、回来的那一笔涂给谁、什么时候作废），
+    // 不是任何一家的解析 —— 因此这一组判据用一个假 provider，不连网。
+
+    /// 一个「两格都声明、但一格请求都拼不出来」的假 provider。
+    /// 为什么要有它：补取只在**有令牌**时才真的起线程发 HTTP，而无头门禁不许连网
+    /// （理由见 `board_from` 那一段）。声明了能力、请求拼不出来（`Host` 的默认实现
+    /// 就是「这家没接」）→ 进过补取名单的行会在 `facts` 上留一格「问过、没有」，
+    /// 于是「哪几行进过名单」这件事量得到，而一个字节都没出这台机器。
+    struct NoUrl;
+    impl gitx::provider::Host for NoUrl {
+        fn id(&self) -> &'static str {
+            "nounrl"
+        }
+        fn label(&self) -> &'static str {
+            "夹具"
+        }
+        fn handles(&self, _url: &str) -> bool {
+            true
+        }
+        fn capabilities(&self) -> Vec<gitx::provider::Capability> {
+            use gitx::provider::Capability as C;
+            vec![C::PullRequests, C::PullRequestDetail, C::CiStatus]
+        }
+        fn token_hint(&self) -> &'static str {
+            "夹具不给"
+        }
+        fn pull_requests_request(
+            &self,
+            _repo: &gitx::provider::RepoRef,
+            _token: &str,
+        ) -> gitx::provider::Result<gitx::provider::ApiRequest> {
+            Err(gitx::GitxError::Other("夹具不给列表请求".to_owned()))
+        }
+        fn parse_pull_requests(&self, _body: &str) -> gitx::provider::Result<Vec<PullRequest>> {
+            Err(gitx::GitxError::Other("夹具不给列表解析".to_owned()))
+        }
+        fn pull_request_web_url(&self, _repo: &gitx::provider::RepoRef, number: u32) -> String {
+            format!("https://example.test/pr/{number}")
+        }
+    }
+    static NO_URL: NoUrl = NoUrl;
+
+    /// 把夹具那一栏换成 `NoUrl`，并给它绑上令牌（id 对得上才会走到拼请求那一步）。
+    fn with_no_url(app: &mut Gitx) {
+        app.board.host = Some(&NO_URL);
+        app.provider_tokens = vec![("nounrl".to_owned(), "tok".to_owned())];
+    }
+
+    /// 看板里画出来的蓝点（左缘那一列）。
+    fn board_dots(out: &egui::FullOutput) -> Vec<Pos2> {
+        out.shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Circle(d) if d.fill == ACCENT && d.center.x < SIDEBAR_W => Some(d.center),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 补取只给**画得进来的**那几行：`WIN_H 545` 那一栏放得下十行 `BOARD_ROW_H 40`
+    /// （第十行只有半格在窗口里，矩形相交就算看得见 —— 用户滚动半格就该看到它的状态）。
+    /// 两头都要问：把相交判据写反（只补看不见的）或写成恒假（一行都不补）都会红；
+    /// 「干脆不做可见性判据、整屏一起补」也红：50 条 PR 就是 100 个请求，
+    /// 而这一栏的第一承诺是「快」，不是「把速率预算一次打爆」。
+    #[test]
+    fn only_the_rows_inside_the_viewport_enter_the_extra_fetch() {
+        let rows: Vec<PullRequest> = (1..=12).map(|n| pr(n, &format!("行{n}"), "")).collect();
+        let mut app = board_fix(rows);
+        with_no_url(&mut app);
+        frame(&mut app);
+        let mut asked: Vec<u32> = app.board.facts.keys().map(|(n, _)| *n).collect();
+        asked.sort_unstable();
+        assert_eq!(
+            asked,
+            (1..=10).collect::<Vec<u32>>(),
+            "进补取名单的不是「窗口里那十行」：头顶的行没被补 / 窗口外的行也起了请求"
+        );
+    }
+
+    /// 落回的那一笔要**同时**对上号和 sha 才涂得进去。
+    /// 号对不上 = 这一笔属于上一代列表（换仓库/按刷新重编过号）；
+    /// sha 对不上 = 作者在这一趟在飞时推了新提交，旧那一版的「可以合并」挂在新提交上
+    /// 是这一栏最要命的那种谎。
+    #[test]
+    fn an_enrich_reply_paints_only_the_row_and_the_version_it_answers() {
+        let mut app = board_fix(vec![pr(12, "那一版", "blocked")]);
+        app.board_seq = 4;
+        let sha = app.board.prs[0].head_sha.clone();
+        app.board.asked.insert(((12u32, sha.clone()), Ask::Detail));
+        app.board.asked.insert(((12u32, sha.clone()), Ask::Checks));
+        app.tx
+            .send(Msg::PrDetail {
+                seq: 4,
+                number: 12,
+                sha: "旧那一版".to_owned(),
+                r: Ok("clean".to_owned()),
+            })
+            .unwrap();
+        frame(&mut app);
+        assert_eq!(
+            app.board.prs[0].mergeable_state, "blocked",
+            "sha 对不上的旧回复被涂上了：新提交会挂着上一版的「可以合并」"
+        );
+        assert!(
+            app.board.facts.get(&(12, "旧那一版".to_owned())).is_none(),
+            "sha 不对的那一笔还进了缓存"
+        );
+        assert_eq!(app.board.outstanding(), 2, "sha 对不上的那一笔把自己解了：在途账跟着旧提交一起没了");
+        // 检查那一格同一道闸：旧那一版的绿不许涂到新提交上。
+        app.tx
+            .send(Msg::PrChecks {
+                seq: 4,
+                number: 12,
+                sha: "旧那一版".to_owned(),
+                r: Ok(Ci::Passed { total: 9 }),
+            })
+            .unwrap();
+        frame(&mut app);
+        assert!(
+            matches!(app.board.prs[0].ci, Ci::NotFetched),
+            "sha 对不上的检查汇总被涂上了：{:?}",
+            app.board.prs[0].ci
+        );
+        assert_eq!(app.board.outstanding(), 2, "sha 对不上的检查那一笔把自己解了");
+        // 对上的那一笔才落地：行上和缓存各一份（缓存是「按刷新」之后不必再问的依据）。
+        app.tx
+            .send(Msg::PrDetail { seq: 4, number: 12, sha: sha.clone(), r: Ok("clean".to_owned()) })
+            .unwrap();
+        app.tx
+            .send(Msg::PrChecks {
+                seq: 4,
+                number: 12,
+                sha: sha.clone(),
+                r: Ok(Ci::Passed { total: 2 }),
+            })
+            .unwrap();
+        frame(&mut app);
+        assert_eq!(app.board.prs[0].mergeable_state, "clean", "对得上 sha 的那一笔反而没涂进去");
+        assert!(matches!(app.board.prs[0].ci, Ci::Passed { total: 2 }), "检查汇总没落到行上");
+        assert_eq!(app.board.outstanding(), 0, "两笔都落地了还占着并发额度");
+        let f = app.board.facts.get(&(12, sha)).expect("落地的结果要进缓存");
+        assert_eq!(f.detail.as_deref(), Some("clean"));
+        assert!(matches!(f.checks, Some(Ci::Passed { total: 2 })));
+    }
+
+    /// 号对不上的补充回复：丢，而且**不许把那一行的「在途」摘掉**
+    /// （和列表那一条同规矩，见 `a_stale_board_reply_is_dropped_and_a_matching_one_lands`：
+    /// 提前摘 = 真回复还没落地，栏上就不转了，用户以为这一行没什么可等的）。
+    /// 详情与检查各问一遍：那两道 `seq` 闸是分开写在两个分支里的，只验一边等于另一边没闸。
+    #[test]
+    fn a_stale_enrich_reply_is_dropped_without_ending_the_wait() {
+        let mut app = board_fix(vec![pr(12, "那一版", "blocked")]);
+        app.board_seq = 9;
+        let sha = app.board.prs[0].head_sha.clone();
+        app.board.asked.insert(((12u32, sha.clone()), Ask::Detail));
+        app.board.asked.insert(((12u32, sha.clone()), Ask::Checks));
+        let one = app.board.prs[0].clone();
+        assert!(app.board.row_fetching(&one), "夹具摆的在途账没生效");
+        app.tx
+            .send(Msg::PrDetail { seq: 8, number: 12, sha: sha.clone(), r: Ok("clean".to_owned()) })
+            .unwrap();
+        frame(&mut app);
+        assert_eq!(app.board.prs[0].mergeable_state, "blocked", "旧号的回复被采纳了");
+        assert!(app.board.row_fetching(&one), "丢掉的旧回复把「在途」摘了：真回复回来之前栏上不转了");
+        // 逐笔的账：一行两个请求，`row_fetching` 只看「有没有在转」分不出哪一格被提前解了，
+        // 所以这里按笔数问（那个数同时是并发上限的依据，见 `the_extra_fetch_caps_…`）。
+        assert_eq!(app.board.outstanding(), 2, "丢掉的那一笔把自己的在途解了：剩 1 笔");
+        app.tx
+            .send(Msg::PrDetail { seq: 9, number: 12, sha: sha.clone(), r: Ok("clean".to_owned()) })
+            .unwrap();
+        frame(&mut app);
+        assert_eq!(app.board.prs[0].mergeable_state, "clean", "对得上号的回复反而被丢了");
+        assert_eq!(app.board.outstanding(), 1, "详情落地却没解它那笔在途");
+        assert!(
+            app.board.row_fetching(&one),
+            "详情落地了，检查那笔还在飞，这一行却不转了：一行有两个请求，账不能并成一笔"
+        );
+        // 检查那一格同一道 `seq` 闸：旧号的绿不许涂进来，也不许替这一行解在途。
+        app.tx
+            .send(Msg::PrChecks { seq: 8, number: 12, sha: sha.clone(), r: Ok(Ci::Passed { total: 3 }) })
+            .unwrap();
+        frame(&mut app);
+        assert!(
+            matches!(app.board.prs[0].ci, Ci::NotFetched),
+            "旧号的检查汇总被采纳了：{:?}",
+            app.board.prs[0].ci
+        );
+        assert!(app.board.row_fetching(&one), "丢掉的旧检查回复把「在途」摘了");
+        assert_eq!(app.board.outstanding(), 1, "丢掉的那笔检查把自己解了");
+        app.tx
+            .send(Msg::PrChecks { seq: 9, number: 12, sha, r: Ok(Ci::Passed { total: 3 }) })
+            .unwrap();
+        frame(&mut app);
+        assert!(matches!(app.board.prs[0].ci, Ci::Passed { total: 3 }), "对得上号的检查汇总反而被丢了");
+        assert!(!app.board.row_fetching(&one), "两个请求都落地了却还挂在在途");
+        assert_eq!(app.board.outstanding(), 0, "两笔都落地了还在占着并发额度");
+    }
+
+    /// 第一次打开这一栏（库里那本账是空的）不该满屏蓝点：这一趟里落下来的结论只进账。
+    /// 三个时刻各问一遍：①结论还在飞（账本空着，靠 `seeding` 那一挡，不是靠巧）；
+    /// ②结论落齐了才建账；③之后真的动一次（这里让 CI 换个汇总）才点亮，
+    /// 否则这一枚点在第二代用户那里就成了永远不亮的装饰。
+    #[test]
+    fn the_first_visit_seeds_the_ledger_instead_of_lighting_every_dot() {
+        let mut app = board_fix(Vec::new());
+        app.board_seq = 2;
+        app.board.seen.clear();
+        // ① 列表落地时那两格还在飞：`outstanding() > 0` → 这一趟还没走完，不建账。
+        // 账本此刻是空的，没有 `is_new` 里 `seeding` 那一挡，每行都会读成「没看过 = 有新动静」。
+        for n in [12u32, 13] {
+            let sha = format!("{n:0>7}");
+            app.board.asked.insert(((n, sha.clone()), Ask::Detail));
+            app.board.asked.insert(((n, sha), Ask::Checks));
+        }
+        app.tx
+            .send(board_reply(2, vec![pr(12, "甲", "clean"), pr(13, "乙", "blocked")]))
+            .unwrap();
+        let out = frame(&mut app);
+        assert_eq!(app.board.outstanding(), 4, "夹具摆的在途没生效");
+        assert!(app.board.seen.is_empty(), "两格还在飞就建账：会把「还没结论」那一版签进账本");
+        assert_eq!(board_dots(&out).len(), 0, "首访、结论还在飞的时候就把每条都标成「有新动静」");
+        // ② 四笔结论落齐 → 这一趟走完，才建账。
+        for n in [12u32, 13] {
+            let sha = format!("{n:0>7}");
+            let ms = if n == 12 { "clean" } else { "blocked" };
+            app.tx
+                .send(Msg::PrDetail { seq: 2, number: n, sha: sha.clone(), r: Ok(ms.to_owned()) })
+                .unwrap();
+            app.tx
+                .send(Msg::PrChecks { seq: 2, number: n, sha, r: Ok(Ci::Passed { total: 3 }) })
+                .unwrap();
+        }
+        let out = frame(&mut app);
+        assert_eq!(app.board.outstanding(), 0, "结论都落地了还占着在途，建账永远等不到");
+        assert_eq!(app.board.seen.len(), 2, "首次打开没把这两行进账（下次进来会整栏都亮）");
+        assert!(app.board.seeding, "进账之后这一趟还该标记成「第一次看」，直到关栏");
+        assert_eq!(board_dots(&out).len(), 0, "第一次看就把每条都标成「有新动静」");
+        // 关掉再打开 = `seeding` 结束（见 `land` 里那一支）：账本对得上，还是不该有蓝点。
+        app.board.seeding = false;
+        let out = frame(&mut app);
+        assert_eq!(board_dots(&out).len(), 0, "切走再回来，看过的那两条又亮了");
+        // ③ 真的动一次：签名换了才亮。
+        let sha = app.board.prs[0].head_sha.clone();
+        app.tx
+            .send(Msg::PrChecks { seq: 2, number: 12, sha, r: Ok(Ci::Passed { total: 7 }) })
+            .unwrap();
+        let out = frame(&mut app);
+        assert_eq!(board_dots(&out).len(), 1, "CI 换了汇总没点亮蓝点（签名白换了）");
+    }
+
+    /// 详情回 `unknown`（GitHub 那一格是后台补的，实测第一次常常就是它）不当结论落地：
+    /// 排一次到点重问，**试够两次**才认下来。
+    /// 少了这一条，那一行会挂着「还没算出来」直到用户手动刷新；上限是为了 CI 永远在跑的
+    /// 仓库不会把这一格变成无休止的重发。
+    #[test]
+    fn an_unknown_mergeable_state_is_asked_again_before_it_becomes_the_answer() {
+        let mut app = board_fix(vec![pr(12, "那一版", "")]);
+        app.board_seq = 5;
+        let sha = app.board.prs[0].head_sha.clone();
+        let key = (12u32, sha.clone());
+        app.board.asked.insert((key.clone(), Ask::Detail));
+        let send = |app: &mut Gitx, ms: &str| {
+            app.tx
+                .send(Msg::PrDetail { seq: 5, number: 12, sha: sha.clone(), r: Ok(ms.to_owned()) })
+                .unwrap();
+        };
+        send(&mut app, "unknown");
+        // 把 egui 时钟拨到 100s：排的那一时刻该是「这一帧 + `DETAIL_RETRY_SECS`」。
+        // 写成当帧（`Some(now)`）的话下一帧就重发，这一格变成每帧一次的循环。
+        frame_at_time(&mut app, 100.0);
+        let f = app.board.facts.get(&key).expect("这一笔该进缓存");
+        assert!(f.detail.is_none(), "`unknown` 被当成结论落地了：这一行再也不会被看一眼");
+        assert!(f.retry_at.is_some(), "没排到点重问");
+        assert_eq!(f.detail_tries, 0, "一笔都还没重问，计数就动了");
+        let at = f.retry_at.unwrap();
+        assert!(
+            (at - (100.0 + DETAIL_RETRY_SECS)).abs() < 0.001,
+            "重问排在 {at}，不是「这帧的 100 + 间隔 {DETAIL_RETRY_SECS}」"
+        );
+        // 没到点：不许偷跑。
+        assert_eq!(app.retry_unknown_details(at - 0.1), Some(at), "没到点却没给出下一次到点");
+        assert!(app.board.asked.contains(&(key.clone(), Ask::Detail)), "没到点就把这一格放开重发了");
+        // 到点：摘账 + 记一次，重发交给 `enrich_rows`（它只补看得见的行）。
+        assert_eq!(app.retry_unknown_details(at + 0.1), None, "到点之后还挂着一个待排的重问");
+        assert_eq!(app.board.facts[&key].detail_tries, 1, "重问没记账");
+        assert!(!app.board.asked.contains(&(key.clone(), Ask::Detail)), "到点重问却没摘在途账，enrich 不会重发");
+        // 第二笔还是 `unknown`：还能再排一次（上限 2）。
+        app.board.asked.insert((key.clone(), Ask::Detail));
+        send(&mut app, "unknown");
+        frame(&mut app);
+        assert!(app.board.facts[&key].retry_at.is_some(), "第二次 `unknown` 就该放弃重问了（上限是两次）");
+        let at = app.board.facts[&key].retry_at.unwrap();
+        app.retry_unknown_details(at + 0.1);
+        app.board.asked.insert((key.clone(), Ask::Detail));
+        send(&mut app, "unknown");
+        frame(&mut app);
+        let f = &app.board.facts[&key];
+        assert_eq!(f.detail.as_deref(), Some("unknown"), "试够两次之后要把 `unknown` 认下来，让状态那句老实说「还没算出来」");
+        assert_eq!(app.retry_unknown_details(at + 1.0), None, "认下来之后还排着第三次重问");
+        // 上限那一挡自己也要问得出：账上同时挂着「到点时刻」和「已经试够」时，
+        // 既不摘账（= 不会再发一次），也不把这一格排进下一次重绘（否则静止的窗口每 4 秒醒一次，永远不停）。
+        let spent = (13u32, "0000013".to_owned());
+        app.board.prs.push(pr(13, "另一条", ""));
+        let f = app.board.facts.entry(spent.clone()).or_default();
+        f.detail_tries = DETAIL_RETRY_MAX;
+        f.retry_at = Some(7.0);
+        app.board.asked.insert((spent.clone(), Ask::Detail));
+        assert_eq!(app.retry_unknown_details(8.0), None, "试够的那一笔还排着下一次重绘");
+        assert_eq!(app.board.facts[&spent].detail_tries, DETAIL_RETRY_MAX, "试够的那一笔又被记了一次");
+        assert!(
+            app.board.asked.contains(&(spent.clone(), Ask::Detail)),
+            "试够的那一笔被摘了账：下一帧 `enrich_rows` 会再发一次，无休止"
+        );
+    }
+
+    /// 「等 4 秒再问」得真的有人上闹钟：没有那句 `request_repaint_after`，静止的窗口不会
+    /// 自己醒来，用户不动鼠标这一行就永远停在「还没算出来」。egui 的 repaint observer
+    /// 量得到这条命令，无头门禁不必真等 4 秒（也不会真的弹浏览器那一类副作用）。
+    #[test]
+    fn the_scheduled_reask_arms_a_wakeup() {
+        let mut app = board_fix(vec![pr(12, "那一版", "")]);
+        app.board_seq = 5;
+        let sha = app.board.prs[0].head_sha.clone();
+        app.board.asked.insert(((12u32, sha.clone()), Ask::Detail));
+        let ctx = egui::Context::default();
+        style(&ctx);
+        let delays: std::sync::Arc<std::sync::Mutex<Vec<f64>>> = std::sync::Arc::default();
+        {
+            let d = delays.clone();
+            ctx.set_repaint_observer(move |info| d.lock().unwrap().push(info.delay.as_secs_f64()));
+        }
+        let mut input = raw_input(Vec::new());
+        input.time = Some(100.0);
+        app.tx
+            .send(Msg::PrDetail { seq: 5, number: 12, sha, r: Ok("unknown".to_owned()) })
+            .unwrap();
+        let mut out = ctx.run_ui(input, |ui| app.shell(ui));
+        out.textures_delta.clear();
+        let ds = delays.lock().unwrap().clone();
+        assert!(
+            ds.iter().any(|s| (s - DETAIL_RETRY_SECS).abs() < 0.01),
+            "重问没上闹钟（看到的重绘延迟：{ds:?}）——静止的窗口不会自己醒来"
+        );
+    }
+
+    /// 「按刷新」之后列表是新的（那两格空着），但 `(号, sha)` 的缓存还有效 → 落地那一刻
+    /// 就涂回去（`Msg::PullRequests` 那一段调的 `apply_facts`）：同一版提交不该被再问第二遍。
+    /// 反半边：sha 变了就不涂 —— 那是另一版提交，旧结论对它没有任何意义。
+    /// 走的是**真回复**而不是直接叫 `apply_facts`，否则「列表落地忘了涂」这一变异没人红。
+    #[test]
+    fn the_facts_cache_is_repainted_on_a_refresh_and_dropped_when_the_sha_moves() {
+        let mut app = board_fix(Vec::new());
+        app.board_seq = 6;
+        let mut one = pr(12, "同一版", "");
+        one.head_sha = "aaaaaaaa".to_owned();
+        let mut two = pr(13, "换了版", "");
+        two.head_sha = "bbbbbbbb".to_owned();
+        app.board.facts.insert(
+            (12, "aaaaaaaa".to_owned()),
+            RowFacts {
+                detail: Some("clean".to_owned()),
+                checks: Some(Ci::Passed { total: 2 }),
+                ..Default::default()
+            },
+        );
+        // 上一版提交的那条缓存：号一样、sha 不一样 → 谁都不许涂。
+        app.board.facts.insert(
+            (13, "上一版".to_owned()),
+            RowFacts { detail: Some("dirty".to_owned()), ..Default::default() },
+        );
+        app.tx.send(board_reply(6, vec![one, two])).unwrap();
+        frame(&mut app);
+        assert_eq!(app.board.prs[0].mergeable_state, "clean", "刷新之后缓存没涂回同一版那一行");
+        assert!(matches!(app.board.prs[0].ci, Ci::Passed { total: 2 }), "缓存里的检查汇总没涂回去");
+        assert_eq!(app.board.prs[1].mergeable_state, "", "sha 不同的那一行被同一本缓存串到了");
+    }
+
+    /// 声明了这两格、却**拼不出请求**的一家（`NoUrl` 就是它）：状态列不许因此卡在
+    /// 「正在看它卡在哪」—— 没有东西在飞，那句就是骗人。
+    /// 这条同时钉住「拼不出请求 = 这一行永远不会有结果，记成已经回过了」那一段。
+    #[test]
+    fn a_provider_that_cannot_build_the_request_says_not_computed_instead_of_waiting() {
+        let mut app = board_fix(vec![pr(12, "那一版", "blocked")]);
+        with_no_url(&mut app);
+        let out = frame(&mut app);
+        let f = app.board.facts.get(&(12, app.board.prs[0].head_sha.clone())).expect("问过的行要留痕");
+        assert_eq!(f.detail.as_deref(), Some(""), "拼不出请求却没记成「回过了」：下一帧又拼一次");
+        assert!(matches!(f.checks, Some(Ci::Unknown)), "检查那一格也一样");
+        assert!(!app.board.row_fetching(&app.board.prs[0].clone()), "压根没在飞却说「正在看它卡在哪」");
+        let words: Vec<String> = side_texts(&out).into_iter().map(|(s, _)| s).collect();
+        assert!(
+            words.iter().any(|s| s.contains("状态还没算出来")),
+            "这一行该老实说「还没算出来」：{words:?}"
+        );
+    }
+
+    /// 没绑令牌 = 一行都不问，而且**不许**把「拼不出请求」记成「这一行取过了」：
+    /// 用户回头绑上令牌、按一下刷新，那些行还得能被补。
+    /// 和 `fetch_board` 同一条规矩（原因当场写在栏上、不转圈到超时）。
+    /// 这一条问的是记在 `board.error` 上那句 —— 有行的时候栏上画的是行，不是这行原因，
+    /// 而「有行又没令牌」只在令牌被撤掉之后出现，那一句该去的是提示带。
+    #[test]
+    fn without_a_token_not_a_single_row_is_asked() {
+        let mut app = board_fix(vec![pr(12, "那一版", "blocked")]);
+        frame(&mut app);
+        assert!(
+            app.board.facts.is_empty(),
+            "没令牌也把行进过补取账（绑上之后那些行永久 blank）"
+        );
+        assert!(app.board.asked.is_empty(), "没令牌也把在途账占了：那一行会一直说「正在看」");
+        let why = app.board.error.clone().unwrap_or_default();
+        assert!(why.contains("未绑定"), "没令牌这件事没被记下来：{why:?}");
+    }
+
+    /// 一次刷屏最多补 `ENRICH_IN_FLIGHT` 行，剩下的等下一帧。
+    /// 不限并发 = 用户滚一下就把带宽和平台的速率预算一次打爆，而这一栏的第一承诺是「快」。
+    #[test]
+    fn the_extra_fetch_caps_how_many_rows_are_in_flight_at_once() {
+        let rows: Vec<PullRequest> = (1..=12).map(|n| pr(n, &format!("行{n}"), "")).collect();
+        let mut app = board_fix(rows);
+        with_no_url(&mut app);
+        // 先把额度占满：六格「发出去了、还没回来」（sha 就是夹具给那一行的，键对得上）。
+        for n in 1..=6u32 {
+            app.board.asked.insert(((n, format!("{n:0>7}")), Ask::Detail));
+        }
+        frame(&mut app);
+        assert!(app.board.facts.is_empty(), "额度还满着就继续补下一行：一次刷屏把并发打满");
+        // 腾出额度（这一帧起它就该往下补）。
+        app.board.asked.clear();
+        frame(&mut app);
+        assert!(!app.board.facts.is_empty(), "腾出额度之后一行都没补");
+    }
+
+    /// 状态那一句的**颜色**按挡路的事走（§原则①「颜色只给状态和层级，不装饰」）：
+    /// 冲突=红、可以合=绿、被拦=墨蓝、真挂了的检查=黄、不挡路的/不急着办的=更灰、认不出=次要灰。
+    /// 这几档是自拍（spec 没给哪档配哪枚色），登记在 DESIGN §7；判据按**每一档各一**问，
+    /// 只验「红的那条是红」会被「所有状态都染红」这种变异放过。
+    ///
+    /// 状态现在由**两轴**拼出来（检查 × 平台的合并格），所以这里每一行都要把 `ci`
+    /// 摆成那一档要求的形状：只改 `mergeable_state` 已经点不到 CI 那几档了。
+    /// 九行是这块画布量得到的上限：`WIN_H 545` 扣掉顶栏、状态带和筛选框，第十行的那半格
+    /// 已经出界（它进了补取名单，见 `only_the_rows_inside_the_viewport_enter_the_extra_fetch`，
+    /// 但那一句字没画在窗口里，`side_galley` 就找不到它）。
+    /// 剩下四档（`已合并 / 已关闭 / 还没有检查 / 正在看`）在
+    /// `the_quiet_statuses_are_all_secondary_grey`，旁证那一句在
+    /// `a_failure_sharing_its_job_name_with_another_row_says_so`。
+    #[test]
+    fn the_status_line_is_coloured_by_what_blocks_it() {
+        let mut draft = pr(6, "己己", "clean");
+        draft.draft = true;
+        let mut ready = pr(2, "乙乙", "clean");
+        ready.ci = Ci::Passed { total: 3 };
+        let mut review = pr(3, "丙丙", "blocked");
+        review.ci = Ci::Passed { total: 2 };
+        let mut broke = pr(4, "丁丁", "");
+        broke.ci = Ci::Failed { failed: vec!["cargo test".to_owned(), "clippy".to_owned()] };
+        let mut behind = pr(8, "辛辛", "behind");
+        behind.ci = Ci::Passed { total: 1 };
+        let mut running = pr(10, "癸癸", "");
+        running.ci = Ci::Running { passed: 1, failed: 0, pending: 2 };
+        let mut warned = pr(11, "甲一", "unstable");
+        warned.ci = Ci::Failed { failed: vec!["e2e".to_owned()] };
+        let mut app = board_fix(vec![
+            pr(1, "甲甲", "dirty"),
+            ready,
+            review,
+            broke,
+            pr(5, "戊戊", ""),
+            draft,
+            behind,
+            running,
+            warned,
+        ]);
+        let out = frame(&mut app);
+        for (status, want) in [
+            ("有冲突 · 需要作者处理", DANGER),
+            ("可以合并", ADD_FG),
+            ("等待评审", ACCENT_INK),
+            ("2 个检查没通过", WARN_FG),
+            ("状态还没算出来", TEXT_SECONDARY),
+            ("草稿 · 作者还没准备好", TEXT_MUTED),
+            ("落后于目标分支 · 先更新", ACCENT_INK),
+            ("CI 正在跑", TEXT_SECONDARY),
+            ("1 个检查没过 · 但不挡合并", TEXT_MUTED),
+        ] {
+            let (got, ..) = side_galley(&out, status);
+            assert_eq!(got, want, "状态那句「{status}」的颜色没按挡路的事走");
+        }
+    }
+
+    /// 剩下四档都是**不挡路**的事 → 一律次要灰：`已合并`、`已关闭`、
+    /// 「最新提交上还没有检查」，还有「正在看它卡在哪」—— 最后那一档额外要一枚
+    /// **真的在飞**的补充请求（`asked` 里有、`facts` 里还没结出结果）。
+    /// 不这么摆就会把「压根没去取」画成「正在取」：那一句是给 Gitee 那种不给
+    /// 详情端点的一家准备的，对它说「正在看」是骗人。
+    #[test]
+    fn the_quiet_statuses_are_all_secondary_grey() {
+        let mut merged = pr(2, "乙乙", "clean");
+        merged.state = "merged".to_owned();
+        let mut closed = pr(3, "丙丙", "dirty");
+        closed.state = "closed".to_owned();
+        let mut bare = pr(9, "壬壬", "");
+        bare.ci = Ci::NoChecks;
+        let waiting = pr(12, "甲二", "blocked");
+        let mut app = board_fix(vec![merged, closed, bare, waiting.clone()]);
+        app.board.asked.insert(((12, waiting.head_sha.clone()), Ask::Detail));
+        let out = frame(&mut app);
+        for status in ["已合并", "已关闭", "最新提交上还没有检查", "正在看它卡在哪"] {
+            let (got, ..) = side_galley(&out, status);
+            assert_eq!(got, TEXT_SECONDARY, "不挡路的那句被染成了要办的事：{status}");
+        }
+        // 「blocked」在没有检查时**不许**说成「等待评审」：万一是检查挡着呢，
+        // 这句把活派给了错的人。上面那一行画的是「正在看」，不是这一句。
+        let words: Vec<String> = side_texts(&out).into_iter().map(|(s, _)| s).collect();
+        assert!(!words.iter().any(|s| s.contains("等待评审")), "{words:?}");
+    }
+
+    /// 旁证：同一个 job 在**别条 PR** 上也挂着 → 那句改口成「在别的 PR 上也挂」，
+    /// 颜色从黄退成更灰（一件不必急着办的事不该报警）。
+    /// 反半边问两次：①别行**还没取到检查**（沉默不是绿）；②别行红着但挂的是**另一个 job**
+    /// （名字对不上不算同一件事）。②是这一批补的：只摆「别行也红」的话，
+    /// 把名字比对删掉判据照样全绿。
+    #[test]
+    fn a_failure_sharing_its_job_name_with_another_row_says_so() {
+        let mut one = pr(1, "甲甲", "");
+        one.ci = Ci::Failed { failed: vec!["cargo test".to_owned()] };
+        let mut two = pr(2, "乙乙", "");
+        two.ci = Ci::Failed { failed: vec!["cargo test".to_owned(), "clippy".to_owned()] };
+        let mut app = board_fix(vec![one, two]);
+        assert!(app.board.failing_elsewhere(1), "同名的失败在别条 PR 上挂着却没算成旁证");
+        assert!(app.board.failing_elsewhere(2), "反方向也一样，旁证不该只朝一条数");
+        let out = frame(&mut app);
+        let (shared, ..) = side_galley(&out, "1 个失败 · 在别的 PR 上也挂");
+        assert_eq!(shared, TEXT_MUTED, "「大概与本次改动无关」那句还在报警");
+
+        let mut lone = pr(3, "丙丙", "");
+        lone.ci = Ci::Failed { failed: vec!["只有它有".to_owned()] };
+        let mut quiet = pr(4, "丁丁", "");
+        quiet.ci = Ci::NotFetched;
+        let mut solo = board_fix(vec![lone, quiet]);
+        assert!(!solo.board.failing_elsewhere(3), "别条 PR 压根没挂这个 job，旁证却成了");
+        let words: Vec<String> = side_texts(&frame(&mut solo)).into_iter().map(|(s, _)| s).collect();
+        assert!(
+            words.iter().any(|s| s.starts_with("1 个检查没通过")),
+            "没有旁证时该只报几个没过：{words:?}"
+        );
+        assert!(
+            !words.iter().any(|s| s.contains("在别的 PR 上也挂")),
+            "没有旁证却说了「在别的 PR 上也挂」"
+        );
+
+        // 反半边二：别行也红着，但挂的是**另一个 job** → 不算旁证。
+        // 少了这一段，「同名才算」那半其实被「别行也是红的」顶替了
+        // ——把名字比对删掉，上面那些判据照样全绿（这一批实测到的假绿）。
+        let mut ours = pr(5, "戊戊", "");
+        ours.ci = Ci::Failed { failed: vec!["cargo test".to_owned()] };
+        let mut other_job = pr(6, "己己", "");
+        other_job.ci = Ci::Failed { failed: vec!["clippy".to_owned()] };
+        let mut unlike = board_fix(vec![ours, other_job]);
+        assert!(
+            !unlike.board.failing_elsewhere(5),
+            "别行挂的是另一个 job，名字都对不上就算成了旁证"
+        );
+        let words: Vec<String> = side_texts(&frame(&mut unlike)).into_iter().map(|(s, _)| s).collect();
+        assert!(
+            !words.iter().any(|s| s.contains("在别的 PR 上也挂")),
+            "不同名的两行红着也说成了「大概无关」：{words:?}"
+        );
+    }
+
+    /// 「这一栏一行都没有」是四件不同的事，各说各的一句。摆那三位旗子就够了，
+    /// 所以这里直接开板子（`host` 用真 `GitHub`，不走 `show_board` —— 那条通路会起线程）。
+    fn empty_board(fetching: bool, loaded: bool, error: Option<&str>) -> Vec<String> {
+        let mut app = remote_branches(0);
+        app.board_open = true;
+        app.board.host = Some(&gitx::provider::GitHub);
+        app.board.fetching = fetching;
+        app.board.loaded = loaded;
+        app.board.error = error.map(str::to_owned);
+        side_texts(&frame(&mut app)).into_iter().map(|(s, _)| s).collect()
+    }
+
+    #[test]
+    fn an_empty_board_says_which_kind_of_empty_it_is() {
+        let flying = empty_board(true, false, None);
+        assert!(flying.iter().any(|s| s.contains("正在取")), "在飞的那一帧没写「正在取」：{flying:?}");
+        assert!(
+            !flying.iter().any(|s| s.contains("没有开放的 PR")),
+            "请求还在飞就宣布「没有开放的 PR」"
+        );
+        let none = empty_board(false, true, None);
+        assert!(none.iter().any(|s| s.contains("没有开放的 PR")), "取回来是空的却没这么写：{none:?}");
+        let not_yet = empty_board(false, false, None);
+        assert!(not_yet.iter().any(|s| s.contains("还没有取")), "一次都没取过却写成空列表：{not_yet:?}");
+        let bad = empty_board(false, true, Some("GitHub：401 Bad credentials"));
+        assert!(bad.iter().any(|s| s.contains("401 Bad credentials")), "失败那一档没把原因写出来：{bad:?}");
+    }
+
+    /// 「刷新」那枚按钮得真的重跑一次取数，不能只是把上一帧的牌子按一下。
+    /// 夹具**不给令牌**，于是 `fetch_board` 在拼请求那一步就提前 return（不起线程、不连网），
+    /// 但它会把 `error` 换成**这一轮**的原因——上一轮那句旧错还挂在栏上就是没重跑。
+    #[test]
+    fn the_refresh_button_reissues_the_fetch() {
+        let mut app = remote_branches(0);
+        app.board_open = true;
+        app.board.host = Some(&gitx::provider::GitHub);
+        app.board.repo_ref = gitx::provider::parse_remote("git@github.com:acme/app.git");
+        app.board.loaded = true;
+        app.board.error = Some("上一次留下的旧错".to_owned());
+        assert!(click_text_exact(&mut app, "刷新"), "看板栏里没有「刷新」那枚按钮");
+        let words: Vec<String> = side_texts(&frame(&mut app)).into_iter().map(|(s, _)| s).collect();
+        assert!(
+            words.iter().any(|s| s.contains("未绑定 GitHub token")),
+            "按了刷新却没换成本轮的原因：{words:?}"
+        );
+        assert!(
+            !words.iter().any(|s| s.contains("上一次留下的旧错")),
+            "栏上还挂着上一轮的旧错：这一轮根本没跑过"
+        );
+    }
+
+    /// 设置卡「代码托管」那一页只给**声明了 PR 能力**的 provider 摆令牌格（Codeup 声明零能力，
+    /// 给它一格输入框 = 留一格按下去没反应的空壳）。填进去的要三处都认账：屏上那句换成
+    /// 「已绑定」、`app.provider_tokens` 里有、库里读得回来（下次启动还是绑着的）。
+    #[test]
+    fn the_hosting_page_gives_a_token_box_only_to_providers_that_can_pr() {
+        let db_file = temp_db("hosting");
+        let mut app = loaded();
+        app.conn = Some(db::open(db_file.to_str().unwrap()).expect("临时库"));
+        assert!(click_tool(&mut app, 10), "设置那一枚按钮没点到");
+        assert!(click_card(&mut app, "代码托管"), "偏好卡上没有「代码托管」那一页");
+        assert!(card_has(&mut app, "GitHub 访问令牌"), "GitHub 那一格没摆出来");
+        assert!(card_has(&mut app, "Gitee 访问令牌"), "Gitee 那一格没摆出来");
+        // 「这一格不该在」不能只按名字问：上一版断的是 `Codeup`，可它的 `label()` 写的是
+        // 「阿里云 Codeup」——前缀匹配永远撞不上，删掉能力过滤这一变异照样绿（假绿）。
+        // 改成数**总共有几格**：两格才是「只给能做的两家」。
+        let boxes = warm_frame(&mut app);
+        let boxes: Vec<String> = texts(&boxes)
+            .into_iter()
+            .map(|(s, _)| s)
+            .filter(|s| s.contains("访问令牌"))
+            .collect();
+        assert_eq!(boxes.len(), 2, "令牌格不是两格（只该给声明了 PR 能力的 provider）：{boxes:?}");
+        assert!(
+            !boxes.iter().any(|s| s.starts_with("阿里云")),
+            "声明零能力的阿里云 Codeup 也占了一格：那是个按下去没反应的壳"
+        );
+        assert!(card_has(&mut app, "未绑定"), "一格都没填时没写「未绑定」");
+        assert!(type_into_card(&mut app, "GitHub 访问令牌", "tok-gh"), "那一格点不进去");
+        frame(&mut app);
+        assert_eq!(
+            app.provider_tokens
+                .iter()
+                .find(|(id, _)| id == "github")
+                .map(|(_, t)| t.as_str()),
+            Some("tok-gh"),
+            "屏上填了却没回到 app 上（看板那边读的就是这一份）"
+        );
+        assert!(card_has(&mut app, "已绑定 · 只存本机"), "填完令牌那句说明没换成「已绑定」");
+        assert_eq!(
+            Prefs::load(app.conn.as_ref()).token("github"),
+            "tok-gh",
+            "没落库：下次启动又是「未绑定」"
+        );
+        // 关卡再开一次：卡上那一份初值是从 `app.prefs()` 端上去的，`prefs()` 漏了 tokens 这一条
+        // 的话，第二次进来写着「未绑定」——数据其实还在（上面三条全绿），屏上却在说谎。
+        press(&mut app, egui::Key::Escape);
+        assert!(click_tool(&mut app, 10), "第二次点设置没点到");
+        assert!(click_card(&mut app, "代码托管"), "第二次进来没有「代码托管」那一页");
+        assert!(
+            card_has(&mut app, "已绑定 · 只存本机"),
+            "重开设置卡却写着「未绑定」：`prefs()` 那份初值漏了令牌这一条"
+        );
+        let _ = std::fs::remove_file(&db_file);
+    }
+
+    /// 「看过」那本账落在库里的**那一本**上：换 app、同一份库，蓝点不该重新亮起来。
+    /// 第二次进来走的是真通路 `show_board()`，但**不给令牌**——它在 `fetch_board` 里提前
+    /// return，不起线程，于是「认 provider + 读回看过」这两步能无头跑完。
+    #[test]
+    fn the_board_reads_the_already_seen_marks_back_out_of_the_database() {
+        let db_dir = std::env::temp_dir().join(format!("gitx-board-seen-{}", std::process::id()));
+        std::fs::create_dir_all(&db_dir).expect("临时目录");
+        let db_file = db_dir.join("gate.db");
+        let mut app = board_fix(vec![pr(12, "看过那条", "clean")]);
+        app.conn = Some(db::open(db_file.to_str().unwrap()).expect("临时库"));
+        let ctx = egui::Context::default();
+        style(&ctx);
+        let at = locate(&ctx, &mut app, "#12 看过那条").expect("看板栏里没有那条 PR");
+        click_at(&ctx, &mut app, at);
+        let key = app.board.seen_key().expect("夹具认得出 GitHub");
+        let saved = db::get_setting(app.conn.as_ref().unwrap(), &key)
+            .expect("读库里那条记录")
+            .expect("库里根本没有那个键：点一条 PR 之后没写回「看过」");
+        assert!(saved.contains("\"12\""), "点过之后库里没有那条 PR 的记录：{saved}");
+
+        let mut again = remote_branches(0);
+        again.conn = Some(db::open(db_file.to_str().unwrap()).expect("临时库"));
+        again.show_board();
+        again.board.prs = vec![pr(12, "看过那条", "clean")];
+        let fresh = again.board.prs[0].clone();
+        assert!(
+            !again.board.is_new(&fresh),
+            "切走再回来，看过的那条又亮了蓝点：「看过」没从库里读回来"
+        );
+        let _ = std::fs::remove_dir_all(&db_dir);
+    }
+
+    /// 一本读不懂的「看过」记录该退成**没看过**，而不是把蓝点永久钉死（同 `flag()` 那条规矩）。
+    /// 顺手钉两件和键名有关的事：
+    /// - provider id 和 `owner/repo` 都得在键里，否则 fork 之间会共用同一本；
+    /// - 换代：值从 `updated_at` 串换成**签名**之后前缀多了那个 2。旧账本里的每一句
+    ///   都对不上任何新签名，逐条比会把每一条都判成「动过」= 一进来满屏蓝点，
+    ///   而那正是「切走再回来不该满屏蓝点」要防的事。换代要的是**整本作废**，
+    ///   所以这里同时塞一份**能读懂**的 v1 记录：读了它判据就红。
+    #[test]
+    fn a_mangled_seen_record_falls_back_to_nothing_seen() {
+        let db_dir = std::env::temp_dir().join(format!("gitx-board-mangled-{}", std::process::id()));
+        std::fs::create_dir_all(&db_dir).expect("临时目录");
+        let db_file = db_dir.join("gate.db");
+        {
+            let seed = db::open(db_file.to_str().unwrap()).expect("临时库");
+            // 换代前那一本：格式完全读得懂，但它是按 `updated_at` 记账的。
+            db::set_setting(&seed, "pr_seen_github_acme_app", r#"{"12":"2026-10-20T01:00:00Z"}"#)
+                .expect("塞一份旧账本");
+            // 换代后的这一本：读不懂 → 当没看过。
+            db::set_setting(&seed, "pr_seen2_github_acme_app", "{ 这不是 JSON").expect("塞一段坏记录");
+        }
+        let mut app = remote_branches(0);
+        app.conn = Some(db::open(db_file.to_str().unwrap()).expect("临时库"));
+        app.show_board();
+        assert_eq!(
+            app.board.seen_key(),
+            Some("pr_seen2_github_acme_app".to_owned()),
+            "「看过」那本账的键名不对：provider id 和 owner/repo 都得在键里（否则 fork 共用一本），\
+             签名换代还得换代前缀（否则旧账本逐条误判成「动过」）"
+        );
+        let one = pr(12, "甲乙", "clean");
+        app.board.prs = vec![one.clone()];
+        assert!(app.board.is_new(&one), "读不懂的「看过」记录把蓝点钉死了（该当没看过）");
+        let _ = std::fs::remove_dir_all(&db_dir);
+    }
+
+    /// 底置筛选框在看板档筛的是**这一栏**：留下的行还在、被滤掉的整行（连状态那句）都不在。
+    /// 后半条问的是「筛过之后点一行，开的还是它自己那条 PR」——行上带的必须是原始下标，
+    /// 按筛完的位置取就会开到别条。
+    #[test]
+    fn the_sidebar_filter_narrows_the_board_and_rows_keep_their_own_pr() {
+        let mut app = board_fix(vec![pr(12, "冲突那条", "dirty"), pr(13, "可以合那条", "clean")]);
+        app.side_filter = "可以合".to_owned();
+        let words: Vec<String> = side_texts(&frame(&mut app)).into_iter().map(|(s, _)| s).collect();
+        assert!(words.iter().any(|s| s.starts_with("#13")), "筛完连该留的那行都没了：{words:?}");
+        assert!(!words.iter().any(|s| s.starts_with("#12")), "滤掉的 #12 还挂在栏上");
+        assert!(
+            !words.iter().any(|s| s.contains("有冲突 · 需要作者处理")),
+            "行没了，它那句状态还在栏里"
+        );
+
+        let ctx = egui::Context::default();
+        style(&ctx);
+        let at = locate(&ctx, &mut app, "#13 可以合那条").expect("筛完之后那行没了");
+        click_at(&ctx, &mut app, at);
+        let mut out = ctx.run_ui(raw_input(Vec::new()), |ui| app.shell(ui));
+        out.textures_delta.clear();
+        let urls: Vec<String> = out
+            .platform_output
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                egui::OutputCommand::OpenUrl(u) => Some(u.url.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            urls,
+            vec!["https://github.com/acme/app/pull/13".to_owned()],
+            "筛过之后点 #13 开的却是别的 PR：行上带的不是原始下标"
+        );
+    }
+
+    // ------------------------------------------------------------ 双语判据（S7-a）
+
+    /// 一帧里画出的**每一段**文字，按 section 切。
+    ///
+    /// 不用现成的 `texts()`（一整块 galley）：一行里常常「外壳的文案 + 仓库的内容」排在
+    /// 一起（hunk 头、带路径的按钮标题、状态那句）。整块去判「有没有汉字」就会把数据算成
+    /// 漏翻——判据要么当场假红，要么被人一路加白名单加到最后什么都不红。
+    fn painted_sections(out: &egui::FullOutput) -> Vec<String> {
+        let mut v = Vec::new();
+        for shape in &out.shapes {
+            let egui::Shape::Text(t) = &shape.shape else { continue };
+            for s in &t.galley.job.sections {
+                let r = s.byte_range.start.0..s.byte_range.end.0;
+                v.push(t.galley.job.text[r].to_owned());
+            }
+        }
+        v
+    }
+
+    /// 英文档**允许**画出来的汉字，整段相等才算：语言选择器里那枚选项写的是它的母语名
+    /// （翻成 "Chinese" 反而让不会英文的人找不到切回去的那格）。
+    /// 用相等而不是包含——漏翻那句只要夹着别的字，就照样红。
+    const EN_ALLOWED_HAN: [&str; 1] = ["中文"];
+
+    fn han_hits(out: &egui::FullOutput, where_: &str) -> Vec<String> {
+        painted_sections(out)
+            .into_iter()
+            .filter(|s| gitx::lang::has_han(s) && !EN_ALLOWED_HAN.contains(&s.trim()))
+            .map(|s| format!("{where_} → {s:?}"))
+            .collect()
+    }
+
+    /// 要扫的每一帧 = 人真会看到的一屏，不是为判据编出来的状态：首页、空态、日志/文件/差异、
+    /// 层级序那一档、分离 HEAD + 进行中的合并 + 冲突文件、某条提交的改动列表、侧栏（远端展开
+    /// + 贮藏 + 标签）、搜索、文件历史浮层、看板（十档状态 + 四种「一栏没有东西」），
+    /// 以及**每一张模态卡**（设置的四个页签、添加仓库的三个档、十张确认卡各一张）。
+    ///
+    /// 数据一律 ASCII（`filled_en` 那段理由），所以这一批帧里落下的汉字只可能是外壳自己的话。
+    /// 在 EN 档位上构建 = 快照里那些**缓存下来的文案**（药丸、日期）也是英文，正是判据要的。
+    fn en_states() -> Vec<(String, Gitx)> {
+        let mut v: Vec<(String, Gitx)> = Vec::new();
+        let mut push = |name: &str, app: Gitx| v.push((name.to_owned(), app));
+
+        // ---- 首页（书签列表 + 托管那几枚）与没开仓库的空态
+        {
+            let mut home = blank();
+            home.home = true;
+            home.repos = vec![Repo {
+                id: None,
+                path: "/fixture/alpha".to_owned(),
+                name: "alpha".to_owned(),
+                added_at: None,
+                last_fetched_at: None,
+                group_name: "work".to_owned(),
+            }];
+            push("首页", home);
+        }
+        push("空仓库视图", blank());
+
+        // ---- 手上没有仓库时按工具条那三枚：三句「先说什么」的提示，走的是 note 那条通路
+        // （不动 git、不开浏览器、不起 HTTP），文案由外壳现拼，所以扫得着。
+        for i in 0..3 {
+            let mut app = blank();
+            click_tool(&mut app, i);
+            push(&format!("没有仓库时按工具条第 {i} 枚"), app);
+        }
+
+        // ---- 主视图：日志 + 文件表 + 差异（hunk 头、行号栏、底部暂存带都在这一帧里）
+        push("日志 / 文件 / 差异", loaded_en());
+        {
+            let mut app = loaded_en();
+            app.topo = true;
+            push("日志（层级序那一档）", app);
+        }
+
+        // ---- 分离 HEAD + 进行中的合并 + 一条未合并文件：状态行、横幅、冲突那一组
+        {
+            let mut app = loaded_en();
+            let snap = app.snap.as_mut().expect("loaded_en 造好了快照");
+            snap.status.detached_at = Some("a0001".to_owned());
+            snap.status.repo_state = "merge".to_owned();
+            snap.status.files.push(FileStatus {
+                path: "src/conflict.rs".to_owned(),
+                old_path: None,
+                index_status: ChangeStatus::Unmerged,
+                worktree_status: ChangeStatus::Unmerged,
+                staged: false,
+            });
+            push("分离 HEAD + 合并中 + 冲突", app);
+        }
+
+        // ---- 选中某条提交：那一栏没有方框，走的是第二条画字通路
+        {
+            let mut app = loaded_en();
+            app.sel = Sel::Commit(0);
+            app.commit_files = vec![
+                DiffEntry {
+                    path: "src/changed.rs".to_owned(),
+                    old_path: None,
+                    status: ChangeStatus::Modified,
+                    additions: 4,
+                    deletions: 2,
+                },
+                DiffEntry {
+                    path: "docs/added.md".to_owned(),
+                    old_path: None,
+                    status: ChangeStatus::Renamed,
+                    additions: 1,
+                    deletions: 0,
+                },
+            ];
+            push("某条提交的改动列表", app);
+        }
+
+        // ---- 侧栏：远端那一栏点开 + 一条贮藏 + 一个标签（三组标题、计数、空那一组的话）
+        {
+            let mut app = remote_branches_en(4);
+            let snap = app.snap.as_mut().expect("remote_branches_en 造好了快照");
+            snap.stashes.push(Stash {
+                index: 0,
+                oid: "0".repeat(40),
+                message: "keep it warm".to_owned(),
+                date: "2026-10-20T11:41:07+08:00".to_owned(),
+            });
+            snap.tags.push(Tag { name: "v1.0".to_owned(), target: snap.commits[0].id.clone(), annotated: false });
+            let origin = snap.remotes[0].name.clone();
+            app.remote_open = vec![origin];
+            push("侧栏（远端展开 + 贮藏 + 标签）", app);
+        }
+
+        // ---- 搜索面板：那一格输入框 + 命中行（命中是数据，面板的话是外壳的）
+        {
+            let mut app = loaded_en();
+            let (commit, badges, date) = {
+                let snap = app.snap.as_ref().expect("loaded_en 造好了快照");
+                (snap.commits[0].clone(), snap.badges[0].clone(), snap.dates[0].clone())
+            };
+            app.search_open = true;
+            app.search_q = "fix".to_owned();
+            app.search_hits = vec![SearchHit { commit, badges, date }];
+            app.sel = Sel::Search(0);
+            push("搜索面板", app);
+        }
+
+        // ---- 文件历史浮层：三个页签 + 列表（列表里那条的说明是数据）
+        {
+            let mut app = loaded_en();
+            let mut h = FileHistory::new("src/loose.rs".to_owned(), 1);
+            h.entries.push(FileLogEntry {
+                commit: app.snap.as_ref().unwrap().commits[0].clone(),
+                change: ChangeStatus::Modified,
+                old_path: None,
+            });
+            app.history = Some(h);
+            push("文件历史浮层", app);
+        }
+
+        // ---- 看板：十档状态各占一行（一句状态话 + 下一步那枚按钮的有无）
+        {
+            let mut draft = pr(2, "Work in progress", "blocked");
+            draft.draft = true;
+            let mut merged = pr(8, "Already landed", "clean");
+            merged.state = "merged".to_owned();
+            let mut closed = pr(9, "Dropped", "clean");
+            closed.state = "closed".to_owned();
+            let all = vec![
+                pr(1, "Fix the reader", "dirty"),
+                draft,
+                pr(3, "Behind the base", "behind"),
+                pr(4, "Broken checks", "unstable"),
+                pr(5, "Checks warn", "has_warnings"),
+                pr(6, "Waiting on review", "blocked"),
+                pr(7, "Ready to go", "clean"),
+                merged,
+                closed,
+                pr(10, "State not reported", ""),
+            ];
+            push("看板（十档状态）", board_fix_en(all));
+        }
+        // ---- 看板那一格「一行都没有」的四件不同的事
+        for (name, fetching, loaded, error, filter, rows) in [
+            ("看板（请求还在飞）", true, false, None, "", Vec::new()),
+            ("看板（没有开放的 PR）", false, true, None, "", Vec::new()),
+            ("看板（被筛空）", false, true, None, "zzz", vec![pr(1, "Something", "clean")]),
+            ("看板（取失败）", false, false, Some("boom"), "", Vec::new()),
+        ] {
+            let mut app = board_fix_en(rows);
+            app.board.fetching = fetching;
+            app.board.loaded = loaded;
+            app.board.error = error.map(str::to_owned);
+            app.side_filter = filter.to_owned();
+            push(name, app);
+        }
+
+        // ---- 每一张模态卡：标题、说明行、页签、字段标签、主/次按钮、底部那句提示全在这儿。
+        // 卡一律套在**有数据的壳**上画：遮罩后面那一屏也要跟着扫（卡的画字路径分不出深浅，
+        // 但「半张卡翻译了、后面那排药丸没翻译」这种事故只有整屏扫得到）。
+        let prefs_for_push = {
+            let app = loaded_en();
+            app.prefs()
+        };
+        for (name, card) in [
+            ("新建分支卡", Modal::new_branch()),
+            ("从某条提交长出去", Modal::new_branch_at(Some("a0001".to_owned()))),
+            ("贮藏卡", Modal::stash_save()),
+            ("打标签卡", Modal::new_tag("0".repeat(40), "Subject 0".to_owned())),
+            ("重命名分支卡", Modal::rename_branch("main".to_owned())),
+            ("合并卡", Modal::merge(vec!["topic-a".to_owned(), "topic-b".to_owned()])),
+            ("提交卡", Modal::commit("main".to_owned(), 2)),
+            (
+                "推送卡",
+                Modal::push(
+                    vec![PushRow {
+                        local: "main".to_owned(),
+                        remote_name: "main".to_owned(),
+                        has_upstream: true,
+                        picked: true,
+                        track: false,
+                    }],
+                    "origin".to_owned(),
+                    &prefs_for_push,
+                ),
+            ),
+            ("拉取卡", Modal::pull("origin".to_owned(), "main".to_owned(), "main".to_owned())),
+            ("重置卡", Modal::reset("0".repeat(40), "Subject 0".to_owned())),
+            ("添加仓库卡", Modal::add_repo()),
+        ] {
+            let mut app = loaded_en();
+            app.modal = Some(card);
+            push(name, app);
+        }
+
+        // ---- 「添加仓库」那三档各一帧：主输入格问的是三件不同的事，占位文案也就三句。
+        for (i, tab) in [AddTab::Open, AddTab::Clone, AddTab::New].into_iter().enumerate() {
+            let mut card = Modal::add_repo();
+            if let Form::AddRepo { tab: now, .. } = &mut card.form {
+                *now = tab;
+            }
+            let mut app = blank();
+            app.modal = Some(card);
+            push(&format!("添加仓库卡第 {i} 档"), app);
+        }
+
+        // ---- 设置卡四个页签各一帧（语言那一格住在第一页，「代码托管」那页有 provider 名）。
+        for i in 0..4 {
+            let page = [PrefPage::General, PrefPage::Push, PrefPage::Hosting, PrefPage::About][i];
+            let mut card = Modal::settings(loaded_en().prefs(), 2, Some("/fixture/gitx.db".to_owned()));
+            if let Form::Settings { page: now, .. } = &mut card.form {
+                *now = page;
+            }
+            let mut app = loaded_en();
+            app.modal = Some(card);
+            push(&format!("设置卡第 {i} 页"), app);
+        }
+
+        // ---- 十张确认卡：`confirm_of` 那 11 对文案（会丢东西的动作各说一句）。
+        for (name, action) in en_confirm_actions() {
+            let (title, detail) = confirm_of(&action);
+            let mut app = loaded_en();
+            app.modal = Some(Modal::confirm(title, detail, action));
+            push(&name, app);
+        }
+        v
+    }
+
+    /// `confirm_of` 管到的那十一种动作，各来一条**数据全是 ASCII** 的实例。
+    /// 逐条列出来（而不是从 `Action` 里反射）是因为 git 会真的动那本仓库的名字都得写死：
+    /// 这些字符串本身就该是英文档画面上唯一可能出现的内容文字。
+    fn en_confirm_actions() -> Vec<(String, Action)> {
+        let path = "src/loose.rs".to_owned();
+        let oid = "0".repeat(40);
+        let cases: Vec<(String, Action)> = vec![
+            ("删除分支那张".to_owned(), Action::DeleteBranch("topic-a".to_owned())),
+            ("删除标签那张".to_owned(), Action::DeleteTag("v1.0".to_owned())),
+            ("弹出贮藏那张".to_owned(), Action::StashPop(1)),
+            ("丢掉贮藏那张".to_owned(), Action::StashDrop(2)),
+            ("修正提交那张".to_owned(), Action::Amend("Subject 0".to_owned())),
+            (
+                "恢复旧版本那张".to_owned(),
+                Action::RestoreFile { oid: oid.clone(), path: path.clone() },
+            ),
+            ("用我的那一侧那张".to_owned(), Action::ResolveOurs(path.clone())),
+            ("用他们的哪一侧那张".to_owned(), Action::ResolveTheirs(path.clone())),
+            ("把冲突放回去那张".to_owned(), Action::MarkUnresolved(path.clone())),
+            ("继续合并那张".to_owned(), Action::ContinueOp { state: "merge".to_owned() }),
+            ("继续变基那张".to_owned(), Action::ContinueOp { state: "rebase".to_owned() }),
+            ("终止遴选那张".to_owned(), Action::AbortOp { state: "cherry-pick".to_owned() }),
+            ("终止变基那张".to_owned(), Action::AbortOp { state: "rebase".to_owned() }),
+        ];
+        cases
+    }
 
 
+
+
+
+    /// English 档画出来的整屏**不许还剩汉字**。
+    ///
+    /// 为什么扫「每一帧落下的每一个码位」而不是对一张文案表：400 多处 `tr!` 长在调用点旁边，
+    /// 表和调用点迟早对不上，而漏翻恰恰是「某一处没人记得改」。这条把外壳每一种状态都画一帧
+    /// （`en_states`），夹具的数据又是 ASCII，所以剩下的汉字只可能是外壳自己没翻的话。
+    /// 反向变异试哪一种都跑得掉：把任一处 `tr!` 的英文半支换成中文、或整处不改，
+    /// 这一条会点名是哪一帧的哪一句。
+    #[test]
+    fn the_english_shell_paints_no_chinese() {
+        let _lang = gitx::lang::scoped(gitx::lang::Lang::En);
+        let mut hits: Vec<String> = Vec::new();
+        let mut states = 0;
+        let mut sections = 0;
+        for (name, mut app) in en_states() {
+            states += 1;
+            let out = frame(&mut app);
+            let found = han_hits(&out, &name);
+            sections += painted_sections(&out).len();
+            hits.extend(found);
+        }
+        // 先钉「这一屏真的画了东西」：一个什么都没画的帧集会让上面那圈永远空命中。
+        assert!(states >= 30, "只画了 {states} 帧，en_states 大概半路就 return 了");
+        assert!(sections >= 800, "整批只认出 {sections} 段文字（{states} 帧），画字路径八成没走通");
+        hits.sort();
+        hits.dedup();
+        assert!(hits.is_empty(), "English 档还画着中文（{} 句）：\n{}", hits.len(), hits.join("\n"));
+    }
+
+    /// 帧扫不到的那批文案：**只在按下去、菜单打开、卡刚建好那一刻才拼出来的那些**。
+    /// 直接调现字的函数逐句问一遍，比在帧里想办法把每个菜单点开便宜得多，也稳得多。
+    #[test]
+    fn the_english_copy_functions_say_no_chinese() {
+        let _lang = gitx::lang::scoped(gitx::lang::Lang::En);
+        let mut hits: Vec<String> = Vec::new();
+        let mut said = 0usize;
+        let mut check = |what: String, s: &str| {
+            said += 1;
+            if gitx::lang::has_han(s) {
+                hits.push(format!("{what} → {s:?}"));
+            }
+        };
+
+        for i in 0..TOOLS.len() {
+            check(format!("工具条第 {i} 枚的名字"), tool_label(i));
+            check(format!("工具条第 {i} 枚的 tooltip"), tool_hint(i));
+        }
+        for (what, s) in [
+            ("筛选条「所有分支」", all_branches()),
+            ("筛选条「当前分支」", current_branch()),
+            ("偏好那枚「显示远程药丸」", show_remote()),
+            ("偏好那枚的相反档", hide_remote()),
+            ("筛选条「日期序」", date_order()),
+            ("筛选条「层级序」", topo_order()),
+            ("待处理那一组的组头", pending_sorted_by_path()),
+            ("跳到某条提交的菜单项", jump_to_sha()),
+            ("搜索框的占位", search_hint()),
+            ("首页那一档的名字", home_tab()),
+            ("重置卡上那句「谁的东西怎么办」", reset_shares()),
+        ] {
+            check(what.to_owned(), s);
+        }
+        for scope in [git::Scope::All, git::Scope::Current, git::Scope::Rev("topic-a".to_owned())] {
+            check("日志范围那一格".to_owned(), &scope_label(&scope));
+        }
+        for (i, b) in PushBehavior::labels().into_iter().enumerate() {
+            check(format!("push.default 第 {i} 档"), b);
+        }
+        for mode in git::ResetMode::ALL {
+            let (tab, shares) = reset_words(mode);
+            check("重置那一档的页签".to_owned(), tab);
+            check("重置那一档的说明".to_owned(), shares);
+        }
+        for state in ["merge", "cherry-pick", "rebase", "revert", ""] {
+            check(format!("{state} 那个操作的短名"), op_noun(state));
+            if let Some(t) = op_title(state) {
+                check(format!("{state} 的横幅标题"), t);
+            }
+            check(format!("{state} 的「继续」按钮"), &continue_label(state));
+            check(format!("{state} 的「终止」按钮"), &abort_label(state));
+        }
+        for (name, action) in en_confirm_actions() {
+            let (title, detail) = confirm_of(&action);
+            check(format!("{name}的标题"), title);
+            check(format!("{name}那句说明"), &detail);
+        }
+        // 状态那半套：文件表色块、历史行上的整词、以及路径上那半个标记。
+        for st in [
+            ChangeStatus::Added,
+            ChangeStatus::Modified,
+            ChangeStatus::Deleted,
+            ChangeStatus::Renamed,
+            ChangeStatus::Copied,
+            ChangeStatus::Untracked,
+            ChangeStatus::Unmerged,
+            ChangeStatus::Unknown,
+        ] {
+            check("文件状态那个字母".to_owned(), mark(&st));
+            check("文件状态的整词".to_owned(), change_label(&st));
+        }
+        // 差异顶上那句「这一格是什么」：六个 Target 形状各一句。
+        let oid = "0".repeat(40);
+        for t in [
+            Target::Working { staged: false, path: None, untracked: false },
+            Target::Working { staged: true, path: None, untracked: false },
+            Target::Working { staged: false, path: Some("src/a.rs".to_owned()), untracked: true },
+            Target::Commit { oid: oid.clone(), path: None },
+            Target::Commit { oid: oid.clone(), path: Some("src/a.rs".to_owned()) },
+            Target::Stash { oid: oid.clone(), path: None },
+            Target::Stash { oid: oid.clone(), path: Some("src/a.rs".to_owned()) },
+        ] {
+            check("差异区顶上那一格".to_owned(), &patch_label(&t));
+        }
+        // 每一张卡：标题、说明行、输入框占位、主/次按钮。`Modal` 建出来就冻住的那些，
+        // 只有在这儿叫一遍才量得到英文档。
+        let prefs = loaded_en().prefs();
+        let cards: Vec<(String, Modal)> = vec![
+            ("新建分支".to_owned(), Modal::new_branch()),
+            ("贮藏".to_owned(), Modal::stash_save()),
+            ("打标签".to_owned(), Modal::new_tag(oid.clone(), "Subject 0".to_owned())),
+            ("重命名".to_owned(), Modal::rename_branch("main".to_owned())),
+            ("合并".to_owned(), Modal::merge(vec!["topic-a".to_owned()])),
+            ("提交".to_owned(), Modal::commit("main".to_owned(), 2)),
+            ("推送".to_owned(), Modal::push(Vec::new(), "origin".to_owned(), &prefs)),
+            ("拉取".to_owned(), Modal::pull("origin".to_owned(), "main".to_owned(), "main".to_owned())),
+            ("重置".to_owned(), Modal::reset(oid.clone(), "Subject 0".to_owned())),
+            ("添加仓库".to_owned(), Modal::add_repo()),
+            ("设置".to_owned(), Modal::settings(prefs.clone(), 1, None)),
+            ("确认".to_owned(), Modal::confirm(confirm_of(&Action::DeleteTag("v1".to_owned())).0, String::new(), Action::DeleteTag("v1".to_owned()))),
+        ];
+        for (name, card) in cards {
+            check(format!("{name}卡的标题"), card.title);
+            if let Some(d) = &card.detail {
+                check(format!("{name}卡的说明行"), d);
+            }
+            check(format!("{name}卡的输入框占位"), card.hint());
+            check(format!("{name}卡的主按钮"), card.primary());
+        }
+        // 看板上那十四句状态：核心层把语言当**参数**收，所以两档在同一条判据里各自问一遍。
+        // 带数字的那几档各给两种（0 和 2）：0 那一档若漏了专门文案，这里就会吐出「0 个」。
+        use gitx::provider::PrStatus as S;
+        for status in [
+            S::Conflicts,
+            S::Draft,
+            S::Behind,
+            S::CiRunning { failed: 0 },
+            S::CiRunning { failed: 2 },
+            S::CiFailed { n: 0 },
+            S::CiFailed { n: 3 },
+            S::CiFailedShared { n: 1 },
+            S::CiWarned { n: 0 },
+            S::CiWarned { n: 4 },
+            S::CiNone,
+            S::Fetching,
+            S::AwaitingReview,
+            S::MergeReady,
+            S::Closed,
+            S::Merged,
+            S::Unknown,
+        ] {
+            let s = status.label(gitx::lang::Lang::En);
+            said += 1;
+            if gitx::lang::has_han(&s) {
+                hits.push(format!("看板状态 {status:?} → {s:?}"));
+            }
+        }
+        assert!(said >= 90, "只问到 {said} 句文案，这一条大概什么都没测");
+        hits.sort();
+        hits.dedup();
+        assert!(hits.is_empty(), "English 档的文案函数还吐出中文（{} 句）：\n{}", hits.len(), hits.join("\n"));
+    }
+
+    /// 两个档位画出的**文字段数**必须一样多。
+    ///
+    /// 漏翻归前两条，这一条抓的是另一种塌法：某个页签、某一行、某枚按钮只在一种语言里
+    /// 存在（写成 `if en { … } else { … }` 时把整块 UI 关掉了），或者某一句在容器里排掉、
+    /// 少画一段。同一批帧两档各画一遍、逐帧比段数——差一段就点名是哪一帧。
+    #[test]
+    fn both_languages_paint_the_same_number_of_labels() {
+        // 同一个构建器跑两遍，只换档位：造出来的是**同一批帧**，数据两边都是 ASCII。
+        let en = {
+            let _g = gitx::lang::scoped(gitx::lang::Lang::En);
+            en_states()
+        };
+        let zh = {
+            let _g = gitx::lang::scoped(gitx::lang::Lang::Zh);
+            en_states()
+        };
+        assert_eq!(
+            en.len(),
+            zh.len(),
+            "同一个构建器在两档造出不同数目的帧——en_states 里有按语言分支的东西"
+        );
+        let mut diff: Vec<String> = Vec::new();
+        for ((name, mut a), (_, mut b)) in en.into_iter().zip(zh.into_iter()) {
+            let n_en = painted_sections(&frame(&mut a)).len();
+            let n_zh = painted_sections(&frame(&mut b)).len();
+            if n_en != n_zh {
+                diff.push(format!("「{name}」中文 {n_zh} 段 / 英文 {n_en} 段"));
+            }
+        }
+        assert!(diff.is_empty(), "两个档位画出的文字段数不一样：\n{}", diff.join("\n"));
+    }
+
+    // ------------------------------------------------------- 右键重置当前分支（#c-1）
+    //
+    // 产品说法：日志一行的右键里那一项**只端卡**，卡上三档页签选「你的改动怎么办」，
+    // 按下去才动 git。卡本身就是那道闸（不再叠一张确认卡），因为三档的差别必须用整句说清，
+    // 一句话的确认框装不下。判据因此全从「按下去之前 git 没动」这一头起。
+
+    /// 两份提交 + 一处未提交改动：重置的三条端到端共用。
+    /// 工作区那一行是**未暂存**的（`reset --mixed` 和 `--hard` 的差别只在它还在不在，
+    /// 用已暂存的改动反而分不清两档）。
+    fn reset_repo(tag: &str) -> (Gitx, std::path::PathBuf) {
+        let dir = scratch_repo(tag);
+        git_in(&dir, &["commit", "-q", "-m", "第二条"]);
+        std::fs::write(dir.join("a.txt"), "一行\n第二行\n第三行\n").unwrap();
+        let mut app = blank();
+        app.open(dir.to_str().unwrap());
+        pump(&mut app, |a| a.snap.as_ref().map(|s| s.commits.len()).unwrap_or(0) >= 2);
+        (app, dir)
+    }
+
+    /// 右键那一项端出来的是**一张卡**，git 一个字没动。
+    /// 反向变异两头都红：把那行 `menu_card` 换成 `menu_item`（点下去直接发 Action），
+    /// 最后那条断言红；把菜单项整行删掉，`menu_pick` 自己 panic。
+    #[test]
+    fn resetting_from_a_log_row_opens_a_card_and_touches_nothing() {
+        let (mut app, dir) = reset_repo("reset-entry");
+        let head = git_in(&dir, &["rev-parse", "HEAD"]);
+        let work = std::fs::read_to_string(dir.join("a.txt")).unwrap();
+        menu_pick(&mut app, "起点", "把当前分支重置到这条提交…");
+        assert!(app.modal.is_some(), "右键重置没端出卡");
+        assert!(!app.busy, "卡还没确认就发了动作（busy 已经抢起来了）");
+        assert_eq!(git_in(&dir, &["rev-parse", "HEAD"]), head, "只是打开卡，分支指针已经挪了");
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), work, "只是打开卡，工作区被写了");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 卡上那四件东西：说明行（挪到**哪条**提交）、三档页签、共同那句、当前档那句。
+    /// 只有 `Mixed` 的说明在，另外两句不许同时出现——三句都摆出来等于没在回答「你选的这档怎么办」。
+    #[test]
+    fn the_reset_card_shows_the_target_and_three_modes_with_one_explanation() {
+        let mut app = blank();
+        app.modal = Some(Modal::reset("0".repeat(40), "起点".to_owned()));
+        let t: Vec<String> = texts(&warm_frame(&mut app)).into_iter().map(|(s, _)| s).collect();
+        assert!(t.iter().any(|s| s == "把当前分支挪到：起点"), "说明行不是那一句：{t:?}");
+        for label in ["重置当前分支", "那之后的提交会离开这条分支，但对象还在，用 reflog 找得回来。"] {
+            assert!(card_has(&mut app, label), "卡上少了「{label}」");
+        }
+        for mode in git::ResetMode::ALL {
+            assert!(card_has(&mut app, reset_words(mode).0), "页签里没有「{}」", reset_words(mode).0);
+        }
+        assert!(card_has(&mut app, reset_words(git::ResetMode::Mixed).1), "默认那档（混合）的说明没画出来");
+        assert!(!card_has(&mut app, reset_words(git::ResetMode::Hard).1), "没选硬，卡上就摆着硬那句警告");
+        assert!(card_has_button(&mut app, "重置分支"), "主按钮不是「重置分支」");
+    }
+
+    /// 换页签只换**那一句**：共同那句、说明行、三枚页签都得留下，卡高也不许跟着跳
+    /// （一翻页卡就上下抖一下，是 §5.1 那一档高度归属没算稳的信号）。
+    #[test]
+    fn switching_the_reset_mode_swaps_only_that_one_sentence() {
+        let mut app = with_remotes();
+        app.modal = Some(Modal::reset("0".repeat(40), "起点".to_owned()));
+        let h0 = card_back(&settled_frame(&mut app, 0.4)).expect("重置卡的卡底没画出来").1.height();
+        assert!(click_card(&mut app, reset_words(git::ResetMode::Hard).0), "点不到「硬」那一档页签");
+        let m = app.modal.as_ref().unwrap();
+        let got = matches!(&m.form, Form::Reset { mode, .. } if *mode == git::ResetMode::Hard);
+        assert!(got, "点了「硬」页签，卡里那一档还是别的");
+        assert!(card_has(&mut app, reset_words(git::ResetMode::Hard).1), "换成硬，硬那句警告没跟上");
+        assert!(!card_has(&mut app, reset_words(git::ResetMode::Mixed).1), "换成硬，混合那句还留着");
+        assert!(card_has(&mut app, "那之后的提交会离开这条分支"), "换档把三档共同那句一起换掉了");
+        assert!(card_has(&mut app, "把当前分支挪到"), "换档把「挪到哪条」那行一起换掉了");
+        let h1 = card_back(&settled_frame(&mut app, 0.4)).expect("换成硬之后卡底没了").1.height();
+        assert_eq!(h0, h1, "换一档把卡撑高了：{h0} → {h1}");
+    }
+
+    /// 端到端（混合，默认那一档）：分支挪回「起点」，改动**留在工作区**、暂存区清空。
+    /// 顺闭上「卡就是那道闸」——按主按钮之后不许再压一张确认卡。
+    #[test]
+    fn a_mixed_reset_from_the_card_keeps_the_work_tree_dirty() {
+        let (mut app, dir) = reset_repo("reset-mixed");
+        let base = git_in(&dir, &["rev-parse", "HEAD~1"]);
+        menu_pick(&mut app, "起点", "把当前分支重置到这条提交…");
+        press(&mut app, egui::Key::Enter);
+        assert!(app.modal.is_none(), "按了主按钮还压着一张卡（重置该由卡自己确认，不再叠确认卡）");
+        pump(&mut app, |a| a.snap.as_ref().map(|s| s.commits.len()).unwrap_or(0) == 1);
+        assert_eq!(git_in(&dir, &["rev-parse", "HEAD"]), base, "分支指针没挪到那条提交");
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "一行\n第二行\n第三行\n", "混合档把工作区改动弄没了");
+        assert_eq!(git_in(&dir, &["diff", "--cached"]), "", "混合档清掉暂存区没有：索引里还有东西");
+        // `git_in` 把回显 trim 过，所以未暂存那一格的行首空格只剩在中间：`"M a.txt"` 而不是 `"MM a.txt"`。
+        // 「索引是空的」上面那条 `diff --cached` 已经单独钉过，这里钉的是文件还在改动那一格里。
+        assert_eq!(git_in(&dir, &["status", "--porcelain"]), "M a.txt", "改动没回到未暂存那一格");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 端到端（硬）：这一档**就是要**丢东西——工作区被那条提交覆盖，未提交的那一行没了。
+    /// 与混合那条成对：只验一边等于「两档跑同一条命令」照样绿（假绿一族「一个值两条出口只验一半」）。
+    #[test]
+    fn a_hard_reset_from_the_card_throws_away_the_work_tree() {
+        let (mut app, dir) = reset_repo("reset-hard");
+        let base = git_in(&dir, &["rev-parse", "HEAD~1"]);
+        menu_pick(&mut app, "起点", "把当前分支重置到这条提交…");
+        assert!(click_card(&mut app, reset_words(git::ResetMode::Hard).0), "点不到「硬」那一档页签");
+        press(&mut app, egui::Key::Enter);
+        pump(&mut app, |a| a.snap.as_ref().map(|s| s.commits.len()).unwrap_or(0) == 1);
+        assert_eq!(git_in(&dir, &["rev-parse", "HEAD"]), base);
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "一行\n", "硬档没把覆盖做完");
+        assert_eq!(git_in(&dir, &["status", "--porcelain"]), "", "硬档之后工作区还不干净");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -------------------------------------------------- 侧栏「远端」点开第三级（#c-2）
+    //
+    // 产品说法：点开一条远端 = 看它下面的分支，点一条分支 = 切过去（本地没有就以 `--track` 建一条）。
+    // 展开靠的是**子项往右缩一档**，不是箭头字符（§2 明写侧栏不画折叠三角），所以那一档的
+    // 起笔位、以及「点这一行只展开、不发动作」两件事都得钉住；切分支那半条走真仓库端到端。
+
+    /// 第三级起在 `24 + 12 = 36`（§7 登记这一档是自测的第三级缩进），行高还是 26。
+    /// 反向变异：把 `SIDE_SUB_X` 改成 0（第三级和二级齐平，看不出是展开）或把缩进改成
+    /// 用 `▼` 之类的字符前缀顶着，这一条都会红。
+    #[test]
+    fn the_branch_rows_under_an_expanded_remote_indent_one_level_right() {
+        let mut app = remote_branches(3);
+        app.remote_open = crate::ui::app::default_remote_open();
+        let out = frame(&mut app);
+        let x = |l: &str| side_galley(&out, l).3.min.x;
+        let y = |l: &str| side_galley(&out, l).3.center().y;
+        assert_eq!(x("origin"), 24.0, "远端那一行是第二级，该起在 24");
+        assert_eq!(x("topic-1"), 36.0, "展开后的分支行是第三级，该比第二级再缩 12");
+        assert!((y("topic-1") - y("origin") - 26.0).abs() < 0.6, "第三级没紧跟在远端那一行下面（差 26）：实际 {}", y("topic-1") - y("origin"));
+        assert!((y("topic-2") - y("topic-1") - 26.0).abs() < 0.6, "第三级的行高不是 26：{}", y("topic-2") - y("topic-1"));
+    }
+
+    /// 点远端那一行**只开合**：不发 git 动作、不动计数。
+    /// 计数那一条是关键——把分支摊进 `items` 里能让「展开看得见」这件事照过，
+    /// 但「远端 1」会跟着变成「远端 4」。
+    #[test]
+    fn clicking_a_remote_row_collapses_its_branches_without_running_anything() {
+        let mut app = remote_branches(3);
+        app.remote_open = crate::ui::app::default_remote_open();
+        let out = frame(&mut app);
+        let row = side_galley(&out, "远端").3;
+        assert_eq!(side_count(&out, row.center().y).2.trim(), "1", "展开时把分支也数进「远端」那一组的计数里");
+        let has = |vis: &Vec<(String, Rect)>, l: &str| vis.iter().any(|(s, _)| s == l);
+        assert!(has(&visible_texts(&out), "topic-1"), "夹具没把 origin 展开，后面的开合没法验");
+
+        assert!(click_text(&mut app, "origin"), "侧栏没有「origin」那一行");
+        assert!(app.remote_open.is_empty(), "点一下远端没收起");
+        assert!(!app.busy, "点展开/收起这一步把动作发出去了（busy 抢起来了）");
+        let out = frame(&mut app);
+        let vis = visible_texts(&out);
+        for i in 1..=3 {
+            assert!(!has(&vis, &format!("topic-{i}")), "收起之后还画着 topic-{i}");
+        }
+        assert_eq!(side_count(&out, side_galley(&out, "远端").3.center().y).2.trim(), "1", "收起之后的计数不再是 1");
+
+        assert!(click_text(&mut app, "origin"), "收起之后点不到那一行");
+        assert_eq!(app.remote_open, vec!["origin".to_owned()], "再点一下没展开回来");
+    }
+
+    /// 端到端：点展开后的那条分支，本地以 `--track` 建出同名分支并且站上去。
+    /// 复核全问磁盘——`branch -D side` 先把本地那条删了，所以「本地已经有了、只是切过去」
+    /// 这一路在这条判据里走不通，两条出口各一条判据。
+    #[test]
+    fn clicking_a_remote_branch_row_checks_out_a_local_branch_that_tracks_it() {
+        let dir = scratch_repo("remote-checkout");
+        git_in(&dir, &["commit", "-q", "-m", "第二条"]);
+        // 把 git 自己的「从远程分支长出来就顺手建追踪」那档关掉：不关的话，代码里的
+        // `--track` 是一枚杀不掉的旗子（2026-10-30 实测：摘掉 `--track` 两条判据照绿，
+        // 因为本机 `branch.autoSetupMerge` 的默认值替它把事做了）。关掉之后上游**只可能**
+        // 是那一枚旗子建的，判据钉的才是代码里写的那件事，而不是某台机器的默认配置。
+        git_in(&dir, &["config", "branch.autoSetupMerge", "false"]);
+        let bare = bare_remote("remote-checkout");
+        git_in(&dir, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git_in(&dir, &["push", "-q", "origin", "main"]);
+        git_in(&dir, &["branch", "side"]);
+        git_in(&dir, &["push", "-q", "origin", "side"]);
+        git_in(&dir, &["branch", "-q", "-D", "side"]);
+        let mut app = blank();
+        app.open(dir.to_str().unwrap());
+        app.remote_open = crate::ui::app::default_remote_open();
+        pump(&mut app, |a| {
+            a.snap.as_ref().map(|s| s.remote_refs.iter().any(|r| r.name == "origin/side")).unwrap_or(false)
+        });
+        assert!(click_text(&mut app, "side"), "展开的 origin 下面没有「side」那一行");
+        pump(&mut app, |a| {
+            a.snap.as_ref().map(|s| s.branches.iter().any(|b| b.name == "side")).unwrap_or(false)
+        });
+        assert_eq!(app.note, None, "切过去的路上报了话：{}", app.note.clone().unwrap_or_default());
+        assert_eq!(git_in(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]), "side", "HEAD 没站到新分支上");
+        assert_eq!(
+            git_in(&dir, &["rev-parse", "side"]),
+            git_in(&dir, &["rev-parse", "origin/side"]),
+            "新分支不是从点的那条远程分支长出来的"
+        );
+        // 上游没建时 `git config` 直接退出码 1，`git_in` 带着那条 git 命令 panic——
+        // 「键不存在」在这里就是要的证据，不是判据写错了。
+        assert_eq!(git_in(&dir, &["config", "branch.side.remote"]), "origin", "新分支没跟 origin 建立追踪");
+        assert_eq!(git_in(&dir, &["config", "branch.side.merge"]), "refs/heads/side", "追踪的不是同名那条");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&bare);
+    }
+
+    /// 重置卡的高度**按它画的那几行算**：标题带 42 + 正文四行（页签 / 共同那句 / 当前档那句 /
+    /// 说明行）× 32 + 卡脚 52 = 222。这一条钉的是 `Modal::rows()` 给重置记的那个数——
+    /// 上一批的六条重置判据全杀不掉「行数少记一行」（实测：`n += 3` 改成 `n += 2` 六条照绿），
+    /// 因为短掉的那 32pt 正好被卡脚那 52 吃进去，按「文字在不在卡矩形里」找一律找得着。
+    /// 所以这里问两件卡矩形问不出的事：**卡高的字面数**，和最下面那句正文**不许压进卡脚那一条带子**
+    /// （两枚按钮住在里面，压上就是字叠字）。
+    #[test]
+    fn the_reset_card_is_tall_enough_for_the_four_lines_it_paints() {
+        let mut app = with_remotes();
+        app.modal = Some(Modal::reset("0".repeat(40), "起点".to_owned()));
+        let out = settled_frame(&mut app, 0.4);
+        let card = card_back(&out).expect("重置卡的卡底没画出来").1;
+        assert_eq!(card.height(), 222.0, "重置卡高不是「标题 42 + 四行 128 + 卡脚 52」那一档");
+        let line = all_text_rects(&out, 0.0..=WIN_H, &[reset_words(git::ResetMode::Mixed).1])
+            .into_iter()
+            .find(|(_, r)| card.contains(r.center()))
+            .map(|(_, r)| r)
+            .expect("卡里没画出当前档那句说明");
+        assert!(
+            line.max.y <= card.max.y - MODAL_FOOT_H,
+            "最下面那句正文压进卡脚那一条带子（里住着两枚按钮）：句子底 {:+.1} > 带上沿 {:+.1}",
+            line.max.y,
+            card.max.y - MODAL_FOOT_H
+        );
+    }
+    /// 关窗那一下**必须在 drop 窗口之前结束进程**（见 `ui/app.rs` 里 `on_exit` 上面那段 winit 崩溃说明）。
+    /// 崩溃本身在无头判据里量不到——它要一台带 Touch Bar 的真 Mac、真窗口、真显示周期，
+    /// 所以这里钉的是**结构**：`on_exit` 那一格真的写着 `std::process::exit(0)`。
+    /// 反向变异（把那一行摘掉、让它落回 eframe 自己的收尾）红的是判据自己那一句，不是编译器。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn quitting_exits_before_the_window_is_dropped() {
+        let src = include_str!("ui/app.rs");
+        let rest = &src[src.find("fn on_exit(&mut self) {").expect("macOS 档里没有 `on_exit`")..];
+        let body = &rest[..rest.find("\n    }").expect("`on_exit` 的函数体收在哪儿")];
+        assert!(
+            body.contains("std::process::exit(0)"),
+            "关窗没有提前结束进程，而是交回 eframe 去 drop 窗口——带 Touch Bar 的 Mac 上那一下会 SIGABRT"
+        );
+    }

@@ -1,4 +1,4 @@
-// Generates the GitCraft app icon (512x512 PNG) without external dependencies.
+// Generates the GitCraft app icon (1024x1024 PNG) without external dependencies.
 //
 // The design is a commit graph whose two lanes cross into an "X" — the glyph
 // says both "git history" and the X in GitCraft. Everything is rasterized here
@@ -12,6 +12,11 @@ const SIZE = 1024;
 // 所有像素常量都是按 512 的稿子量的，升到 1024 只把线宽/半径按同一比例放大，
 // 造型一个不变（macOS 的 `icon_512x512@2x` 要的正是 1024 这一档，不必再放大一次）。
 const K = SIZE / 512;
+// macOS 的图标网格：1024 的画布里圆角方块只占 **824**（左右各留 100 的透明边），
+// 别的应用按这个网格摆，满幅画出来的图标在 Dock 里会比别人大一圈（用户 2026-10-26 反馈）。
+// 这里不逐个改几何常量，而是把画布坐标**除以 ART**：整幅造型（底板 + 字 + 光晕）
+// 等比缩进中心，比例一个不变。
+const ART = 824 / SIZE;
 
 // CRC32 table
 const crcTable = (() => {
@@ -100,9 +105,10 @@ let o = 0;
 for (let py = 0; py < SIZE; py++) {
   raw[o++] = 0; // PNG filter: none
   for (let px = 0; px < SIZE; px++) {
-    // Icon-space coordinates centered on the plate.
-    const x = px + 0.5 - HALF;
-    const y = py + 0.5 - HALF;
+    // Icon-space coordinates centered on the plate, then divided by ART so the
+    // plate lands inside macOS's 824pt icon grid with 100px of transparent rim.
+    const x = (px + 0.5 - HALF) / ART;
+    const y = (py + 0.5 - HALF) / ART;
 
     const plate = roundedBox(x, y, HALF, 116 * K);
     const plateA = cover(plate, 1.5 * K);

@@ -37,6 +37,21 @@ pub(crate) const TAB_PILL_R: u8 = 13;
 pub(crate) const TAB_FONT: f32 = 13.0;
 /// tab 之间的间距（`.tabs{gap:6}`）。
 pub(crate) const TAB_GAP: f32 = 6.0;
+/// tab 组与动作按钮组之间那一段（预览稿 `.header{gap:14}`）。顶栏收纳那本账也要扣它。
+pub(crate) const HEADER_GROUP_GAP: f32 = 14.0;
+/// 分支名与 `↑↓` 计数之间那一段（`.branch-chip` 内部）。
+pub(crate) const BRANCH_GAP: f32 = 6.0;
+// ---- 首页（顶栏最左的「首页」tab 打开的那一页）----
+/// 首页正文的最大宽。窗口 1050 时两侧各留 165，窗口缩到地板 860 时两侧各留 70——
+/// 仍然比侧栏 188 窄一档，读起来是「一页内容」而不是「一块塞满的表格」。
+pub(crate) const HOME_MAX_W: f32 = 720.0;
+/// 正文离顶栏的空白（4/8 网格的 32）。首页没有日志表头，第一眼需要一点呼吸。
+pub(crate) const HOME_TOP: f32 = 32.0;
+/// 仓库卡的高度：名字 14 + 路径 11 两行（约 32）+ 上下内边距 18 + 1px 边 2。
+/// 固定高度让「卡片之间 8pt」真的按同一节奏走，而不是跟着字体行盒漂。
+pub(crate) const HOME_CARD_H: f32 = 54.0;
+pub(crate) const HOME_CARD_GAP: f32 = 8.0;
+pub(crate) const HOME_CARD_RAD: u8 = 8;
 /// 顶栏动作按钮：命中 28×28、圆角 6、图标 14（§4.1「图标按钮 28×28，圆角 6，hover
 /// `BG_HOVER`，图标 14px」；预览稿 `.ib`）。旧的 50pt 宽「图标在上、中文在下」那种竖按钮
 /// 是照 SourceTree 量的，spec 收掉了：**中文只活在 tooltip 和溢出菜单里**，不带进顶栏。
@@ -99,9 +114,11 @@ pub(crate) const RULE_H: f32 = 16.0;
 /// gap:12px}` 给的是 12，也是 4/8 网格（原则④）上的一档。旧 5 是参考图四个表头词量出来的，
 /// 那张图的列宽和现在不同，那个数跟着一起作废。
 pub(crate) const COL_INSET: f32 = 12.0;
-/// §2 的三枚定宽列：图 48 \| 作者 96 \| 日期 78，中间「提交信息」那一列弹性。
-/// **`COL_SHA`（提交号那一列 77）整列删掉**——§2 的四列里没有它，预览稿 `.lr` 也只有
-/// `.g / .sj / .au / .dt` 四格；提交号仍可从筛选条与右键菜单拿到。
+/// §2 的定宽列：图 48 | 提交号 66 | 作者 96 | 日期 78，中间「提交信息」（含药丸）弹性。
+/// **提交号那一列 2026-10-26 加回来**：S6-4 按 §2 把它整列删了，用户反馈「历史记录页面
+/// 没有 hash 值」——筛选条能按前缀搜、右键菜单能读全号，都不等于「一眼看得见」。
+/// 66 = 12 内缩 + 7 位等宽 11px（46.2）+ 8 余量。
+pub(crate) const COL_SHA: f32 = 66.0;
 pub(crate) const COL_GRAPH: f32 = 48.0;
 pub(crate) const COL_AUTHOR: f32 = 96.0;
 pub(crate) const COL_DATE: f32 = 78.0;
@@ -177,6 +194,14 @@ pub(crate) const SIDE_DOT_R: f32 = 3.5;
 /// 扣掉的预算（这一条）和画出来的高度必须同源，不然又是一处"两个数各说各话"。
 pub(crate) const SIDE_FILTER_GAP: f32 = 8.0;
 pub(crate) const SIDE_FILTER_H: f32 = SIDE_FILTER_GAP + 26.0;
+/// 看板那一栏（DESIGN §2.2）。**整栏替掉侧栏大纲**，宽度不变还是 188。
+/// 一条 PR 占两行：标题 12px + 状态 11px，行高 **40** = 两行各 20。§2 的侧栏行档是 26，
+/// 但那一档只有一行字；两行的节奏没有 spec 数，40 走 4/8 网格自拍，登记在 §7。
+pub(crate) const BOARD_ROW_H: f32 = 40.0;
+pub(crate) const BOARD_LINE_H: f32 = 20.0;
+/// 标题与状态两档字级。状态比标题小一档、并且**只有它能带颜色**（§原则①：颜色只给状态）。
+pub(crate) const BOARD_TITLE_FONT: f32 = 12.0;
+pub(crate) const BOARD_STATUS_FONT: f32 = 11.0;
 /// 描述列开头那串 ref 药丸的几何（§4.5）。**高 15 / 圆角取半高 7 是拍的**：§4.5 只给了
 /// 「圆角 999、11/600」和四套颜色，没给高度；15 沿用参考图量到的那一档（行带 129..149、
 /// 药丸 131.5..146.5），半高画出来就是 spec 要的那颗胶囊（同 §7 里 `TAB_PILL_R` 那条处理）。
@@ -232,10 +257,20 @@ pub(crate) const ADD_BG: Color32 = Color32::from_rgb(0xE6, 0xF4, 0xEA);
 pub(crate) const ADD_FG: Color32 = Color32::from_rgb(0x1A, 0x7F, 0x37);
 pub(crate) const DEL_BG: Color32 = Color32::from_rgb(0xFC, 0xEB, 0xEA);
 pub(crate) const DEL_FG: Color32 = Color32::from_rgb(0xCF, 0x22, 0x2E);
-pub(crate) const WARN: Color32 = Color32::from_rgb(0xb0, 0x3a, 0x2e);
-/// 冲突/进行中操作那条横幅的底色。**没有参考图依据**：SourceTree 那张截图里没有冲突，
-/// 这是我们的增强，浅到不抢文件表的注意力。
-pub(crate) const WARN_BG: Color32 = Color32::from_rgb(0xfd, 0xf0, 0xee);
+/// 警告横幅那一对（§3.1）。旧的 `WARN = #b03a2e` / `WARN_BG = #fdf0ee` 是复刻时代从
+/// 截图里取的偏红值；§6 迁移对照明写「`WARN` / `WARN_BG` → `WARN_FG` / `WARN_BG`；
+/// **冲突另设 `CONF_*`**」，这一批照办：警告回黄、冲突单列一色。
+pub(crate) const WARN_FG: Color32 = Color32::from_rgb(0x9A, 0x67, 0x00);
+pub(crate) const WARN_BG: Color32 = Color32::from_rgb(0xFF, 0xF8, 0xE6);
+/// 冲突横幅那一对（§3.1 `CONF_BG` / `CONF_FG`）。以前冲突和「进行中的变基/遴选」共用
+/// 一枚警告色，`op_banner` 现在按 `conflicts > 0` 分档——「有东西要你亲手合」和
+/// 「有个操作在进行中」不是同一件事。
+pub(crate) const CONF_FG: Color32 = Color32::from_rgb(0xC2, 0x4E, 0x00);
+pub(crate) const CONF_BG: Color32 = Color32::from_rgb(0xFD, 0xEB, 0xE0);
+/// 危险文字/主按钮（§3.1 `DANGER`）。值和 `DEL_FG` 同一个数，但**语义不同**：
+/// 一个是「这一行被删掉了」，一个是「这一步会丢东西」。§6 迁移对照里确认卡主按钮
+/// 用的就是这一枚，所以单独成名，别拿 `DEL_FG` 顶。
+pub(crate) const DANGER: Color32 = DEL_FG;
 /// 冲突横幅的行高。也没有参考图；和 `ROW_H` 差 4pt，塞得下 11.5 号字与两枚小按钮。
 pub(crate) const CONFLICT_BANNER_H: f32 = 30.0;
 /// 底部状态栏：§2「STATUS **24pt**，横贯整窗；左：分支 · ↑↓ · 进行中操作；右：仓库路径；11px 灰字」。
@@ -573,21 +608,32 @@ pub(crate) fn lane_color(lane: usize) -> Color32 {
 }
 
 /// 顶栏动作组：11 枚，右对齐，每枚是 §4.1 那颗 28×28 的图标按钮。
-/// 第二个字段（中文）**不再画在顶栏上**——它只给 tooltip 和 §2 那句「溢出收进 `»` 菜单」用。
+/// 第二/第三字段是同一个名字的两种语言，**不画在顶栏上**——它们只给 tooltip 和 §2 那句
+/// 「溢出收进 `»` 菜单」用；第四/第五字段同理，是那枚按钮的一句话说明。
 /// **图标只能是字体链里真有字形的那些**：`every_rune_the_shell_paints_has_a_glyph`
 /// 这条无头判据会把每一枚落过字的码位跑一遍。之前那批箭头、带圈字母和两个彩色 emoji
 /// 全都不在 Noto Sans SC 的 cmap 里，于是有七个是豆腐块——这不是配色问题，是根本没字。
 /// 换成真线描 SVG 排在 S6-6（§4 那批组件）；在那之前先用字体里确实存在的字形顶着。
-pub(crate) const TOOLS: [(&str, &str, &str); 11] = [
-    ("⊕", "提交", "把暂存的变更提交到当前分支"),
-    ("↓", "拉取", "从远端拉取提交"),
-    ("↑", "推送", "推送提交到远端"),
-    ("⇄", "抓取", "从远端获取对象，不动工作区"),
-    ("⤴", "分支", "创建分支"),
-    ("⤵", "合并", "把分支合并到当前分支"),
-    ("≡", "贮藏", "把工作区暂存起来"),
-    ("☁", "远程服务器", "在浏览器里打开远端"),
-    ("▥", "Finder", "在 Finder 中打开仓库目录"),
-    ("▣", "终端", "在终端里打开当前目录"),
-    ("⊙", "设置", "GitX 设置"),
+pub(crate) const TOOLS: [(&str, &str, &str, &str, &str); 11] = [
+    ("⊕", "提交", "Commit", "把暂存的变更提交到当前分支", "Commit the staged changes to the current branch"),
+    ("↓", "拉取", "Pull", "从远端拉取提交", "Pull commits from the remote"),
+    ("↑", "推送", "Push", "推送提交到远端", "Push commits to the remote"),
+    ("⇄", "抓取", "Fetch", "从远端获取对象，不动工作区", "Fetch objects from the remote, leave the working tree alone"),
+    ("⤴", "分支", "Branch", "创建分支", "Create a branch"),
+    ("⤵", "合并", "Merge", "把分支合并到当前分支", "Merge a branch into the current branch"),
+    ("≡", "贮藏", "Stash", "把工作区暂存起来", "Stash the working tree away"),
+    ("☁", "远程服务器", "Remote", "在浏览器里打开远端", "Open the remote in a browser"),
+    ("▥", "Finder", "Finder", "在 Finder 中打开仓库目录", "Open the repository folder in Finder"),
+    ("▣", "终端", "Terminal", "在终端里打开当前目录", "Open a terminal at this folder"),
+    ("⊙", "设置", "Settings", "GitX 设置", "GitX settings"),
 ];
+
+/// 第 i 枚按钮的名字（tooltip / `»` 菜单项都用它）。
+pub(crate) fn tool_label(i: usize) -> &'static str {
+    gitx::tr!(TOOLS[i].1, TOOLS[i].2)
+}
+
+/// 第 i 枚按钮的一句话说明。
+pub(crate) fn tool_hint(i: usize) -> &'static str {
+    gitx::tr!(TOOLS[i].3, TOOLS[i].4)
+}

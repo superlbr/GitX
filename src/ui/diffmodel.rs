@@ -1,6 +1,6 @@
 //! （拆分自 main.rs；见 docs/PROCESS.md「拆分 main.rs」。）
 
-
+use gitx::tr;
 
 // ------------------------------------------------------------------------ 差异排版
 #[derive(Clone, Copy, PartialEq)]
@@ -72,9 +72,15 @@ pub(crate) fn layout(patch: &str, show_files: bool) -> Vec<DiffLine> {
             let (o0, o1) = (a, a + ac.saturating_sub(1));
             let (n0, n1) = (c, c + cc.saturating_sub(1));
             let head = if (o1 - o0) == (n1 - n0) {
-                format!("块 {hunk}： 行 {o0}-{o1}")
+                tr!(
+                    format!("块 {hunk}： 行 {o0}-{o1}"),
+                    format!("Hunk {hunk}: lines {o0}-{o1}")
+                )
             } else {
-                format!("块 {hunk}： 行 {o0}-{o1}（新 {n0}-{n1}）")
+                tr!(
+                    format!("块 {hunk}： 行 {o0}-{o1}（新 {n0}-{n1}）"),
+                    format!("Hunk {hunk}: lines {o0}-{o1} (new {n0}-{n1})")
+                )
             };
             out.push(DiffLine { kind: Kind::Hunk, old: None, new: None, text: head, file, hunk: Some(hunk) });
             continue;
