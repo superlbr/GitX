@@ -1,8 +1,9 @@
 //! （拆分自 main.rs；见 docs/PROCESS.md「拆分 main.rs」。）
 
-use eframe::egui::{self, Align, Align2, Color32, FontId, Label, Pos2, Rect, RichText, Sense, Stroke, TextStyle, Vec2, pos2, vec2};
+use eframe::egui::{self, Align, Align2, Color32, FontId, Id, Label, Pos2, Rect, Response, RichText, Sense, Stroke, TextStyle, Vec2, pos2, vec2};
 use gitx::git;
 use gitx::models::{BlameLine, ChangeStatus, FileLogEntry, FileStatus, Remote};
+use gitx::tr;
 
 use crate::ui::theme::*;
 use crate::ui::state::*;
@@ -12,10 +13,11 @@ use crate::ui::diffmodel::{DiffLine, Kind};
 
 /// 一行要画的东西。**带所有权**：绘制时只画视口里那几十行，从 `Commit` 拷出三段字符串
 /// 比把整份提交搬进闭包再处理生命周期便宜得多。
-/// **没有提交号那一段**：§2 的四列是 图 48 | 提交信息 | 作者 96 | 日期 78，提交号不在其中
-/// （筛选条按 `short_id` 前缀过滤、右键菜单里能读全号，所以信息没丢）。
+/// 2026-10-26 把提交号加回来：图 48 | **提交号 66** | 提交信息 | 作者 96 | 日期 78。
 pub(crate) struct Cells {
     pub(crate) subject: String,
+    /// 短提交号（7 位），等宽 11px `TEXT_MUTED`。虚拟行留空——那一行不是提交。
+    pub(crate) short: String,
     pub(crate) author: String,
     pub(crate) date: String,
     /// 描述列前面那几枚药丸，可以空。内容在快照时就算好了（见 `Snapshot::badges`）。
@@ -33,6 +35,10 @@ pub(crate) struct Cells {
 /// `every_rune_the_shell_paints_has_a_glyph` 会把每一枚被画的字对着字体表查一遍，
 /// 换了个字体表里没有的就当场红——`▾`（U+25BE）就是这么死的，这份字体链里只有 `▼`。
 pub(crate) const ARROW: &str = "▼";
+/// 顶栏收纳那枚「溢出」按钮（§2「窗口收窄时溢出收进 `»` 菜单」）。和 `ARROW` 同一类风险：
+/// 它只在**窗口窄到排不下**的那一帧才出现，常态壳的 glyph 判据扫不到它，
+/// 所以由 `the_more_button_is_not_a_tofu_box` 单独对着字体表查一次。
+pub(crate) const MORE_GLYPH: &str = "»";
 /// 卡标题带右端那一枚关闭字形（§5.2「右上 ×」）。`×`（U+00D7）和 `ARROW` 同一类风险：
 /// 卡打开着的那些帧不在 `every_rune_the_shell_paints_has_a_glyph` 的取景范围里（它跑常态壳），
 /// 所以由 `the_card_closes_from_the_x_in_its_title` 自己对着字体表查一次。
@@ -40,29 +46,49 @@ pub(crate) const CLOSE_GLYPH: &str = "×";
 // 下面这几条文案**逐字抄自**本机 SourceTree 4.2.19
 // `Contents/Resources/zh_CN.lproj/Localizable.strings`（UTF-16LE，要 `iconv -f UTF-16 -t UTF-8`）。
 // 键名注在后面，下次核对直接按键搜；自己改一个"更顺口的"就是破坏复刻契约第③条。
-pub(crate) const ALL_BRANCHES: &str = "所有分支"; // LogBranchesAll
-pub(crate) const CURRENT_BRANCH: &str = "当前分支"; // LogBranchesCurrent
-pub(crate) const SHOW_REMOTE: &str = "显示远程分支"; // LogShowRemotes
-pub(crate) const HIDE_REMOTE: &str = "隐藏远程分支"; // LogHideRemotes
-pub(crate) const DATE_ORDER: &str = "按日期排序"; // LogDateOrder
-pub(crate) const TOPO_ORDER: &str = "层级顺序"; // LogAncestorOrder
-pub(crate) const PENDING_SORTED_BY_PATH: &str = "待定的文件, 已依照路径排序"; // PendingFiles + SortedByPath
+// 这一组是**函数**不是常量：文案跟着语言档位走，常量表只装得下一种语言。
+pub(crate) fn all_branches() -> &'static str { tr!("所有分支", "All branches") } // LogBranchesAll
+pub(crate) fn current_branch() -> &'static str { tr!("当前分支", "Current branch") } // LogBranchesCurrent
+pub(crate) fn show_remote() -> &'static str { tr!("显示远程分支", "Show remote branches") } // LogShowRemotes
+pub(crate) fn hide_remote() -> &'static str { tr!("隐藏远程分支", "Hide remote branches") } // LogHideRemotes
+pub(crate) fn date_order() -> &'static str { tr!("按日期排序", "Sort by date") } // LogDateOrder
+pub(crate) fn topo_order() -> &'static str { tr!("层级顺序", "Ancestry order") } // LogAncestorOrder
+pub(crate) fn pending_sorted_by_path() -> &'static str {
+    tr!("待定的文件, 已依照路径排序", "Pending files, sorted by path")
+} // PendingFiles + SortedByPath
 /// 日志右侧那格 SHA 跳转框的提示。官方原文**没有冒号**，别自己补。
-pub(crate) const JUMP_TO_SHA: &str = "转到Commit的SHA-1"; // JumpToRevisionLabelGit
+pub(crate) fn jump_to_sha() -> &'static str { tr!("转到Commit的SHA-1", "Jump to commit SHA-1") } // JumpToRevisionLabelGit
 /// 历史页那一格**搜索**的提示。这一格不是 SourceTree 那一档（它的搜索是侧栏「搜索」
 /// 下面那块带作用域条的独立面板，本机没有安装包、控件一个数都没量到）——
 /// 按 PROCESS 2026-10-21 规则②，这是**我们的增强**，文案因此是自己写的，
 /// 登记在 `DESIGN.md §7`。
-pub(crate) const SEARCH_HINT: &str = "搜索提交（说明 / 文件名）";
+pub(crate) fn search_hint() -> &'static str {
+    tr!("搜索提交（说明 / 文件名）", "Search commits (message / file name)")
+}
+/// 顶栏**最左**那枚固定 tab（用户 2026-10-26 要求：首页就是固定顶部 tab 左侧有个「首页」tab）。
+/// 它不随仓库书签列表滚，点它回首页；点任一仓库 tab 离开首页。
+pub(crate) fn home_tab() -> &'static str { tr!("首页", "Home") }
 
 /// 范围那一档在按钮上写什么：两态（所有分支/当前分支）用官方文案，第三条「具体分支」
 /// 是我们自己加的（SourceTree 那一档只切两态），所以按钮上直接是分支名。
+///
+/// **分离 HEAD 时「当前分支」是句假话**：那一档实际走 `--all`（见 `data::eff_scope`，
+/// 分离时 HEAD 不可达的那截本来就取不到）。chip 写着「当前分支」却查全部引用，用户读到的是
+/// 「软件筛掉了我的提交」。所以这一格说的话必须就是实参——档名换成「分离 HEAD · 全部引用」，
+/// 不新造一档，也不动取数。
 pub(crate) fn scope_label(scope: &git::Scope) -> String {
     match scope {
-        git::Scope::All => ALL_BRANCHES.to_owned(),
-        git::Scope::Current => CURRENT_BRANCH.to_owned(),
+        git::Scope::All => all_branches().to_owned(),
+        git::Scope::Current => current_branch().to_owned(),
         git::Scope::Rev(r) => r.clone(),
     }
+}
+
+pub(crate) fn scope_label_for(scope: &git::Scope, detached: bool) -> String {
+    if detached && *scope == git::Scope::Current {
+        return tr!("分离 HEAD · 全部引用", "Detached HEAD · all refs").to_owned();
+    }
+    scope_label(scope)
 }
 
 /// 筛选条上一枚弹出按钮：按钮上是**当前那一项** + ▼，点开列出其余的。
@@ -208,10 +234,25 @@ pub(crate) fn log_row(ui: &mut egui::Ui, width: f32, cells: &Cells, active: bool
     // §3.4 的层级：提交信息走「正文」13px，作者 / 日期走「次要」12px，全是 `TEXT_PRIMARY`
     // 与 `TEXT_SECONDARY` 两档灰度（§2 原则②）。选中那一行**不换色**，只加粗（§4.6）。
     let right = rect.max.x;
-    // §2 四列：图 48 | 提交信息（弹性）| 作者 96 | 日期 78。文字一律从自己列的左缘
-    // 往里缩 `COL_INSET` 起笔（提交号那一列整列删了，见 `theme.rs` 的 `COL_GRAPH` 那段）。
+    // §2 五列：图 48 | 提交号 66 | 提交信息（弹性）| 作者 96 | 日期 78。文字一律从自己列的
+    // 左缘往里缩 `COL_INSET` 起笔。
     let author_x = right - COL_DATE - COL_AUTHOR;
     let date_x = right - COL_DATE;
+    // 提交号：等宽 11px、比作者/日期再低一档（`TEXT_MUTED`）——它是指认用的坐标，
+    // 不是正文。虚拟行没有号，这一段就空着。
+    if !cells.short.is_empty() {
+        put_left(ui, band(rect, rect.min.x + COL_GRAPH + COL_INSET, COL_SHA - COL_INSET, ROW_H), |ui| {
+            ui.add(
+                Label::new(
+                    RichText::new(cells.short.as_str())
+                        .font(FontId::monospace(11.0))
+                        .color(TEXT_MUTED),
+                )
+                .truncate()
+                .selectable(false),
+            );
+        });
+    }
     // 作者 / 日期这两格也走 `put_left` + `Label::truncate`，**不用 `p.text`**：
     // `Painter::text` 不截断，长作者名（`包融 <br@example.com>` 实测 142.5pt）会从自己那格
     // （96 − 内缩 = 84pt）一路压到右边「日期」那一格上——`no_visible_text_overlaps_at_the_smallest_allowed_window`
@@ -227,7 +268,7 @@ pub(crate) fn log_row(ui: &mut egui::Ui, width: f32, cells: &Cells, active: bool
             ui.add(Label::new(RichText::new(txt.as_str()).font(meta.clone()).color(TEXT_SECONDARY)).truncate().selectable(false));
         });
     }
-    let x0 = rect.min.x + COL_GRAPH + COL_INSET;
+    let x0 = rect.min.x + COL_GRAPH + COL_SHA + COL_INSET;
     // 药丸占掉提交信息列的开头，文字从药丸后面起笔。
     let x = if cells.badges.is_empty() { x0 } else { pill_row(&p, rect, &cells.badges, x0) + PILL_AFTER };
     let w = (author_x - x - 8.0).max(60.0);
@@ -359,6 +400,7 @@ pub(crate) fn card_field(
     hint: &str,
     text: &mut String,
     rows: usize,
+    secret: bool,
 ) -> egui::Response {
     let inner = r.shrink(1.0);
     // 底色铺在**整格** `r` 上，不铺在缩了一号的 `inner`：描边按 `r` 走 `StrokeKind::Inside`
@@ -370,6 +412,7 @@ pub(crate) fn card_field(
     } else {
         egui::TextEdit::singleline(text)
     };
+    let te = if secret { te.password(true) } else { te };
     let resp = ui.put(
         inner,
         te.hint_text(hint)
@@ -524,7 +567,11 @@ pub(crate) fn primary_action(m: &mut Modal) -> Option<Action> {
         Form::RenameBranch { from } => (!raw.is_empty())
             .then(|| Action::RenameBranch { from: from.clone(), to: raw.clone() }),
         Form::StashSave { include_untracked } => Some(Action::StashSave {
-            message: if raw.is_empty() { "没有说明的贮藏".to_owned() } else { raw.clone() },
+            message: if raw.is_empty() {
+                tr!("没有说明的贮藏", "No stash description").to_owned()
+            } else {
+                raw.clone()
+            },
             include_untracked: *include_untracked,
         }),
         Form::Confirm { then } => then.take(),
@@ -667,7 +714,7 @@ pub(crate) fn push_card(
     allow_force: bool,
 ) {
     let names: Vec<String> = remotes.iter().map(|r| r.name.clone()).collect();
-    modal_label(ui, top, PUSH_LABEL_X, PUSH_ROW1_Y + 4.0, "推送到仓库：");
+    modal_label(ui, top, PUSH_LABEL_X, PUSH_ROW1_Y + 4.0, tr!("推送到仓库：", "Push to repository:"));
     if let Some(picked) =
         cell_popup(ui, top, PUSH_REMOTE_X, PUSH_ROW1_Y, PUSH_REMOTE_W, FIELD_H, remote.as_str(), &names)
     {
@@ -683,11 +730,11 @@ pub(crate) fn push_card(
 
     // 表格那一格的标题在框**外面**（左），「全选」在同一个标题行的右端——它原来孤零零浮在
     // 一只大半空着的框底下，看着像上一行的尾巴。
-    modal_label(ui, top, PUSH_LABEL_X, PUSH_HEAD_LABEL_Y + 4.0, "要推送的分支");
+    modal_label(ui, top, PUSH_LABEL_X, PUSH_HEAD_LABEL_Y + 4.0, tr!("要推送的分支", "Branches to push"));
     // 「全选」把表里每一条都勾上——它只动**这一张卡**上的勾，不碰仓库。
     if card_button(
         ui,
-        "全选",
+        tr!("全选", "Select all"),
         top.x + PUSH_TABLE_RIGHT,
         top.y + PUSH_HEAD_LABEL_Y + 13.0,
         false,
@@ -724,10 +771,10 @@ pub(crate) fn push_card(
     // 表头四列。列宽见 theme.rs。
     let mut x = PUSH_TABLE_X;
     for (title, w) in [
-        ("推送？", PUSH_COL_PICK),
-        ("本地分支", PUSH_COL_LOCAL),
-        ("远程分支", PUSH_COL_REMOTE),
-        ("跟踪？", PUSH_COL_TRACK),
+        (tr!("推送？", "Push?"), PUSH_COL_PICK),
+        (tr!("本地分支", "Local branch"), PUSH_COL_LOCAL),
+        (tr!("远程分支", "Remote branch"), PUSH_COL_REMOTE),
+        (tr!("跟踪？", "Track?"), PUSH_COL_TRACK),
     ] {
         modal_label(ui, top, x + 4.0, PUSH_TABLE_TOP + 4.0, title);
         x += w;
@@ -766,6 +813,7 @@ pub(crate) fn push_card(
             "",
             &mut row.remote_name,
             1,
+            false,
         );
         check_row(ui, Rect::from_min_max(pos2(top.x + box_x(col_track_x, PUSH_COL_TRACK), band.min.y), pos2(top.x + box_x(col_track_x, PUSH_COL_TRACK) + CHK_CARD, band.max.y)), |ui| {
             ui.checkbox(&mut row.track, "")
@@ -773,11 +821,11 @@ pub(crate) fn push_card(
     }
     // 框下面那两枚勾。
     let y = push_checks_y(n);
-    modal_switch(ui, top, PUSH_LABEL_X, y, "推送所有标签", tags);
+    modal_switch(ui, top, PUSH_LABEL_X, y, tr!("推送所有标签", "Push all tags"), tags);
     // 「允许强制推送」是偏好里的那道闸：关着的时候这一枚**摆都不摆**——
     // 摆一枚点了没用的勾等于没有闸（和偏好卡「三条都真接得通才摆上来」同一条规矩）。
     if allow_force {
-        modal_switch(ui, top, PUSH_LABEL_X + 130.0, y, "强制推送", force);
+        modal_switch(ui, top, PUSH_LABEL_X + 130.0, y, tr!("强制推送", "Force push"), force);
     }
 }
 
@@ -800,7 +848,7 @@ pub(crate) fn pull_card(
     opts: &mut git::PullOpts,
 ) -> bool {
     let names: Vec<String> = remotes.iter().map(|r| r.name.clone()).collect();
-    modal_label(ui, top, PULL_LABEL_X, PULL_REMOTE_Y + 4.0, "从仓库拉取：");
+    modal_label(ui, top, PULL_LABEL_X, PULL_REMOTE_Y + 4.0, tr!("从仓库拉取：", "Pull from repository:"));
     if let Some(picked) =
         cell_popup(ui, top, PULL_FIELD_X, PULL_REMOTE_Y, PULL_REMOTE_W, FIELD_H, remote.as_str(), &names)
     {
@@ -812,10 +860,10 @@ pub(crate) fn pull_card(
         .map(|r| r.url.clone())
         .unwrap_or_default();
     modal_note(ui, top, PULL_FIELD_X, PULL_URL_Y, PULL_REMOTE_W, &url);
-    modal_label(ui, top, PULL_LABEL_X, PULL_BRANCH_Y + 4.0, "要拉取的远程分支：");
+    modal_label(ui, top, PULL_LABEL_X, PULL_BRANCH_Y + 4.0, tr!("要拉取的远程分支：", "Remote branch to pull:"));
     // 那一列的选项来自**当前那份快照**的远程跟踪引用（按选中的远端剥前缀），
     // 「刷新」跑完 fetch、新快照落地，它跟着变——所以选项不是卡打开那一刻钉死的那一批。
-    let empty = "选择一个分支";
+    let empty = tr!("选择一个分支", "Select a branch");
     let current = if branch.is_empty() { empty } else { branch.as_str() };
     if let Some(picked) =
         cell_popup(ui, top, PULL_FIELD_X, PULL_BRANCH_Y, PULL_BRANCH_W, FIELD_H, current, branches)
@@ -826,14 +874,14 @@ pub(crate) fn pull_card(
     // 离哪一格都不像）。它跑的是 `git fetch <远端>`，只动远端那一列，不改工作区。
     let refresh = card_button(
         ui,
-        "刷新",
+        tr!("刷新", "Fetch"),
         top.x + CARD_BODY_RIGHT,
         top.y + PULL_BRANCH_Y + FIELD_H / 2.0,
         false,
     )
     .0;
-    modal_label(ui, top, PULL_LABEL_X, PULL_INTO_Y + 4.0, "拉取到本地分支：");
-    let empty2 = "选择本地分支";
+    modal_label(ui, top, PULL_LABEL_X, PULL_INTO_Y + 4.0, tr!("拉取到本地分支：", "Into local branch:"));
+    let empty2 = tr!("选择本地分支", "Select a local branch");
     let current2 = if into.is_empty() { empty2 } else { into.as_str() };
     if let Some(picked) =
         cell_popup(ui, top, PULL_FIELD_X, PULL_INTO_Y, PULL_BRANCH_W, FIELD_H, current2, locals)
@@ -841,7 +889,7 @@ pub(crate) fn pull_card(
         *into = picked;
     }
     // 「选项」那只框：标题在框外，框只裹住真摆出来的那几行。
-    modal_label(ui, top, PULL_LABEL_X, PULL_OPT_LABEL_Y + 4.0, "选项");
+    modal_label(ui, top, PULL_LABEL_X, PULL_OPT_LABEL_Y + 4.0, tr!("选项", "Options"));
     let box_rect = Rect::from_min_max(
         pos2(top.x + PULL_LABEL_X, top.y + PULL_BOX_TOP),
         pos2(top.x + CARD_BODY_RIGHT, top.y + PULL_BOX_BOTTOM),
@@ -853,14 +901,19 @@ pub(crate) fn pull_card(
         Stroke::new(1.0, BORDER_STRONG),
         egui::StrokeKind::Inside,
     );
-    modal_switch(ui, top, PULL_OPT_X, PULL_OPT_LOG_Y, "包括被合并提交的信息内容", &mut opts.log);
-    modal_switch(ui, top, PULL_OPT_X, PULL_OPT_NOFF_Y, "无论是否可以快进更新都创建新的提交", &mut opts.no_ff);
+    modal_switch(ui, top, PULL_OPT_X, PULL_OPT_LOG_Y,
+        tr!("包括被合并提交的信息内容", "Include information from merged commits"), &mut opts.log);
+    modal_switch(ui, top, PULL_OPT_X, PULL_OPT_NOFF_Y,
+        tr!("无论是否可以快进更新都创建新的提交", "Always create a new commit, even when a fast-forward is possible"), &mut opts.no_ff);
     modal_switch(
         ui,
         top,
         PULL_OPT_X,
         PULL_OPT_REBASE_Y,
-        "用变基代替合并 (警告：请确保您还没有推送您的变更)",
+        tr!(
+            "用变基代替合并 (警告：请确保您还没有推送您的变更)",
+            "Use rebase instead of merge (warning: make sure you have not pushed your changes)"
+        ),
         &mut opts.rebase,
     );
     refresh
@@ -913,23 +966,25 @@ pub(crate) fn header_row(ui: &mut egui::Ui, width: f32) {
     let p = ui.painter();
     let right = rect.max.x;
     // 表头文字走 §3.4「次要」档（12px `TEXT_SECONDARY`，预览稿 `.lh{font-size:12}`），
-    // 列的排法**跟着数据那一行同一条竖线起笔**：四列的文字都离自己列的左边线 `COL_INSET`。
+    // 列的排法**跟着数据那一行同一条竖线起笔**：各列的文字都离自己列的左边线 `COL_INSET`。
     // 「图表」仍旧整格居中（预览稿 `.lh .g` 空着、`.lr` 那一格画的是图元）。
     let g = band(rect, rect.min.x, COL_GRAPH, 13.0);
-    p.text(g.center_top(), Align2::CENTER_TOP, "图表", FontId::proportional(12.0), TEXT_SECONDARY);
+    p.text(g.center_top(), Align2::CENTER_TOP, tr!("图表", "Graph"), FontId::proportional(12.0), TEXT_SECONDARY);
     let author_x = right - COL_DATE - COL_AUTHOR;
     let date_x = right - COL_DATE;
+    let sha_x = rect.min.x + COL_GRAPH;
     for (x, w, label) in [
-        (rect.min.x + COL_GRAPH + COL_INSET, author_x - rect.min.x - COL_GRAPH - COL_INSET, "提交信息"),
-        (author_x + COL_INSET, COL_AUTHOR - COL_INSET, "作者"),
-        (date_x + COL_INSET, COL_DATE - COL_INSET, "日期"),
+        (sha_x + COL_INSET, COL_SHA - COL_INSET, tr!("提交号", "Revision")),
+        (sha_x + COL_SHA + COL_INSET, author_x - sha_x - COL_SHA - COL_INSET, tr!("提交信息", "Message")),
+        (author_x + COL_INSET, COL_AUTHOR - COL_INSET, tr!("作者", "Author")),
+        (date_x + COL_INSET, COL_DATE - COL_INSET, tr!("日期", "Date")),
     ] {
         p.text(band(rect, x, w, 13.0).left_top(), Align2::LEFT_TOP, label, FontId::proportional(12.0), TEXT_SECONDARY);
     }
-    // 列边界上的**三条**竖线（1pt 宽、16pt 高）：图 \| 提交信息、提交信息 \| 作者、作者 \| 日期。
-    // 旧的四条里「提交 \| 描述」那一条跟着提交号那一列一起删了。
+    // 列边界上的**四条**竖线（1pt 宽、16pt 高）：图 \| 提交号、提交号 \| 提交信息、
+    // 提交信息 \| 作者、作者 \| 日期。
     let y0 = rect.center().y - RULE_H / 2.0;
-    for x in [rect.min.x + COL_GRAPH, author_x, date_x] {
+    for x in [sha_x, sha_x + COL_SHA, author_x, date_x] {
         p.line_segment([pos2(x, y0), pos2(x, y0 + RULE_H)], Stroke::new(1.0, BORDER_SUBTLE));
     }
     // 表头上下各一条横线，把这一条从筛选条与日志里隔开。
@@ -948,13 +1003,32 @@ pub(crate) fn header_row(ui: &mut egui::Ui, width: f32) {
 /// **中文不进顶栏**（§2：那一行只有 tab、分支、按钮）——标签住在 tooltip 里，
 /// 等 §2 那句「溢出收进 `»` 菜单」落地时它还会住在菜单项里。
 pub(crate) fn icon_button(ui: &mut egui::Ui, i: usize) -> bool {
-    let (icon, _label, hint) = TOOLS[i];
+    let icon = TOOLS[i].0;
+    let hint = tool_hint(i);
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(ICON_BTN), Sense::click());
     if resp.hovered() {
         ui.painter().rect_filled(rect, ICON_BTN_R, BG_HOVER);
     }
     ui.painter().text(rect.center(), Align2::CENTER_CENTER, icon, FontId::proportional(ICON_PX), TEXT_SECONDARY);
     resp.on_hover_text(hint).clicked()
+}
+
+/// 一枚胶囊 tab 的宽度 = 文字宽 + 左右各 `TAB_PILL_PAD`。
+/// 画它的三处（仓库 / 幽灵 / `»`）和顶栏收纳那本账**共用这一个算式**：
+/// 两处各写一遍，迟早出现「量的是 A、画的是 B」——那正是收纳失效的方式。
+pub(crate) fn tab_w(text_w: f32) -> f32 {
+    text_w + 2.0 * TAB_PILL_PAD
+}
+
+/// 一行字在这一档字体下占多宽。顶栏收纳那本账要用它算右边那一组，
+/// 而算的必须是**画的那一档**（分支名 12 常规、`↑↓` 12 中黑）。
+pub(crate) fn text_w(ui: &egui::Ui, text: &str, font: FontId) -> f32 {
+    ui.painter().layout_no_wrap(text.to_owned(), font, TEXT_SECONDARY).size().x
+}
+
+/// `↑n ↓m` 那枚计数用的字体（§2：主色 + 真字重）。画它和量它共用这一行。
+pub(crate) fn counts_font() -> FontId {
+    FontId { size: BRANCH_FONT, family: crate::ui::fonts::semibold_family(), ..FontId::proportional(BRANCH_FONT) }
 }
 
 /// 一枚仓库 tab：**胶囊开关**（§2「高 26、圆角 999，选中 = 主色浅底深字」；预览稿 `.tab`）。
@@ -964,14 +1038,10 @@ pub(crate) fn icon_button(ui: &mut egui::Ui, i: usize) -> bool {
 pub(crate) fn repo_tab(ui: &mut egui::Ui, label: &str, active: bool) -> bool {
     // 选中那一枚走真字重（预览稿 `.tab.on{font-weight:600}`）；§3.4 说 600 只有拉丁/数字吃得进
     // 真字重，仓库名正是拉丁。
-    let font = if active {
-        FontId { size: TAB_FONT, family: crate::ui::fonts::semibold_family(), ..FontId::proportional(TAB_FONT) }
-    } else {
-        FontId::proportional(TAB_FONT)
-    };
+    let font = tab_font(active);
     let ink = if active { ACCENT_INK } else { TEXT_SECONDARY };
     let galley = ui.painter().layout_no_wrap(label.to_owned(), font, ink);
-    let (rect, resp) = ui.allocate_exact_size(vec2(galley.size().x + 2.0 * TAB_PILL_PAD, TAB_PILL_H), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(vec2(tab_w(galley.size().x), TAB_PILL_H), Sense::click());
     let p = ui.painter();
     let fill = if active { ACCENT_SOFT } else if resp.hovered() { BG_HOVER } else { Color32::TRANSPARENT };
     p.rect(rect, egui::CornerRadius::same(TAB_PILL_R), fill, Stroke::NONE, egui::StrokeKind::Inside);
@@ -979,18 +1049,130 @@ pub(crate) fn repo_tab(ui: &mut egui::Ui, label: &str, active: bool) -> bool {
     resp.clicked()
 }
 
+/// tab 上那行字用哪档字重：选中走真字重，未选中走常规。收纳那本账量的必须是**画的那一档**，
+/// 否则「选中一枚比量出来的宽」会把右边那串顶过去。
+fn tab_font(active: bool) -> FontId {
+    if active {
+        FontId { size: TAB_FONT, family: crate::ui::fonts::semibold_family(), ..FontId::proportional(TAB_FONT) }
+    } else {
+        FontId::proportional(TAB_FONT)
+    }
+}
+
 /// 「＋ 添加仓库」那一枚**幽灵** tab（预览稿 `.tab.add`）：不铺底，只描一圈边、字走辅助档。
 /// 它是空列表时**唯一**的入口，所以画得再轻也不能省。
 /// spec 写的是 `1px dashed`：egui 0.37 的 `Stroke` 给不了圆角矩形的虚线（`PathPaint` 没有
 /// dash 字段），先落 1px `BORDER_STRONG` 实线，虚线这一档自定让步登记在 PROCESS。
 pub(crate) fn ghost_tab(ui: &mut egui::Ui, label: &str) -> bool {
-    let font = FontId::proportional(12.0);
-    let galley = ui.painter().layout_no_wrap(label.to_owned(), font.clone(), TEXT_MUTED);
-    let (rect, resp) = ui.allocate_exact_size(vec2(galley.size().x + 2.0 * TAB_PILL_PAD, TAB_PILL_H), Sense::click());
+    let galley = ghost_galley(ui, label);
+    let (rect, resp) = ui.allocate_exact_size(vec2(tab_w(galley.size().x), TAB_PILL_H), Sense::click());
     let p = ui.painter();
     p.rect(rect, egui::CornerRadius::same(TAB_PILL_R), Color32::TRANSPARENT, Stroke::new(1.0, BORDER_STRONG), egui::StrokeKind::Inside);
     p.galley(rect.min + vec2(TAB_PILL_PAD, (rect.height() - galley.size().y) / 2.0), galley, TEXT_MUTED);
     resp.clicked()
+}
+
+fn ghost_galley(ui: &egui::Ui, label: &str) -> std::sync::Arc<egui::Galley> {
+    ui.painter().layout_no_wrap(label.to_owned(), FontId::proportional(12.0), TEXT_MUTED)
+}
+
+/// 顶栏收纳那本账的三个问句：一枚画得出来的 tab 到底占多宽。**量与画同源**（`tab_w`），
+/// 所以「算下来放得下、画出来却压住右边」这一类错不会从这两行里长出来。
+pub(crate) fn repo_tab_width(ui: &egui::Ui, label: &str, active: bool) -> f32 {
+    tab_w(ui.painter().layout_no_wrap(label.to_owned(), tab_font(active), TEXT_SECONDARY).size().x)
+}
+
+pub(crate) fn ghost_tab_width(ui: &egui::Ui, label: &str) -> f32 {
+    tab_w(ghost_galley(ui, label).size().x)
+}
+
+/// 顶栏那枚 `»`：窗口收窄、仓库 tab 排不下时，剩下的收进它里面（§2）。
+/// 它自己**也占一格**，那一格要从预算里先扣掉（见 `Gitx::toolbar` 的 `fit_header_tabs`）。
+/// 不用 `menu::MenuButton`：那枚按钮自己决定宽度，而收纳要**先知道**它占多格才能决定谁能留下；
+/// 这里画的是一枚和旁边胶囊同规格的 pill，弹出交给调用方的 `egui::Popup::menu`。
+pub(crate) fn more_tab(ui: &mut egui::Ui) -> Response {
+    let galley = ghost_galley(ui, MORE_GLYPH);
+    let (rect, _) = ui.allocate_exact_size(vec2(tab_w(galley.size().x), TAB_PILL_H), Sense::hover());
+    let resp = ui.interact(rect, Id::unique("gitx-header-more"), Sense::click());
+    let p = ui.painter();
+    let fill = if resp.hovered() { BG_HOVER } else { Color32::TRANSPARENT };
+    p.rect(rect, egui::CornerRadius::same(TAB_PILL_R), fill, Stroke::new(1.0, BORDER_STRONG), egui::StrokeKind::Inside);
+    p.galley(rect.min + vec2(TAB_PILL_PAD, (rect.height() - galley.size().y) / 2.0), galley, TEXT_MUTED);
+    resp.on_hover_text(tr!("放不下的仓库", "Repositories that did not fit"))
+}
+
+pub(crate) fn more_tab_width(ui: &egui::Ui) -> f32 {
+    tab_w(ghost_galley(ui, MORE_GLYPH).size().x)
+}
+
+/// 首页仓库列表的一张卡：白底 + 1px `BORDER_SUBTLE` 边 + 圆角 8；名字 14/600、路径 11 辅助灰，
+/// 右端 `note`（当前仓库那里放分支 · ↑↓）。整张卡可点 = 打开那个仓库。
+/// 当前仓库铺 `ACCENT_SOFT` + `ACCENT_LINE` 边，和顶栏选中胶囊同一套「选中」语言。
+///
+/// 卡高钉在 `HOME_CARD_H`（54 = 内容 34 + 上下内边距 18 + 边 2），卡片之间 8pt 才走得齐。
+/// 不用 `Button`：它给不了两行不同字级 + 右对齐备注；也不在卡里放子按钮，
+/// 免得「点卡」与「点卡里的按钮」抢同一下。
+pub(crate) fn home_repo_card(
+    ui: &mut egui::Ui,
+    name: &str,
+    path: &str,
+    note: &str,
+    current: bool,
+) -> bool {
+    let avail = ui.available_rect_before_wrap();
+    let expected = Rect::from_min_size(avail.min, vec2(avail.width(), HOME_CARD_H));
+    let hover = ui.rect_contains_pointer(expected);
+    let fill = if current {
+        ACCENT_SOFT
+    } else if hover {
+        BG_HOVER
+    } else {
+        BG_WINDOW
+    };
+    let edge = if current { ACCENT_LINE } else { BORDER_SUBTLE };
+    let card = egui::Frame::NONE
+        .fill(fill)
+        .stroke(Stroke::new(1.0, edge))
+        .corner_radius(egui::CornerRadius::same(HOME_CARD_RAD))
+        .inner_margin(egui::Margin::symmetric(12, 9))
+        .show(ui, |ui| {
+            ui.set_width((avail.width() - 26.0).max(0.0));
+            ui.set_min_height(HOME_CARD_H - 20.0);
+            ui.label(
+                RichText::new(name)
+                    .size(14.0)
+                    .color(TEXT_PRIMARY)
+                    .family(crate::ui::fonts::semibold_family()),
+            );
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(path).size(11.0).color(TEXT_MUTED));
+                if !note.is_empty() {
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(RichText::new(note).size(11.0).color(TEXT_MUTED));
+                    });
+                }
+            });
+        });
+    ui.interact(card.response.rect, ui.scope_id().with(("home-repo", path)), Sense::click())
+        .clicked()
+}
+
+/// 首页「代码托管」那一行前面的平台小药丸（GitHub / Gitee / Codeup）。
+/// 浅蓝底 + 同色描边 + 深色字，和日志里的分支药丸同一套；不是装饰，是「这个仓库属于谁」。
+pub(crate) fn provider_badge(ui: &mut egui::Ui, label: &str) {
+    egui::Frame::NONE
+        .fill(ACCENT_SOFT)
+        .stroke(Stroke::new(1.0, ACCENT_LINE))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::symmetric(6, 2))
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(label)
+                    .size(11.0)
+                    .color(ACCENT_INK)
+                    .family(crate::ui::fonts::semibold_family()),
+            );
+        });
 }
 
 /// 侧栏的**子项**行（§2「子项行高 26，选中 = 浅蓝药丸（圆角 6）」）：整行可点，文字钉死在
@@ -1061,6 +1243,66 @@ pub(crate) fn side_group_row(ui: &mut egui::Ui, title: &str, count: usize) {
     p.text(pos2(base + SIDE_COUNT_X, cy), Align2::RIGHT_CENTER, count.to_string(), FontId::proportional(SIDE_COUNT_FONT), TEXT_MUTED);
 }
 
+/// 看板里的一条 PR（DESIGN §2.2）：**两行**——`#号 + 标题` 一行、状态一句话一行，
+/// 左缘一枚蓝点 = 「你上次看过之后它又动了」。整行可点 = 记号 + 在浏览器打开。
+///
+/// 文字走 `Label` 的 `truncate` 而不是 painter 落 galley：188pt 那一栏装不下一条真实的
+/// PR 标题，galley 不裁就会横着溢出到日志区（侧栏那些短分支名量不到这一条）。
+/// 状态那一句的颜色由调用方按**挡路的事**给（§原则①：颜色只给状态，不装饰）。
+pub(crate) fn board_pr_row(
+    ui: &mut egui::Ui,
+    number: u32,
+    title: &str,
+    status: &str,
+    status_color: Color32,
+    is_new: bool,
+    selected: bool,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), BOARD_ROW_H), Sense::click());
+    let base = rect.min.x - SIDE_INSET as f32;
+    let p = ui.painter();
+    if selected {
+        p.add(egui::Shape::rect_filled(
+            Rect::from_min_max(
+                pos2(base + SIDE_PILL_L, rect.center().y - BOARD_ROW_H / 2.0),
+                pos2(base + SIDE_PILL_R, rect.center().y + BOARD_ROW_H / 2.0),
+            ),
+            SIDE_PILL_RAD as f32,
+            ACCENT_SOFT,
+        ));
+    } else if resp.hovered() {
+        p.rect_filled(rect, 2.0, BG_HOVER);
+    }
+    if is_new {
+        p.circle(pos2(base + SIDE_DOT_X, rect.center().y), SIDE_DOT_R, ACCENT, Stroke::NONE);
+    }
+    let text_l = base + SIDE_TEXT_X;
+    let text_r = base + SIDE_COUNT_X;
+    // 两行的落点：以行中心为界各占 `BOARD_LINE_H` 半格。
+    let title_row = Rect::from_min_max(pos2(text_l, rect.center().y - BOARD_LINE_H), pos2(text_r, rect.center().y));
+    let status_row = Rect::from_min_max(pos2(text_l, rect.center().y), pos2(text_r, rect.center().y + BOARD_LINE_H));
+    put_left(ui, title_row, |ui| {
+        let shown = if title.is_empty() { tr!("（无标题）", "(no title)") } else { title };
+        ui.add(
+            Label::new(
+                RichText::new(format!("#{number} {shown}"))
+                    .size(BOARD_TITLE_FONT)
+                    .color(TEXT_PRIMARY),
+            )
+            .truncate()
+            .selectable(false),
+        );
+    });
+    put_left(ui, status_row, |ui| {
+        ui.add(
+            Label::new(RichText::new(status).size(BOARD_STATUS_FONT).color(status_color))
+                .truncate()
+                .selectable(false),
+        );
+    });
+    resp
+}
+
 /// 一帧里从界面各处收上来的「接下来要发生的事」。行点击、右键菜单、卡片按钮都往这里放，
 /// 面板收尾时统一落地。
 ///
@@ -1078,9 +1320,25 @@ pub(crate) struct Intent {
     /// 侧栏「远端」里要点开/收起的**那一条的名字**。放在 `Intent` 而不是就地改
     /// `self.remote_open`：这一段跑在面板闭包里，`self` 正被借走。
     pub(crate) toggle_remote: Option<String>,
+    /// 侧栏「远端」展开后**超过 3 条**的那一截：点「还有 N 个」把这一条远端整组摊开。
+    /// 默认只画前 3 条（用户 2026-10-26 要求），摊开记在 `Gitx::remote_all` 里。
+    pub(crate) toggle_remote_all: Option<String>,
     /// 侧栏「搜索」那一行：把日志条右边那一格换成搜索框。同样因为闭包借走了 `self`，
     /// 只能递一个布尔出去。开着的时候再点那一行不重算命中（见 `open_search`）。
     pub(crate) open_search: bool,
+    /// 左栏顶那一枚「看板 / 仓库」切换（DESIGN §2.2）。看板整栏替掉大纲，
+    /// 切过去 = 认 provider + 读「看过」+ 起一次取数，全在 `land` 里办。
+    pub(crate) toggle_board: bool,
+    /// 看板里点开的哪一条（按下标）。落地面记「看过」并在浏览器打开——
+    /// 记号必须跟着这一击走，否则蓝点永远亮着，那个点就没有意义了。
+    pub(crate) open_pr: Option<usize>,
+    /// 「刷新」那一枚：只重发请求，不动「看过」那一份记录。
+    pub(crate) refresh_board: bool,
+    /// 这一帧**画在可见区里**的那几行看板行（按 `board.prs` 的下标）。
+    /// 收在 `Intent` 而不是就地发请求：这一段跑在面板闭包里，`self` 正被借走，
+    /// 而补取要动 `asked` / `facts` 两本账。可见性只在这条路上量得到 ——
+    /// 滚动区外的行根本不进这一格，所以「视口外的行不起请求」有地方可问。
+    pub(crate) enrich: Vec<usize>,
 }
 
 impl Intent {
@@ -1120,10 +1378,10 @@ pub(crate) fn needs_confirm(a: &Action) -> bool {
 /// 遴选叫「遴选」，变基叫「变基」。
 pub(crate) fn op_noun(state: &str) -> &'static str {
     match state {
-        "merge" => "合并",
-        "cherry-pick" => "遴选",
-        "rebase" => "变基",
-        _ => "操作",
+        "merge" => tr!("合并", "merge"),
+        "cherry-pick" => tr!("遴选", "cherry-pick"),
+        "rebase" => tr!("变基", "rebase"),
+        _ => tr!("操作", "operation"),
     }
 }
 
@@ -1131,9 +1389,9 @@ pub(crate) fn op_noun(state: &str) -> &'static str {
 /// 照抄。没有进行中的操作时返回 `None`，调用方据此决定画不画横幅。
 pub(crate) fn op_title(state: &str) -> Option<&'static str> {
     match state {
-        "merge" => Some("未解决的合并："),
-        "cherry-pick" => Some("未解决的遴选："),
-        "rebase" => Some("未解决的变基:"),
+        "merge" => Some(tr!("未解决的合并：", "Unresolved merge:")),
+        "cherry-pick" => Some(tr!("未解决的遴选：", "Unresolved cherry-pick:")),
+        "rebase" => Some(tr!("未解决的变基:", "Unresolved rebase:")),
         _ => None,
     }
 }
@@ -1141,17 +1399,17 @@ pub(crate) fn op_title(state: &str) -> Option<&'static str> {
 /// 「继续」那一枚按钮上的字。合并就是「继续」，另外两种带上操作名（SourceTree 同款）。
 pub(crate) fn continue_label(state: &str) -> String {
     match state {
-        "merge" => "继续".to_owned(),
-        other => format!("继续{}", op_noun(other)),
+        "merge" => tr!("继续", "Continue").to_owned(),
+        other => tr!(format!("继续{}", op_noun(other)), format!("Continue {}", op_noun(other))),
     }
 }
 
 /// 「终止」那一枚。变基在 SourceTree 里叫「放弃变基」，另外两种叫「终止…」。
 pub(crate) fn abort_label(state: &str) -> String {
     match state {
-        "merge" => "终止".to_owned(),
-        "rebase" => "放弃变基".to_owned(),
-        other => format!("终止{}", op_noun(other)),
+        "merge" => tr!("终止", "Abort").to_owned(),
+        "rebase" => tr!("放弃变基", "Abort rebase").to_owned(),
+        other => tr!(format!("终止{}", op_noun(other)), format!("Abort {}", op_noun(other))),
     }
 }
 
@@ -1159,52 +1417,94 @@ pub(crate) fn abort_label(state: &str) -> String {
 pub(crate) fn confirm_of(a: &Action) -> (&'static str, String) {
     match a {
         Action::DeleteBranch(name) => (
-            "删除分支",
-            format!("分支 {name} 会被删掉。没合并过的分支 git 自己会拦下来，不会静默丢提交。"),
+            tr!("删除分支", "Delete branch"),
+            tr!(
+                format!("分支 {name} 会被删掉。没合并过的分支 git 自己会拦下来，不会静默丢提交。"),
+                format!("Branch {name} will be deleted. git refuses an unmerged branch on its own — no commits are lost silently.")
+            ),
         ),
-        Action::DeleteTag(name) => ("删除标签", format!("标签 {name} 从本地删掉；远端那份要另外推一次才会没。")),
-        Action::StashPop(i) => ("弹出贮藏", format!("stash@{{{i}}} 回到工作区，同时从贮藏列表里删掉。")),
-        Action::StashDrop(i) => ("丢弃贮藏", format!("stash@{{{i}}} 那份改动直接丢掉，找不回来。")),
+        Action::DeleteTag(name) => (
+            tr!("删除标签", "Delete tag"),
+            tr!(
+                format!("标签 {name} 从本地删掉；远端那份要另外推一次才会没。"),
+                format!("Tag {name} goes from this repository only; the remote copy needs a separate push.")
+            ),
+        ),
+        Action::StashPop(i) => (
+            tr!("弹出贮藏", "Pop stash"),
+            tr!(
+                format!("stash@{{{i}}} 回到工作区，同时从贮藏列表里删掉。"),
+                format!("stash@{{{i}}} comes back into the working tree and leaves the stash list.")
+            ),
+        ),
+        Action::StashDrop(i) => (
+            tr!("丢弃贮藏", "Drop stash"),
+            tr!(
+                format!("stash@{{{i}}} 那份改动直接丢掉，找不回来。"),
+                format!("The changes in stash@{{{i}}} are dropped — there is no way back.")
+            ),
+        ),
         Action::Amend(_) => (
-            "修正上一条提交",
-            "上一条提交会被新的信息和暂存内容替换。没推送过就没有影响；推送过的分支要强推才能更新远端。"
-                .to_owned(),
+            tr!("修正上一条提交", "Amend the last commit"),
+            tr!(
+                "上一条提交会被新的信息和暂存内容替换。没推送过就没有影响；推送过的分支要强推才能更新远端。",
+                "The last commit is replaced by the new message and staged content. If it was never pushed nothing happens elsewhere; a pushed branch needs a force update."
+            )
+            .to_owned(),
         ),
         Action::RestoreFile { oid, path } => (
-            "恢复到旧版本",
-            format!(
-                "{} 会被 {oid} 那一版覆盖，工作区和暂存区里它现在的改动都会没。",
-                path,
-                oid = &oid[..oid.len().min(8)]
+            tr!("恢复到旧版本", "Restore this older version"),
+            tr!(
+                format!("{} 会被 {oid} 那一版覆盖，工作区和暂存区里它现在的改动都会没。", path, oid = &oid[..oid.len().min(8)]),
+                format!("{} is overwritten by the version at {oid} — what it holds now in the working tree and index is gone.", path, oid = &oid[..oid.len().min(8)])
             ),
         ),
         Action::ResolveOurs(path) => (
-            "确认使用「我的版本」解决冲突",
-            format!("{path} 会被当前分支那一版覆盖，工作区里它现在的手工改动都会没。"),
+            tr!("确认使用「我的版本」解决冲突", "Confirm resolving with \"mine\""),
+            tr!(
+                format!("{path} 会被当前分支那一版覆盖，工作区里它现在的手工改动都会没。"),
+                format!("{path} is overwritten by this branch's version — the edits you made by hand are gone.")
+            ),
         ),
         Action::ResolveTheirs(path) => (
-            "确认使用「他们的版本」解决冲突",
-            format!("{path} 会被传入那一版覆盖，工作区里它现在的手工改动都会没。"),
+            tr!("确认使用「他们的版本」解决冲突", "Confirm resolving with \"theirs\""),
+            tr!(
+                format!("{path} 会被传入那一版覆盖，工作区里它现在的手工改动都会没。"),
+                format!("{path} is overwritten by the incoming version — the edits you made by hand are gone.")
+            ),
         ),
         Action::MarkUnresolved(path) => (
-            "确认标记为未解决",
-            format!("{path} 会被重新写上冲突标记，工作区里它现在的改动会被覆盖。"),
+            tr!("确认标记为未解决", "Confirm marking as unresolved"),
+            tr!(
+                format!("{path} 会被重新写上冲突标记，工作区里它现在的改动会被覆盖。"),
+                format!("Conflict markers go back into {path}, overwriting what it holds now.")
+            ),
         ),
         Action::ContinueOp { state } => (
-            "继续操作？",
+            tr!("继续操作？", "Continue?"),
             match state.as_str() {
-                "rebase" => "您确定要继续此变基操作吗？请确保您已经解决了所有待解决的冲突。".to_owned(),
-                other => format!("确认所有冲突都已解决，然后完成这次{}。", op_noun(other)),
+                "rebase" => tr!(
+                    "您确定要继续此变基操作吗？请确保您已经解决了所有待解决的冲突。",
+                    "Continue this rebase? Make sure every conflict is resolved."
+                )
+                .to_owned(),
+                other => tr!(
+                    format!("确认所有冲突都已解决，然后完成这次{}。", op_noun(other)),
+                    format!("Confirm every conflict is resolved, then finish this {}.", op_noun(other))
+                ),
             },
         ),
         Action::AbortOp { state } => (
-            "中止操作？",
+            tr!("中止操作？", "Abort?"),
             match state.as_str() {
-                "rebase" => "您确定要中止这次变基吗？".to_owned(),
-                other => format!("这次{}会整个撤销，已经解掉的那部分改动也会没。", op_noun(other)),
+                "rebase" => tr!("您确定要中止这次变基吗？", "Abort this rebase?").to_owned(),
+                other => tr!(
+                    format!("这次{}会整个撤销，已经解掉的那部分改动也会没。", op_noun(other)),
+                    format!("This {} is undone entirely — the conflicts you already resolved go with it.", op_noun(other))
+                ),
             },
         ),
-        _ => ("确认", String::new()),
+        _ => (tr!("确认", "Confirm"), String::new()),
     }
 }
 
@@ -1251,16 +1551,28 @@ pub(crate) fn menu_go(ui: &mut egui::Ui, label: &str, oid: String, intent: &mut 
 pub(crate) fn reset_words(mode: git::ResetMode) -> (&'static str, &'static str) {
     use git::ResetMode as M;
     match mode {
-        M::Soft => ("都保留（软）", "分支指针挪走，暂存区和工作区里的改动一条都不动。"),
-        M::Mixed => ("取消暂存（混合）", "改动都留在工作区，但暂存区清空，要重新暂存一遍。"),
-        M::Hard => ("丢弃改动（硬）", "工作区和暂存区都被那条提交覆盖，未提交的改动当场没了、找不回来。"),
+        M::Soft => (
+            tr!("都保留（软）", "Keep everything (soft)"),
+            tr!("分支指针挪走，暂存区和工作区里的改动一条都不动。", "The branch pointer moves; nothing in the index or working tree changes."),
+        ),
+        M::Mixed => (
+            tr!("取消暂存（混合）", "Unstage (mixed)"),
+            tr!("改动都留在工作区，但暂存区清空，要重新暂存一遍。", "Changes stay in the working tree, but the index is emptied and you stage again."),
+        ),
+        M::Hard => (
+            tr!("丢弃改动（硬）", "Discard changes (hard)"),
+            tr!("工作区和暂存区都被那条提交覆盖，未提交的改动当场没了、找不回来。", "The working tree and index are overwritten by that commit — uncommitted changes are gone for good."),
+        ),
     }
 }
 
 /// 三档**共同**的那一句：挪分支指针意味着什么，和选哪档无关，所以它不跟着页签变。
 /// 「还在对象库里、reflog 找得回来」这句要紧——用户听到「历史没了」的第一反应是恐慌，
 /// 而三条提交其实一条都没被删。
-pub(crate) const RESET_SHARES: &str = "那之后的提交会离开这条分支，但对象还在，用 reflog 找得回来。";
+pub(crate) fn reset_shares() -> &'static str {
+    tr!("那之后的提交会离开这条分支，但对象还在，用 reflog 找得回来。",
+        "Those later commits leave this branch, but the objects are still there — reflog gets them back.")
+}
 
 /// 日志一行的右键菜单。`subject` 只用来给「打标签」那张卡当说明——卡上的说明必须是
 /// **打开那一刻**那条提交的话，之后日志翻页不能让它换内容。
@@ -1268,22 +1580,22 @@ pub(crate) fn commit_menu(ui: &mut egui::Ui, oid: &str, subject: &str, intent: &
     let full = oid.to_owned();
     // 文案里写明「分离 HEAD」：git 的 `checkout <oid>` 就是这样，而只写「检出这个提交」的话，
     // 用户点完发现上面的提交不见了，会以为是软件吞了历史（状态栏那边另有「回到 main」那一格）。
-    menu_item(ui, "检出这条提交（分离 HEAD）", || Action::Checkout(full.clone()), intent);
-    menu_card(ui, "从这里新建分支", || Modal::new_branch_at(Some(full.clone())), intent);
-    menu_card(ui, "在这条提交上打标签", || Modal::new_tag(full.clone(), subject.to_owned()), intent);
-    menu_item(ui, "合并到当前分支", || Action::Merge(full.clone()), intent);
+    menu_item(ui, tr!("检出这条提交（分离 HEAD）", "Check out this commit (detached HEAD)"), || Action::Checkout(full.clone()), intent);
+    menu_card(ui, tr!("从这里新建分支", "New branch from here"), || Modal::new_branch_at(Some(full.clone())), intent);
+    menu_card(ui, tr!("在这条提交上打标签", "Tag this commit"), || Modal::new_tag(full.clone(), subject.to_owned()), intent);
+    menu_item(ui, tr!("合并到当前分支", "Merge into current branch"), || Action::Merge(full.clone()), intent);
     // 重置走**卡**而不是确认框：三档的差别是「你的改动还在不在」，一句话的确认框装不下，
     // 而这一句正是用户按下去之前唯一想知道的事。名字里写清「当前分支」——挪的是站着的那条。
     menu_card(
         ui,
-        "把当前分支重置到这条提交…",
+        tr!("把当前分支重置到这条提交…", "Reset the current branch to this commit…"),
         || Modal::reset(full.clone(), subject.to_owned()),
         intent,
     );
     // 归档只读对象库、不动工作区，所以不过确认卡；但它要**问一个存盘位置**，
     // 于是这一行交回去的只是 oid（见 `Action::Archive`：面板在下一帧之外才跑）。
-    menu_item(ui, "归档成 zip", || Action::Archive(full.clone()), intent);
-    if ui.button("复制完整提交号").clicked() {
+    menu_item(ui, tr!("归档成 zip", "Archive as zip"), || Action::Archive(full.clone()), intent);
+    if ui.button(tr!("复制完整提交号", "Copy full revision")).clicked() {
         ui.ctx().copy_text(full.clone());
         ui.close();
     }
@@ -1361,7 +1673,7 @@ pub(crate) fn section(
         ui,
         Rect::from_min_max(pos2(hrect.min.x + CHK_HEAD_X + CHK_S + 7.0, hrect.min.y), pos2(hrect.max.x - 84.0, hrect.max.y)),
         |ui| {
-            ui.add(Label::new(RichText::new(format!("{title}（{}）", files.len())).size(11.5).strong()).selectable(false).sense(Sense::hover()));
+            ui.add(Label::new(RichText::new(tr!(format!("{title}（{}）", files.len()), format!("{title} ({})", files.len()))).size(11.5).strong()).selectable(false).sense(Sense::hover()));
         },
     );
     let mut discard = false;
@@ -1372,7 +1684,7 @@ pub(crate) fn section(
                 .max_rect(Rect::from_min_max(pos2(hrect.max.x - 80.0, hrect.min.y), pos2(hrect.max.x, hrect.max.y)))
                 .layout(egui::Layout::right_to_left(Align::Center)),
             |ui| {
-                discard = ui.small_button("放弃整组").clicked();
+                discard = ui.small_button(tr!("放弃整组", "Discard group")).clicked();
             },
         );
     }
@@ -1405,6 +1717,7 @@ pub(crate) fn conflict_section(
     ui: &mut egui::Ui,
     files: &[&FileStatus],
     current: &Option<String>,
+    repo: &str,
     act: &mut Option<Action>,
     pick: &mut Option<Target>,
     hist: &mut Option<String>,
@@ -1422,10 +1735,13 @@ pub(crate) fn conflict_section(
         |ui| {
             ui.add(
                 Label::new(
-                    RichText::new(format!("冲突的文件（{}）", files.len()))
+                    RichText::new(tr!(
+                        format!("冲突的文件（{}）", files.len()),
+                        format!("Conflicting files ({})", files.len())
+                    ))
                         .size(11.5)
                         .strong()
-                        .color(WARN),
+                        .color(CONF_FG),
                 )
                 .selectable(false)
                 .sense(Sense::hover()),
@@ -1452,7 +1768,7 @@ pub(crate) fn conflict_section(
                 untracked: false,
             });
         }
-        resp.context_menu(|ui| conflict_menu(ui, &path, act, hist));
+        resp.context_menu(|ui| conflict_menu(ui, &path, repo, act, hist));
     }
 }
 
@@ -1461,9 +1777,18 @@ pub(crate) fn conflict_section(
 pub(crate) fn op_banner(ui: &mut egui::Ui, state: &str, conflicts: usize, act: &mut Option<Action>) {
     let Some(title) = op_title(state) else { return };
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), CONFLICT_BANNER_H), Sense::hover());
-    ui.painter().rect_filled(rect.shrink2(vec2(0.0, 2.0)), 4.0, WARN_BG);
+    // §3.1 把「警告」和「冲突」拆成两对色：`# ` 有几条要人亲手合，值得单独一档。
+    let (bg, fg) = if conflicts > 0 {
+        (CONF_BG, CONF_FG)
+    } else {
+        (WARN_BG, WARN_FG)
+    };
+    ui.painter().rect_filled(rect.shrink2(vec2(0.0, 2.0)), 4.0, bg);
     let text = if conflicts > 0 {
-        format!("{title}冲突：{conflicts}")
+        tr!(
+            format!("{title}冲突：{conflicts}"),
+            format!("{title} {conflicts} conflict(s)")
+        )
     } else {
         title.to_owned()
     };
@@ -1471,7 +1796,7 @@ pub(crate) fn op_banner(ui: &mut egui::Ui, state: &str, conflicts: usize, act: &
         ui,
         Rect::from_min_max(pos2(rect.min.x + 10.0, rect.min.y + 4.0), pos2(rect.max.x - 150.0, rect.max.y - 4.0)),
         |ui| {
-            ui.add(Label::new(RichText::new(text).size(11.5).color(WARN)).truncate().selectable(false));
+            ui.add(Label::new(RichText::new(text).size(11.5).color(fg)).truncate().selectable(false));
         },
     );
     let mut next: Option<Action> = None;

@@ -4,6 +4,7 @@ use chrono::Datelike;
 use eframe::egui::{self, Align2, Color32, FontId, Label, Rect, RichText, Sense, Stroke, TextStyle, Vec2, pos2, vec2};
 use gitx::models::{Branch, ChangeStatus, Commit, FileStatus, RemoteRef, Tag};
 use gitx::git;
+use gitx::tr;
 use std::sync::mpsc::Sender;
 
 use crate::ui::theme::*;
@@ -24,9 +25,9 @@ pub(crate) fn date_label(iso: &str, now: chrono::DateTime<chrono::Local>) -> Str
     let hm = then.format("%H:%M");
     let days = (now.date_naive() - then.date_naive()).num_days();
     if days == 0 {
-        format!("今天 {hm}")
+        tr!(format!("今天 {hm}"), format!("Today {hm}"))
     } else if days == 1 {
-        format!("昨天 {hm}")
+        tr!(format!("昨天 {hm}"), format!("Yesterday {hm}"))
     } else if then.year() == now.year() {
         format!("{} {hm}", then.format("%m-%d"))
     } else {
@@ -54,9 +55,9 @@ pub(crate) fn ref_badges(
         push(&b.target, RefBadge { label: b.name.clone(), kind: RefKind::Branch });
         // 参考图只在超前时给「超前3个版本」。落后那一支没有依据，先按同一形状给。
         if b.ahead > 0 {
-            push(&b.target, RefBadge { label: format!("超前{}个版本", b.ahead), kind: RefKind::Ahead });
+            push(&b.target, RefBadge { label: tr!(format!("超前{}个版本", b.ahead), format!("{} ahead", b.ahead)), kind: RefKind::Ahead });
         } else if b.behind > 0 {
-            push(&b.target, RefBadge { label: format!("落后{}个版本", b.behind), kind: RefKind::Ahead });
+            push(&b.target, RefBadge { label: tr!(format!("落后{}个版本", b.behind), format!("{} behind", b.behind)), kind: RefKind::Ahead });
         }
     }
     for r in remote_refs {
@@ -135,7 +136,7 @@ pub(crate) fn append_page(snap: &mut Snapshot, more: Vec<Commit>) {
 
 pub(crate) fn spawn_snapshot(tx: &Sender<Msg>, repo: &str, topo: bool, scope: &git::Scope) {
     let (tx, repo, scope) = (tx.clone(), repo.to_owned(), scope.clone());
-    std::thread::spawn(move || {
+    gitx::lang::spawn(move || {
         let _ = tx.send(match snapshot_of(&repo, topo, &scope) {
             Ok(s) => Msg::Loaded { repo, snap: Box::new(s) },
             Err(e) => Msg::Failed(format!("{repo}: {e}")),
@@ -157,7 +158,7 @@ pub(crate) const SEARCH_MAX: u32 = 200;
 /// 输出、不限遍历，大仓库上就是几百毫秒——主线程点一下卡一下，那是性能轴上的倒退。
 pub(crate) fn spawn_search(tx: &Sender<Msg>, repo: &str, query: &str, scope: &git::Scope, seq: u64) {
     let (tx, repo, query, scope) = (tx.clone(), repo.to_owned(), query.to_owned(), scope.clone());
-    std::thread::spawn(move || {
+    gitx::lang::spawn(move || {
         let _ = tx.send(match git::search_commits(&repo, &query, &scope, SEARCH_MAX) {
             Ok(commits) => Msg::Search { repo, seq, query, commits },
             Err(e) => Msg::Failed(format!("{repo}: {e}")),
@@ -167,7 +168,7 @@ pub(crate) fn spawn_search(tx: &Sender<Msg>, repo: &str, query: &str, scope: &gi
 
 pub(crate) fn spawn_file_log(tx: &Sender<Msg>, repo: &str, path: &str, seq: u64) {
     let (tx, repo, path) = (tx.clone(), repo.to_owned(), path.to_owned());
-    std::thread::spawn(move || {
+    gitx::lang::spawn(move || {
         // 未跟踪文件本来就没有历史，`git log --follow -- path` 会成功返回空列表。
         let entries = git::file_log(&repo, &path, FILE_LOG_MAX).unwrap_or_default();
         let _ = tx.send(Msg::FileLog { repo, seq, path, entries });
@@ -178,7 +179,7 @@ pub(crate) fn spawn_file_log(tx: &Sender<Msg>, repo: &str, path: &str, seq: u64)
 /// 面板只认打开的这一条。
 pub(crate) fn spawn_history_patch(tx: &Sender<Msg>, repo: &str, oid: &str, path: &str, seq: u64, index: usize) {
     let (tx, repo, path, oid) = (tx.clone(), repo.to_owned(), path.to_owned(), oid.to_owned());
-    std::thread::spawn(move || {
+    gitx::lang::spawn(move || {
         let lines = git::commit_patch(&repo, &oid, Some(&path)).map(|p| layout(&p, false)).unwrap_or_default();
         let _ = tx.send(Msg::HistoryPatch { repo, seq, path, index, lines });
     });
@@ -187,11 +188,15 @@ pub(crate) fn spawn_history_patch(tx: &Sender<Msg>, repo: &str, oid: &str, path:
 /// 文件在某个版本里的全文。和补丁分开走：看全文的人通常是在找「这行原来长什么样」。
 pub(crate) fn spawn_history_text(tx: &Sender<Msg>, repo: &str, oid: &str, path: &str, seq: u64, index: usize) {
     let (tx, repo, path, oid) = (tx.clone(), repo.to_owned(), path.to_owned(), oid.to_owned());
-    std::thread::spawn(move || {
+    gitx::lang::spawn(move || {
         // 文件在那个版本可能不存在（比如这一条就是删掉它的提交）。不把错误当成空文件：
         // 让面板显示原因，比显示一页空白诚实。
-        let text = git::rev_file_text(&repo, &oid, &path)
-            .unwrap_or_else(|e| format!("（读不出这个版本的文件：{e}）"));
+        let text = git::rev_file_text(&repo, &oid, &path).unwrap_or_else(|e| {
+            tr!(
+                format!("（读不出这个版本的文件：{e}）"),
+                format!("(cannot read this file at that version: {e})")
+            )
+        });
         let _ = tx.send(Msg::HistoryText { repo, seq, path, index, text });
     });
 }
@@ -200,7 +205,7 @@ pub(crate) fn spawn_history_text(tx: &Sender<Msg>, repo: &str, oid: &str, path: 
 /// 不是「某条提交里的那份是谁写的」。
 pub(crate) fn spawn_history_blame(tx: &Sender<Msg>, repo: &str, path: &str, seq: u64) {
     let (tx, repo, path) = (tx.clone(), repo.to_owned(), path.to_owned());
-    std::thread::spawn(move || {
+    gitx::lang::spawn(move || {
         let lines = git::blame(&repo, &path, None).unwrap_or_default();
         let _ = tx.send(Msg::HistoryBlame { repo, seq, path, lines });
     });
@@ -225,11 +230,24 @@ pub(crate) fn patch_of(repo: &str, target: &Target) -> gitx::Result<String> {
 
 pub(crate) fn patch_label(t: &Target) -> String {
     match t {
-        Target::Working { staged, path: None, .. } => if *staged { "全部已暂存变更" } else { "全部未暂存变更" }.to_owned(),
-        Target::Working { staged, path: Some(p), .. } => format!("{} · {}", if *staged { "已暂存" } else { "未暂存" }, p),
-        Target::Commit { oid, path: None } => format!("{} · 提交的全部改动", short(oid)),
+        Target::Working { staged, path: None, .. } => tr!(
+            if *staged { "全部已暂存变更" } else { "全部未暂存变更" },
+            if *staged { "All staged changes" } else { "All unstaged changes" }
+        )
+        .to_owned(),
+        Target::Working { staged, path: Some(p), .. } => tr!(
+            format!("{} · {}", if *staged { "已暂存" } else { "未暂存" }, p),
+            format!("{} · {}", if *staged { "Staged" } else { "Unstaged" }, p)
+        ),
+        Target::Commit { oid, path: None } => tr!(
+            format!("{} · 提交的全部改动", short(oid)),
+            format!("{} · every change in this commit", short(oid))
+        ),
         Target::Commit { oid, path: Some(p) } => format!("{} · {}", short(oid), p),
-        Target::Stash { oid, path: None } => format!("{} · 贮藏的全部改动", short(oid)),
+        Target::Stash { oid, path: None } => tr!(
+            format!("{} · 贮藏的全部改动", short(oid)),
+            format!("{} · every change in this stash", short(oid))
+        ),
         Target::Stash { oid, path: Some(p) } => format!("{} · {}", short(oid), p),
     }
 }
@@ -306,18 +324,18 @@ pub(crate) fn badge_of(s: &ChangeStatus) -> (Color32, &'static str) {
     }
 }
 
-/// 文件历史行上那半个字的状态说明。参考图没有文件历史面板可量，这里只用中文，
+/// 文件历史行上那半个字的状态说明。参考图没有文件历史面板可量，这里用的是**整词**，
 /// 和文件表里的单字母色块区分开。
 pub(crate) fn change_label(s: &ChangeStatus) -> &'static str {
     match s {
-        ChangeStatus::Added => "新增",
-        ChangeStatus::Modified => "修改",
-        ChangeStatus::Deleted => "删除",
-        ChangeStatus::Renamed => "改名",
-        ChangeStatus::Copied => "复制",
-        ChangeStatus::Untracked => "未跟踪",
-        ChangeStatus::Unmerged => "冲突",
-        ChangeStatus::Unknown => "未知",
+        ChangeStatus::Added => tr!("新增", "Added"),
+        ChangeStatus::Modified => tr!("修改", "Modified"),
+        ChangeStatus::Deleted => tr!("删除", "Deleted"),
+        ChangeStatus::Renamed => tr!("改名", "Renamed"),
+        ChangeStatus::Copied => tr!("复制", "Copied"),
+        ChangeStatus::Untracked => tr!("未跟踪", "Untracked"),
+        ChangeStatus::Unmerged => tr!("冲突", "Conflict"),
+        ChangeStatus::Unknown => tr!("未知", "Unknown"),
     }
 }
 
@@ -400,19 +418,28 @@ pub(crate) fn file_menu(
     hist: &mut Option<String>,
 ) {
     if staged {
-        menu_act(ui, "取消暂存这个文件", || Action::Unstage(vec![path.to_owned()]), act);
+        menu_act(ui, tr!("取消暂存这个文件", "Unstage this file"), || Action::Unstage(vec![path.to_owned()]), act);
     } else {
-        menu_act(ui, "暂存这个文件", || Action::Stage(vec![path.to_owned()]), act);
+        menu_act(ui, tr!("暂存这个文件", "Stage this file"), || Action::Stage(vec![path.to_owned()]), act);
     }
     // 未跟踪那份**不是**「放弃改动」——它没有旧版本可回，git 是把文件删了。文案得说实话。
     menu_act(
         ui,
-        if untracked { "删掉这个未跟踪的文件" } else { "放弃这个文件的改动" },
+        if untracked {
+            tr!("删掉这个未跟踪的文件", "Delete this untracked file")
+        } else {
+            tr!("放弃这个文件的改动", "Discard changes to this file")
+        },
         || Action::Discard(vec![path.to_owned()]),
         act,
     );
-    menu_act(ui, "忽略这个文件（写进 .gitignore）", || Action::Ignore(path.to_owned()), act);
-    if ui.button("查看文件历史").clicked() {
+    menu_act(
+        ui,
+        tr!("忽略这个文件（写进 .gitignore）", "Ignore this file (write to .gitignore)"),
+        || Action::Ignore(path.to_owned()),
+        act,
+    );
+    if ui.button(tr!("查看文件历史", "View file history")).clicked() {
         *hist = Some(path.to_owned());
         ui.close();
     }
@@ -424,15 +451,31 @@ pub(crate) fn file_menu(
 pub(crate) fn conflict_menu(
     ui: &mut egui::Ui,
     path: &str,
+    repo: &str,
     act: &mut Option<Action>,
     hist: &mut Option<String>,
 ) {
-    menu_act(ui, "使用「我的」版本解决", || Action::ResolveOurs(path.to_owned()), act);
-    menu_act(ui, "使用「他们的」版本解决", || Action::ResolveTheirs(path.to_owned()), act);
-    menu_act(ui, "标记为已解决", || Action::MarkResolved(path.to_owned()), act);
-    menu_act(ui, "标记为未解决", || Action::MarkUnresolved(path.to_owned()), act);
-    if ui.button("查看文件历史").clicked() {
+    menu_act(ui, tr!("使用「我的」版本解决", "Resolve using \"mine\""), || Action::ResolveOurs(path.to_owned()), act);
+    menu_act(ui, tr!("使用「他们的」版本解决", "Resolve using \"theirs\""), || Action::ResolveTheirs(path.to_owned()), act);
+    menu_act(ui, tr!("标记为已解决", "Mark as resolved"), || Action::MarkResolved(path.to_owned()), act);
+    menu_act(ui, tr!("标记为未解决", "Mark as unresolved"), || Action::MarkUnresolved(path.to_owned()), act);
+    if ui.button(tr!("查看文件历史", "View file history")).clicked() {
         *hist = Some(path.to_owned());
+        ui.close();
+    }
+    ui.separator();
+    if ui.button(tr!("在编辑器中打开", "Open in editor")).clicked() {
+        let full = std::path::Path::new(repo).join(path);
+        let _ = match std::env::consts::OS {
+            "macos" => std::process::Command::new("open").arg(&full).spawn(),
+            "windows" => std::process::Command::new("cmd")
+                .arg("/c")
+                .arg("start")
+                .arg("")
+                .arg(full.to_string_lossy().to_string())
+                .spawn(),
+            _ => std::process::Command::new("xdg-open").arg(&full).spawn(),
+        };
         ui.close();
     }
 }
@@ -440,7 +483,7 @@ pub(crate) fn conflict_menu(
 /// 某条提交的改动列表里文件行的右键菜单。这一栏的文件**已经在库里**，没有暂存/放弃可言，
 /// 能做的只有溯源。
 pub(crate) fn commit_file_menu(ui: &mut egui::Ui, path: &str, hist: &mut Option<String>) {
-    if ui.button("查看文件历史").clicked() {
+    if ui.button(tr!("查看文件历史", "View file history")).clicked() {
         *hist = Some(path.to_owned());
         ui.close();
     }

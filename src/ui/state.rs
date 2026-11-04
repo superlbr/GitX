@@ -6,6 +6,7 @@ use gitx::models::{
     BlameLine, Branch, Commit, DiffEntry, FileLogEntry, Remote, RemoteRef, Repo, RepoStatus, Stash, Tag,
 };
 use gitx::rusqlite::Connection;
+use gitx::tr;
 use std::sync::mpsc::{Receiver, Sender};
 
 use crate::ui::graph::*;
@@ -284,6 +285,8 @@ pub(crate) enum PrefPage {
     General,
     /// 「推送与拉取」那一页：默认远端 + `push.default` 那五档 + 两枚勾。
     Push,
+    /// 「代码托管」那一页：每家认得出的托管填一枚访问令牌，看板取数用的就是它。
+    Hosting,
     About,
 }
 
@@ -314,11 +317,20 @@ pub(crate) enum PushBehavior {
 }
 
 impl PushBehavior {
-    /// 弹出按钮上那五项，顺序和 nib 里的菜单一字不差。
-    pub(crate) const LABELS: [&'static str; 5] = ["无", "匹配", "上流", "简单", "当前"];
+    /// 弹出按钮上那五项，顺序和 nib 里的菜单一字不差。文案跟着语言档位走，
+    /// 所以这是一**函数**：常量表会把两种语言钉死成一份。
+    pub(crate) fn labels() -> [&'static str; 5] {
+        [
+            tr!("无", "None"),
+            tr!("匹配", "Matching"),
+            tr!("上流", "Upstream"),
+            tr!("简单", "Simple"),
+            tr!("当前", "Current"),
+        ]
+    }
 
     pub(crate) fn label(self) -> &'static str {
-        Self::LABELS[self.index()]
+        Self::labels()[self.index()]
     }
 
     pub(crate) fn index(self) -> usize {
@@ -413,6 +425,14 @@ pub(crate) struct Prefs {
     /// 「允许强制推送」：关掉它，推送卡上「强制推送」那枚勾**摆都不摆**——
     /// SourceTree 这一档就是拿它当安全闸的，勾着不给按等于没闸。
     pub(crate) allow_force: bool,
+    /// 界面语言。默认中文（「跟随系统」没做：从 Finder 起来的 GUI 进程读不到可靠的
+    /// locale，猜错档位比不给这一档更坏）。
+    pub(crate) lang: gitx::lang::Lang,
+    /// 代码托管的访问令牌，按 provider 的 id 存（键名 `provider_token_<id>`，见
+    /// `provider::Host::id` 那句注释）。只收**声明了能力**的那几家：Codeup 认得出
+    /// 但 PR/CI 都做不了，给它留一格令牌就是一格按下去没反应的输入框。
+    /// 顺序跟着 `provider::HOSTS`，所以两份 Prefs 比得动。
+    pub(crate) tokens: Vec<(String, String)>,
 }
 
 impl Prefs {
@@ -423,6 +443,33 @@ impl Prefs {
     pub(crate) const KEY_DEFAULT_REMOTE: &'static str = "gitx_prefs_default_remote";
     pub(crate) const KEY_PUSH_TAGS: &'static str = "gitx_prefs_push_tags";
     pub(crate) const KEY_ALLOW_FORCE: &'static str = "gitx_prefs_allow_force";
+    /// 语言存 `"zh"` / `"en"` 两个明文值（不是布尔，所以走 `text()` 那一格）。
+    pub(crate) const KEY_LANG: &'static str = "gitx_prefs_lang";
+    /// 令牌的键前缀：完整键是 `provider_token_<id>`（`id` 取自 `provider::Host::id`）。
+    pub(crate) const KEY_TOKEN_PREFIX: &'static str = "provider_token_";
+
+    /// 这一家 provider 当前存的令牌；没存过就是空串。
+    pub(crate) fn token(&self, provider: &str) -> &str {
+        self.tokens
+            .iter()
+            .find(|(id, _)| id == provider)
+            .map(|(_, t)| t.as_str())
+            .unwrap_or("")
+    }
+
+    /// 取出（必要时创建）那一家那一格，供「代码托管」页的输入框直接绑。
+    /// provider 的 id 必须来自 `provider::HOSTS`，否则这一格根本不该存在。
+    pub(crate) fn token_mut(&mut self, provider: &str) -> &mut String {
+        if !self.tokens.iter().any(|(id, _)| id == provider) {
+            self.tokens.push((provider.to_owned(), String::new()));
+        }
+        &mut self
+            .tokens
+            .iter_mut()
+            .find(|(id, _)| id == provider)
+            .unwrap()
+            .1
+    }
 
     /// 没有数据库、或某个键没写过 → 用这层原本的初值。存的是 `"true"` / `"false"`
     /// （和 core 那张表里别的值一样是明文），读回一个不像布尔的串就按默认走，
@@ -451,6 +498,20 @@ impl Prefs {
             default_remote: text(Self::KEY_DEFAULT_REMOTE, ""),
             push_tags: read(Self::KEY_PUSH_TAGS, false),
             allow_force: read(Self::KEY_ALLOW_FORCE, true),
+            lang: gitx::lang::Lang::from_key(&text(Self::KEY_LANG, gitx::lang::Lang::Zh.key())),
+            tokens: {
+                let mut t = Vec::new();
+                for h in gitx::provider::HOSTS
+                    .iter()
+                    .filter(|h| h.capabilities().contains(&gitx::provider::Capability::PullRequests))
+                {
+                    let v = text(&format!("{}{}", Self::KEY_TOKEN_PREFIX, h.id()), "");
+                    if !v.is_empty() {
+                        t.push((h.id().to_owned(), v));
+                    }
+                }
+                t
+            },
         }
     }
 
@@ -463,6 +524,18 @@ impl Prefs {
         let _ = db::set_setting(c, Self::KEY_DEFAULT_REMOTE, &self.default_remote);
         let _ = db::set_setting(c, Self::KEY_PUSH_TAGS, bit(self.push_tags));
         let _ = db::set_setting(c, Self::KEY_ALLOW_FORCE, bit(self.allow_force));
+        let _ = db::set_setting(c, Self::KEY_LANG, self.lang.key());
+        // 令牌整排重写：清空的要落回空串，否则「删掉绑定」在库里其实还在。
+        for h in gitx::provider::HOSTS
+            .iter()
+            .filter(|h| h.capabilities().contains(&gitx::provider::Capability::PullRequests))
+        {
+            let _ = db::set_setting(
+                c,
+                &format!("{}{}", Self::KEY_TOKEN_PREFIX, h.id()),
+                self.token(h.id()),
+            );
+        }
     }
 }
 
@@ -493,8 +566,10 @@ impl Modal {
     /// `start` = 从哪条提交长出去；从分支行/日志行的菜单里进来时带的是那条的 oid。
     pub(crate) fn new_branch_at(start: Option<String>) -> Self {
         Modal {
-            title: "新建分支",
-            detail: start.as_ref().map(|s| format!("从 {s} 长出去")),
+            title: tr!("新建分支", "New branch"),
+            detail: start
+                .as_ref()
+                .map(|s| tr!(format!("从 {s} 长出去"), format!("branched from {s}"))),
             text: Some(String::new()),
             form: Form::NewBranch { start },
         }
@@ -502,8 +577,11 @@ impl Modal {
 
     pub(crate) fn stash_save() -> Self {
         Modal {
-            title: "贮藏改动",
-            detail: Some("贮藏会把工作区和暂存区都收起来，之后回到当前分支".to_owned()),
+            title: tr!("贮藏改动", "Stash changes"),
+            detail: Some(tr!(
+                "贮藏会把工作区和暂存区都收起来，之后回到当前分支",
+                "Stashing takes the working tree and the index away, then returns you to this branch"
+            ).to_owned()),
             text: Some(String::new()),
             form: Form::StashSave { include_untracked: false },
         }
@@ -511,8 +589,8 @@ impl Modal {
 
     pub(crate) fn new_tag(oid: String, subject: String) -> Self {
         Modal {
-            title: "新建标签",
-            detail: Some(format!("打在：{subject}")),
+            title: tr!("新建标签", "New tag"),
+            detail: Some(tr!(format!("打在：{subject}"), format!("on: {subject}"))),
             text: Some(String::new()),
             form: Form::NewTag { oid },
         }
@@ -522,15 +600,15 @@ impl Modal {
     /// 在末尾接着打，得到 `main-new` 这种串。
     pub(crate) fn rename_branch(from: String) -> Self {
         Modal {
-            title: "重命名分支",
-            detail: Some(format!("{from} 改名为")),
+            title: tr!("重命名分支", "Rename branch"),
+            detail: Some(tr!(format!("{from} 改名为"), format!("Rename {from} to"))),
             text: Some(String::new()),
             form: Form::RenameBranch { from },
         }
     }
 
     pub(crate) fn merge(branches: Vec<String>) -> Self {
-        Modal { title: "合并到当前分支", detail: None, text: None, form: Form::Merge { branches } }
+        Modal { title: tr!("合并到当前分支", "Merge into current branch"), detail: None, text: None, form: Form::Merge { branches } }
     }
 
     /// 「把当前分支重置到这条提交」那张卡。标题里的「当前分支」不是顺手写的：`git reset`
@@ -538,8 +616,8 @@ impl Modal {
     /// 自己在改别条分支。`subject` 是打开那一刻那条提交的话，卡开着时日志翻页不该让它换内容。
     pub(crate) fn reset(oid: String, subject: String) -> Self {
         Modal {
-            title: "重置当前分支",
-            detail: Some(format!("把当前分支挪到：{subject}")),
+            title: tr!("重置当前分支", "Reset current branch"),
+            detail: Some(tr!(format!("把当前分支挪到：{subject}"), format!("Move this branch to: {subject}"))),
             text: None,
             form: Form::Reset { oid, mode: git::ResetMode::Mixed },
         }
@@ -552,7 +630,7 @@ impl Modal {
     /// 「添加仓库」那张卡。三档共用一格主输入：已有仓库的路径 / 克隆的源地址 / 新仓库目录。
     pub(crate) fn add_repo() -> Self {
         Modal {
-            title: "添加仓库",
+            title: tr!("添加仓库", "Add repository"),
             detail: None,
             text: Some(String::new()),
             form: Form::AddRepo { tab: AddTab::Open, dest: String::new() },
@@ -563,8 +641,11 @@ impl Modal {
     /// 能不能提交由落地时那条 git 命令说了算）。
     pub(crate) fn commit(branch: String, staged: usize) -> Self {
         Modal {
-            title: "提交",
-            detail: Some(format!("提交到 {branch} · 已暂存 {staged} 个文件")),
+            title: tr!("提交", "Commit"),
+            detail: Some(tr!(
+                format!("提交到 {branch} · 已暂存 {staged} 个文件"),
+                format!("to {branch} · {staged} staged file(s)")
+            )),
             text: Some(String::new()),
             form: Form::Commit { desc: String::new(), amend: false, push_after: false },
         }
@@ -573,7 +654,7 @@ impl Modal {
     /// 偏好那张卡：把当下那三枚开关原样端上来，改一格当场落库一格。
     pub(crate) fn settings(prefs: Prefs, repos: usize, database: Option<String>) -> Self {
         Modal {
-            title: "设置",
+            title: tr!("设置", "Settings"),
             detail: None,
             text: None,
             form: Form::Settings { prefs, page: PrefPage::General, repos, database },
@@ -587,7 +668,7 @@ impl Modal {
     /// 刷新不该让表换人，也不该让远端那一格自己漂走。
     pub(crate) fn push(rows: Vec<PushRow>, remote: String, prefs: &Prefs) -> Self {
         Modal {
-            title: "推送",
+            title: tr!("推送", "Push"),
             detail: None,
             text: None,
             form: Form::Push { remote, rows, force: false, tags: prefs.push_tags },
@@ -597,7 +678,7 @@ impl Modal {
     /// 拉取那张卡。标题「拉取」取自 `GitPullSheet.nib`（那张里没有带问号的写法）。
     pub(crate) fn pull(remote: String, branch: String, into: String) -> Self {
         Modal {
-            title: "拉取",
+            title: tr!("拉取", "Pull"),
             detail: None,
             text: None,
             form: Form::Pull { remote, branch, into, opts: git::PullOpts::default() },
@@ -607,16 +688,16 @@ impl Modal {
     /// 文本框的占位文案，也是「这一格该填什么」的唯一说法。
     pub(crate) fn hint(&self) -> &'static str {
         match &self.form {
-            Form::NewBranch { .. } => "分支名",
-            Form::StashSave { .. } => "贮藏说明（可留空）",
-            Form::NewTag { .. } => "标签名",
-            Form::RenameBranch { .. } => "新分支名",
+            Form::NewBranch { .. } => tr!("分支名", "Branch name"),
+            Form::StashSave { .. } => tr!("贮藏说明（可留空）", "Stash description (optional)"),
+            Form::NewTag { .. } => tr!("标签名", "Tag name"),
+            Form::RenameBranch { .. } => tr!("新分支名", "New branch name"),
             Form::AddRepo { tab, .. } => match tab {
-                AddTab::Open => "已有仓库的路径",
-                AddTab::Clone => "源仓库地址（https://… 或 /路径）",
-                AddTab::New => "新仓库的目录",
+                AddTab::Open => tr!("已有仓库的路径", "Path to an existing repository"),
+                AddTab::Clone => tr!("源仓库地址（https://… 或 /路径）", "Source URL (https://… or a path)"),
+                AddTab::New => tr!("新仓库的目录", "Directory for the new repository"),
             },
-            Form::Commit { .. } => "提交摘要",
+            Form::Commit { .. } => tr!("提交摘要", "Commit summary"),
             Form::Merge { .. } | Form::Confirm { .. } | Form::Settings { .. } => "",
             // 两张卡没有「主输入」那一格：远端和分支都是弹出按钮，「远程分支」那一列的
             // 改名框在表格里面自己带提示，不占这张卡的 `hint`。
@@ -657,29 +738,29 @@ impl Modal {
     /// 这一张卡的「主按钮」文案（Enter 走的就是它）。
     pub(crate) fn primary(&self) -> &'static str {
         match &self.form {
-            Form::NewBranch { .. } => "创建并切换",
-            Form::StashSave { .. } => "贮藏",
-            Form::NewTag { .. } => "创建",
-            Form::RenameBranch { .. } => "重命名",
+            Form::NewBranch { .. } => tr!("创建并切换", "Create and check out"),
+            Form::StashSave { .. } => tr!("贮藏", "Stash"),
+            Form::NewTag { .. } => tr!("创建", "Create"),
+            Form::RenameBranch { .. } => tr!("重命名", "Rename"),
             Form::AddRepo { tab, .. } => match tab {
-                AddTab::Open => "添加",
-                AddTab::Clone => "克隆",
+                AddTab::Open => tr!("添加", "Add"),
+                AddTab::Clone => tr!("克隆", "Clone"),
                 // 不叫「新建仓库」：那一串已经是上面那档页签的名字，同一张卡上出现两次，
                 // 判据（和无头夹具里的点击）就分不清点的是哪一格。
-                AddTab::New => "创建",
+                AddTab::New => tr!("创建", "Create"),
             },
-            Form::Commit { amend, .. } => if *amend { "修正并提交" } else { "提交" },
-            Form::Settings { .. } => "完成",
+            Form::Commit { amend, .. } => if *amend { tr!("修正并提交", "Amend and commit") } else { tr!("提交", "Commit") },
+            Form::Settings { .. } => tr!("完成", "Done"),
             // 两张卡的主按钮写动词不写「确定」：nib 里那两枚按钮的文案确实是「确定 / 取消」，
             // 但那两张卡是工作表不是确认框，标题就叫「推送」「拉取」——按钮再写「确定」，
             // 同一张卡上两个词指同一件事，还得多读一次。「推送」「拉取」这两个词同样在那两张 nib 里。
-            Form::Push { .. } => "推送",
-            Form::Pull { .. } => "拉取",
+            Form::Push { .. } => tr!("推送", "Push"),
+            Form::Pull { .. } => tr!("拉取", "Pull"),
             Form::Merge { .. } => "",
-            Form::Confirm { .. } => "确定",
+            Form::Confirm { .. } => tr!("确定", "OK"),
             // 动词 + 对象：这一按改的是分支指针，光写「重置」和卡上那排页签读起来
             // 像「重置这个选择」。
-            Form::Reset { .. } => "重置分支",
+            Form::Reset { .. } => tr!("重置分支", "Reset branch"),
         }
     }
 }
@@ -734,6 +815,175 @@ pub(crate) struct SearchHit {
     pub(crate) date: String,
 }
 
+/// 一行上那两个补充请求（按号取详情、按 sha 取检查）的落地结果。
+///
+/// 任何一项是 `None` = **还没回来**。「压根没去取」不由这里表示——那是 `Board::facts`
+/// 里根本没有这个键；两件事挤进同一个 `Option`，迟早会把「取失败」读成「没取」。
+#[derive(Debug, Default, Clone)]
+pub(crate) struct RowFacts {
+    /// `mergeable_state` 的**原始值**（GitHub：`clean` / `blocked` / `unknown` …）。
+    pub(crate) detail: Option<String>,
+    pub(crate) checks: Option<gitx::models::Ci>,
+    /// 详情回过几次 `unknown`（GitHub 那一格是后台算的，第一次常常还没有）。
+    /// 有上限，不然一本 CI 永远在跑的仓库会把这格变成无休止的重发。
+    pub(crate) detail_tries: u8,
+    /// 到点重取详情的那个时刻（egui 的秒）。`None` = 不排。
+    pub(crate) retry_at: Option<f64>,
+}
+
+/// `Board::asked` 里的那一格：同一个键的两个请求各自记一次。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Ask {
+    Detail,
+    Checks,
+}
+
+/// 看板那一栏的全部状态：当前仓库对应的 provider、取回来的 PR、以及「这条我看过没有」。
+///
+/// 为什么这些数不住在 `Snapshot` 里：快照是**一次 git 调用**的产物，而看板的数据来自
+/// HTTP，取回来的时机和 git 完全不同步。住在同一份结构里会让「git 落地」顺手清掉
+/// 刚取回的列表，或者反过来。
+#[derive(Default)]
+pub(crate) struct Board {
+    /// 当前这一栏对着哪家 provider（`provider::Host::id`）；`None` = 这本仓库的远端
+    /// 认不出来，看板画「没有可看的托管」而不是空列表。
+    pub(crate) host: Option<&'static dyn gitx::provider::Host>,
+    /// 认出来的那个 `owner/repo`（连同 host），拼 API 与网页地址都用它。
+    pub(crate) repo_ref: Option<gitx::provider::RepoRef>,
+    pub(crate) prs: Vec<gitx::models::PullRequest>,
+    /// **还没取过**和**取过、结果是空**是两回事：前者画「还没有取」，后者画「没有开放的 PR」。
+    pub(crate) loaded: bool,
+    /// 正在飞的取数。和 `busy` 分开：那一面旗子是 git 的（见 PROCESS「分离 HEAD」那批
+    /// 记的 `Msg::Patch` 抢旗教训），HTTP 在飞不该让 git 动作看起来在跑。
+    /// 这一位只管**列表**；每一行的那两个补充请求另有 `asked` / `facts` 两本账。
+    pub(crate) fetching: bool,
+    /// 上一次取数的失败原因；成功取回时清掉。
+    pub(crate) error: Option<String>,
+    /// 「上次看过」的**签名**（见 `PullRequest::signature`），按 PR 号存；键见 `seen_key`。
+    pub(crate) seen: std::collections::HashMap<u32, String>,
+    /// 补充请求的结果，按 `(号, head sha)` 存。sha 是键的一半不是装饰：
+    /// 作者 force-push 之后号还是那个号，旧的那份绿必须作废，不然新提交挂着上一版的结论。
+    /// 它在「按刷新」和换列表之间**留着**——同一版提交不必问第二次。
+    pub(crate) facts: std::collections::HashMap<(u32, String), RowFacts>,
+    /// 为哪个键发过哪种请求。每帧都在重画，不去重的话就是每帧一轮 HTTP。
+    pub(crate) asked: std::collections::HashSet<((u32, String), Ask)>,
+    /// **这本账第一次建**：库里读回来是空的（或压根没有这一条）。
+    /// 这一趟里落下来的结论只进账、不点亮蓝点 —— 用户正盯着这一栏，
+    /// 「补充的两格到齐」不是他离开之后发生的动静，给它一个点是骗他。
+    /// 关掉这一栏（或换仓库）之后就不再有这一档：从第二次打开起，蓝点比的
+    /// 是上一次真正看过的那一版。
+    pub(crate) seeding: bool,
+}
+
+impl Board {
+    /// 这一本的「看过」记录在库里的那个键。provider id + `owner/repo` 都在键里，
+    /// 所以 fork 之间、同名仓库之间不会互相顶掉。
+    ///
+    /// `pr_seen2_` 的那个 2：签名换过格式（旧账本存的是 `updated_at` 串）。不换代的话，
+    /// 旧值对不上任何新签名 → 一进来满屏蓝点，那正是「切走再回来不该满屏蓝点」要防的事。
+    /// 换档 = 旧账本整本作废，而不是逐条被误判成「动过」。
+    pub(crate) fn seen_key(&self) -> Option<String> {
+        let id = self.host.map(|h| h.id())?;
+        self.repo_ref
+            .as_ref()
+            .map(|r| format!("pr_seen2_{}_{}", id, r.path.replace('/', "_")))
+    }
+
+    /// 这条 PR 自上次查看之后有没有新动静（看板那一枚蓝点）。
+    ///
+    /// 比的是**签名**不是 `updated_at`：检查跑完不会把 `updated_at` 顶走（实测），
+    /// 只看它的话「CI 从在跑到全绿」这一眼看不见的那次变化永远不亮。
+    /// 首次建账那趟（`seeding`）一律不亮：见那个字段的说明。
+    pub(crate) fn is_new(&self, pr: &gitx::models::PullRequest) -> bool {
+        if self.seeding {
+            return false;
+        }
+        self.seen
+            .get(&pr.number)
+            .map(|s| *s != pr.signature())
+            .unwrap_or(true)
+    }
+
+    /// 发过、但还没结出结果的补充请求有几笔。两处用同一个数：`enrich_rows` 的并发上限，
+    /// 和「首次建账这一趟走完了没有」。所以它住在这儿而不是写两遍。
+    pub(crate) fn outstanding(&self) -> usize {
+        self.asked
+            .iter()
+            .filter(|((number, sha), ask)| {
+                let f = self.facts.get(&(number.clone(), sha.clone()));
+                match ask {
+                    Ask::Detail => f.map(|f| f.detail.is_none()).unwrap_or(true),
+                    Ask::Checks => f.map(|f| f.checks.is_none()).unwrap_or(true),
+                }
+            })
+            .count()
+    }
+
+    /// 首次建账：把每一行**现在**的签名当作「看过了」记下来，返回账本有没有变。
+    /// 只在 `seeding` 那趟里被反复调用（列表落地一次、补充结论每落一次一次），
+    /// 所以它必须自己幂等 —— 变了才落库，不然每帧写一次数据库。
+    pub(crate) fn seed_seen(&mut self) -> bool {
+        let mut changed = false;
+        for pr in self.prs.iter() {
+            let sig = pr.signature();
+            if self.seen.get(&pr.number) != Some(&sig) {
+                self.seen.insert(pr.number, sig);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// 这一行还有没有在飞的补充请求。**决定「正在看它卡在哪」那句话能不能说**：
+    /// 压根不取的那一家（没声明 capability）永远等不到答案，对它说「正在看」是骗人。
+    pub(crate) fn row_fetching(&self, pr: &gitx::models::PullRequest) -> bool {
+        let key = (pr.number, pr.head_sha.clone());
+        let facts = self.facts.get(&key);
+        let outstanding = |ask: Ask, got: bool| self.asked.contains(&(key.clone(), ask)) && !got;
+        let detail_got = facts.map(|f| f.detail.is_some()).unwrap_or(false);
+        let checks_got = facts.map(|f| f.checks.is_some()).unwrap_or(false);
+        outstanding(Ask::Detail, detail_got) || outstanding(Ask::Checks, checks_got)
+    }
+
+    /// 旁证：这一行挂着的那个 job，在同一栏的**别行**上也挂着。
+    /// 只做正向证据——「别行没挂着」不等于「别行是绿的」（可能压根还没取到），
+    /// 所以没证据时那句「大概率无关」不许出口。
+    pub(crate) fn failing_elsewhere(&self, number: u32) -> bool {
+        use gitx::models::Ci;
+        let mine: Vec<&String> = match self.prs.iter().find(|p| p.number == number).map(|p| &p.ci) {
+            Some(Ci::Failed { failed }) => failed.iter().collect(),
+            _ => return false,
+        };
+        self.prs.iter().any(|other| {
+            other.number != number
+                && matches!(&other.ci, Ci::Failed { failed } if failed.iter().any(|n| mine.contains(&n)))
+        })
+    }
+
+    /// 把缓存涂回列表：按刷新之后列表是新的（那两格全空），但按 `(号, sha)` 的缓存还有效，
+    /// 同一版提交不该再问第二次。
+    pub(crate) fn apply_facts(&mut self) {
+        for pr in self.prs.iter_mut() {
+            if let Some(f) = self.facts.get(&(pr.number, pr.head_sha.clone())) {
+                if let Some(ms) = &f.detail {
+                    pr.mergeable_state = ms.clone();
+                }
+                if let Some(ci) = &f.checks {
+                    pr.ci = ci.clone();
+                }
+            }
+        }
+    }
+}
+
+/// 状态栏左下角那格推送状态的阶段。平时 `None`，发推送时 `Pushing`，落地后转 `Done`/`Failed`
+/// 并带上 egui 时间（秒）当作计时起点，超过几秒由 `status_bar` 自动清除。
+pub(crate) enum PushPhase {
+    Pushing,
+    Done(f64),
+    Failed(f64),
+}
+
 pub(crate) enum Msg {
     Loaded { repo: String, snap: Box<Snapshot> },    /// 日志的下一页。带 `seq`：切仓库/换排序之后旧页作废，不能往新列表尾巴上接。
     More { repo: String, seq: u64, commits: Vec<Commit> },
@@ -752,12 +1002,26 @@ pub(crate) enum Msg {
     HistoryText { repo: String, seq: u64, path: String, index: usize, text: String },
     HistoryBlame { repo: String, seq: u64, path: String, lines: Vec<BlameLine> },
     Failed(String),
+    /// 推送这一路**单独**回的字：成功 `Ok(())`、失败 `Err(原因)`。状态栏靠它报
+    /// 「正在推送 / 推送完成 / 推送失败」，而不是只弹一条 toast。
+    PushDone(std::result::Result<(), String>),
     /// 克隆回来的只有「成了在哪」或者「为什么没成」，没有快照——成了之后由 `add_repo`
     /// 自己去开那个仓库（它会再发一次 `Msg::Loaded`）。
     Cloned(std::result::Result<String, String>),
     /// 归档成了，`String` 是落地的那个路径。失败那一路共用 `Msg::Failed`（它已经把
     /// `busy` 落回来、也把原文进了 toast），这里只管成功那一条。
     Archived(String),
+    /// 看板取数的回复。`seq` 对不上 `Gitx::board_seq` 的一律丢：切仓库、按刷新、
+    /// 再点进看板都会重新编号，旧回复落地就会把 A 仓库的列表挂在 B 仓库名下。
+    /// 成功那一路带回来的已经是解析好的列表——解析归 provider（有 fixture 判据），
+    /// 这里只管搬运。
+    PullRequests { seq: u64, prs: std::result::Result<Vec<gitx::models::PullRequest>, String> },
+    /// 单条 PR 详情落回的那一格 `mergeable_state`（列表端点**不给**这一格，实测）。
+    /// 带 `sha`：作者在这一趟在飞时推了新提交，回来那一版已经不是人现在看的那一版，
+    /// 把它涂进行会挂出一个假的「可以合并」。
+    PrDetail { seq: u64, number: u32, sha: String, r: std::result::Result<String, String> },
+    /// head 那一版提交的检查汇总（已经在后台线程 `aggregate_ci` 过了）。
+    PrChecks { seq: u64, number: u32, sha: String, r: std::result::Result<gitx::models::Ci, String> },
 }
 
 pub struct Gitx {
@@ -765,6 +1029,10 @@ pub struct Gitx {
     pub(crate) repos: Vec<Repo>,
     /// 当前仓库路径，取自 `repos` 里的 `path`。
     pub(crate) repo: Option<String>,
+    /// 顶栏那个**固定在最左**的「首页」tab 选中了。选中时主区换成仓库列表，
+    /// 侧栏、日志、暂存带整块让位（见 `Gitx::home_page`）。
+    /// 产品默认停在首页；点任一仓库 tab / `open()` 就离开，再点「首页」回来。
+    pub(crate) home: bool,
     pub(crate) snap: Option<Snapshot>,
     pub(crate) sel: Sel,
     pub(crate) commit_files: Vec<DiffEntry>,
@@ -786,6 +1054,9 @@ pub struct Gitx {
     /// 差异请求序号：快速连点两个文件时，只有最新那次的回复能落地。
     pub(crate) seq: u64,
     pub(crate) busy: bool,
+    /// 状态栏左下角的推送状态（见 `PushPhase`）。平时 `None`，发推送期间 `Pushing`，
+    /// 落地后 `Done`/`Failed` 并带时间戳，几秒后由 `status_bar` 清回 `None`。
+    pub(crate) push_state: Option<PushPhase>,
     pub(crate) note: Option<String>,
     /// `note` 第一次出现的时刻（egui 时间，秒）。toast 靠它结算 8 秒超时；
     /// `None` 表示这一帧还没画过。无头判据直接往 `RawInput::time` 塞值来造「过了 8 秒」。
@@ -848,6 +1119,12 @@ pub struct Gitx {
     pub(crate) push_tags: bool,
     /// 推送卡「强制推送」那枚勾**摆不摆**的闸（关掉就整个不出现，见 `push_card`）。
     pub(crate) allow_force: bool,
+    /// 界面语言。`shell()` 每帧开头把它刷进线程局部（见 `gitx::lang`），
+    /// 于是 400 多处 `tr!` 不用把档位一路当参数传；后台线程由 `lang::spawn` 带走同一份。
+    pub(crate) lang: gitx::lang::Lang,
+    /// 代码托管的访问令牌，按 provider id 存（同 `Prefs::tokens`）。看板的 PR 列表、
+    /// 以及这一批还不做的 CI 状态都从这儿取钥匙。
+    pub(crate) provider_tokens: Vec<(String, String)>,
     /// 当前差异区显示的是哪一份补丁。hunk 那两枚按钮要问的就是这个：同一块在第 1 格
     /// 和第 2 格里意思不同（未暂存 → 「暂存区块」，已暂存 → 「取消暂存区块」，
     /// 某条提交 → 根本没有区块可暂存，按钮不出现）。
@@ -878,6 +1155,19 @@ pub struct Gitx {
     /// 抓取之后新快照落地，展开着的那条自己就把新的分支摆出来。
     /// 存在 `Gitx` 而不是数据库：这是这一次看仓库时的临时状态，重启又铺开一堆分支不是用户要的。
     pub(crate) remote_open: Vec<String>,
+    /// 已经点过「还有 N 个」、整组摊开的远端名。默认空 = 每个远端只露前 3 条分支。
+    pub(crate) remote_all: Vec<String>,
+    /// 左栏当前画的是仓库大纲还是**看板**（provider 的 PR 列表）。看板整栏替掉大纲
+    /// （DESIGN §2.2），切过去那一刻起一次取数。
+    pub(crate) board_open: bool,
+    pub(crate) board: Board,
+    /// 看板的取数号：切仓库、按「刷新」、再点进看板都会 +1。落地的回复对不上号就丢——
+    /// 否则人会看到「A 仓库的列表挂在 B 仓库名下」（同 `search_seq` 那一招）。
+    pub(crate) board_seq: u64,
+    /// 看板那一击要在浏览器里打开的地址。攒在字段里、由 `poll` 推给 egui 的命令队列：
+    /// `land` 手上没有 `Context`，而起进程 `open <url>` 会让跑测试真的弹出浏览器
+    /// （同差异区复制走 `CopyText` 那一条路）。
+    pub(crate) board_open_url: Option<String>,
     pub(crate) tx: Sender<Msg>,
     pub(crate) rx: Receiver<Msg>,
 }

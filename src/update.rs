@@ -8,6 +8,7 @@ use serde_json::Value;
 
 use crate::error::{GitxError, Result};
 use crate::models::{Asset, Release};
+use crate::tr;
 
 /// A release repo is exactly `owner/repo`; anything else can only be a typo, and
 /// validating here keeps the string out of a URL it would silently 404 on.
@@ -16,7 +17,7 @@ pub fn check_slug(slug: &str) -> Result<()> {
     let parts: Vec<&str> = slug.split('/').collect();
     if parts.len() != 2 || parts.iter().any(|p| p.is_empty()) {
         return Err(GitxError::Other(
-            "发布仓库要写成 owner/repo，例如 t8y2/dbx。".into(),
+            tr!("发布仓库要写成 owner/repo，例如 t8y2/dbx。", "The release repository must be owner/repo, e.g. t8y2/dbx.").into(),
         ));
     }
     for p in parts {
@@ -24,9 +25,9 @@ pub fn check_slug(slug: &str) -> Result<()> {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
         if !ok {
-            return Err(GitxError::Other(format!(
-                "仓库名「{}」里有不支持的字符，只能用字母、数字、-、_、.。",
-                p
+            return Err(GitxError::Other(tr!(
+                format!("仓库名「{}」里有不支持的字符，只能用字母、数字、-、_、.。", p),
+                format!("The repository name “{p}” has unsupported characters: only letters, digits, -, _ and . are allowed.")
             )));
         }
     }
@@ -51,13 +52,15 @@ pub fn release_api_url(slug: &str, base: &str) -> Result<String> {
         return Ok(official);
     }
     if !b.starts_with("https://") && !b.starts_with("http://") {
-        return Err(GitxError::Other(format!(
-            "更新检查地址「{}」要以 https:// 或 http:// 开头。",
-            b
+        return Err(GitxError::Other(tr!(
+            format!("更新检查地址「{}」要以 https:// 或 http:// 开头。", b),
+            format!("The update-check address “{b}” must start with https:// or http://.")
         )));
     }
     if b.chars().any(char::is_whitespace) {
-        return Err(GitxError::Other("更新检查地址不能含空格。".into()));
+        return Err(GitxError::Other(
+            tr!("更新检查地址不能含空格。", "The update-check address cannot contain spaces.").into(),
+        ));
     }
     if b.contains("{url}") {
         return Ok(crate::git::apply_node_template(b, &official));
@@ -71,10 +74,17 @@ pub fn release_api_url(slug: &str, base: &str) -> Result<String> {
 
 /// Parse GitHub's `/releases/latest` response.
 pub fn parse_release(text: &str) -> Result<Release> {
-    let v: Value = serde_json::from_str(text)
-        .map_err(|e| GitxError::Other(format!("发布信息的 JSON 解析失败: {}", e)))?;
+    let v: Value = serde_json::from_str(text).map_err(|e| {
+        GitxError::Other(tr!(
+            format!("发布信息的 JSON 解析失败: {}", e),
+            format!("Cannot parse the release JSON: {e}")
+        ))
+    })?;
     if let Some(msg) = v.get("message").and_then(|m| m.as_str()) {
-        return Err(GitxError::Other(format!("GitHub 返回：{}", msg)));
+        return Err(GitxError::Other(tr!(
+            format!("GitHub 返回：{}", msg),
+            format!("GitHub answered: {msg}")
+        )));
     }
     let get = |k: &str| -> String {
         v.get(k)
@@ -85,7 +95,11 @@ pub fn parse_release(text: &str) -> Result<Release> {
     let version = get("tag_name");
     if version.is_empty() {
         return Err(GitxError::Other(
-            "发布信息里没有 tag_name，无法判断版本。".into(),
+            tr!(
+                "发布信息里没有 tag_name，无法判断版本。",
+                "The release has no tag_name, so its version cannot be compared."
+            )
+            .into(),
         ));
     }
     let assets = v

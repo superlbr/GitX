@@ -1,8 +1,9 @@
 //! （拆分自 main.rs；见 docs/PROCESS.md「拆分 main.rs」。）
 
 use eframe::egui::{self, Align, Align2, Color32, FontId, Label, Margin, Rect, RichText, ScrollArea, Sense, Stroke, TextEdit, TextStyle, Vec2, pos2, vec2};
+use gitx::lang::Lang;
 use gitx::models::{FileStatus, Repo};
-use gitx::{db, git, provider, GitxError};
+use gitx::{db, git, provider, tr, GitxError};
 use std::sync::mpsc::channel;
 
 use crate::ui::theme::*;
@@ -22,6 +23,89 @@ pub(crate) fn default_scope() -> git::Scope {
     git::Scope::Current
 }
 
+/// 侧栏「远端」开局展开哪一条。用户 2026-10-26 的要求是「origin 默认展示分支」，
+/// 所以这里给 `origin`；其余远端仍旧收着，一下铺开整列会把「标签 / 已贮藏」挤下去。
+///
+/// 和 `default_scope()` 同一个理由单独成函数：无头夹具自己填 `Gitx` 的字段，
+/// 把 `Gitx::new` 里的初值改坏不会有任何一帧变红。判据通过这个函数摆初值，
+/// 产品也走同一个函数——两边同源，改坏才会真的红。
+pub(crate) fn default_remote_open() -> Vec<String> {
+    vec!["origin".to_owned()]
+}
+
+/// 看板上「看得见的行」补取详情/检查时，同时在飞的请求上限。
+/// 每条 PR 两个请求，一次刷屏八九行就是十几个；不限并发会把速率预算一次打空
+/// （GitHub 认证请求 5000/小时，见 PROCESS 同日实测）。
+pub(crate) const ENRICH_IN_FLIGHT: usize = 6;
+
+/// `mergeable_state = unknown` 的那一格自愈：等多久、最多试几次。
+/// GitHub 那一格是后台算的，第一次打经常还没有；不重试的话看板会一直挂着
+/// 「状态还没算出来」，而那恰恰是它**已经能回答**之后的样子。
+pub(crate) const DETAIL_RETRY_SECS: f64 = 4.0;
+pub(crate) const DETAIL_RETRY_MAX: u8 = 2;
+
+/// 顶栏右边那一组会占多宽：11 枚 28 的按钮 + 它们之间的 2 + 组间距 14 + 分支名 · `↑↓`。
+/// 它是**有界**的一串（`TOOLS.len()` 定死），所以收纳只发生在左边那串无界的仓库 tab 上。
+/// 每一项都按「宽 + 一段间距」计：宁可多算 2pt，也不要出现「算下来放得下、画出来压住」。
+pub(crate) fn header_right_group_width(ui: &egui::Ui, head: &Option<(String, Option<String>)>) -> f32 {
+    let mut w = TOOLS.len() as f32 * (ICON_BTN + ICON_BTN_GAP) + HEADER_GROUP_GAP;
+    if let Some((branch, counts)) = head {
+        w += text_w(ui, branch, FontId::proportional(BRANCH_FONT)) + BRANCH_GAP;
+        if let Some(c) = counts {
+            w += text_w(ui, c, counts_font()) + BRANCH_GAP;
+        }
+    }
+    w
+}
+
+/// §2 那句「窗口收窄时溢出收进 `»` 菜单」的算法：**按顺序**能放几枚放几枚，剩下的一律收进去。
+/// 只收前缀是硬的——书签列表的顺序就是用户的读法，不能因为收纳抽走第 3 枚却留下第 4 枚。
+/// `»` 自己也要占一格，所以「有东西被收走」不是免费的：先当没有 `»` 排一遍，只要少了一枚，
+/// 就把那一格从预算里再扣掉重排——宁可少画一枚，也不要两串撞在一起。
+/// 返回 `(留下的枚数, 要不要画 »)`。「首页」和「添加仓库」不在 `widths` 里：那两枚永远画得出。
+pub(crate) fn fit_header_tabs(widths: &[f32], budget: f32, more_w: f32) -> (usize, bool) {
+    let take = |cap: f32| -> usize {
+        let mut used = 0.0;
+        let mut n = 0;
+        for w in widths {
+            if used + w + TAB_GAP > cap {
+                break;
+            }
+            used += w + TAB_GAP;
+            n += 1;
+        }
+        n
+    };
+    let n = take(budget);
+    if n == widths.len() {
+        (n, false)
+    } else {
+        (take(budget - more_w - TAB_GAP).min(n), true)
+    }
+}
+
+/// 看板那一行状态的颜色：**只给挡路的那件事上色**（§原则①「颜色只给状态和层级，不装饰」）。
+/// 认不出的状态一律次要灰——「还没算出来」不该看起来像一件要办的事。
+///
+/// 吃的是 `provider::PrStatus` 而不是 `mergeable_state` 那个原始取值：同一句话的文案
+/// 与颜色必须有**一个**主人，否则加了新档位时改了一处、另一处还在按旧表匹配。
+fn board_status_color(status: provider::PrStatus) -> Color32 {
+    use provider::PrStatus as S;
+    match status {
+        S::Conflicts => DANGER,
+        S::MergeReady => ADD_FG,
+        // 等评审与落后于目标分支都是「事情在别人手里 / 要先动一步」，同一档被拦色。
+        S::AwaitingReview | S::Behind => ACCENT_INK,
+        // 真挂了的检查才值得黄色；「在别的 PR 上也挂」和「不挡合并」都是**别报警**的意思，
+        // 报成黄色就等于把一件不必办的事涂成要办的事（§原则①）。
+        S::CiFailed { .. } => WARN_FG,
+        S::CiFailedShared { .. } | S::CiWarned { .. } | S::Draft => TEXT_MUTED,
+        S::CiRunning { .. } | S::CiNone | S::Closed | S::Merged | S::Unknown | S::Fetching => {
+            TEXT_SECONDARY
+        }
+    }
+}
+
 /// 存盘面板里那格建议文件名的前半段：路径最后一段当仓库名。
 /// `Path::file_name` 自己会忽略尾斜杠（`/a/b/` 也给出 `b`），所以不先 trim。
 /// 归档的 zip 落到用户自己选的位置，这个名字只是**默认值**，面板里可以改。
@@ -30,6 +114,18 @@ fn repo_name(repo: &str) -> String {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| repo.to_owned())
+}
+
+/// 首页「代码托管」那一格要显示什么：只在**当前仓库的快照**里认远端，不额外跑 git。
+/// 返回（平台名，`owner/repo`，打开主页要用到的远端名）。
+/// 认不出（不是 GitHub/Gitee/Codeup，或地址不是 `主机/所有者/仓库`）就整块不画——
+/// 摆一个「未知平台」的空壳比不摆更吵。
+fn home_provider(snap: &Snapshot) -> Option<(&'static str, String, String)> {
+    let urls: Vec<String> = snap.remotes.iter().map(|r| r.url.clone()).collect();
+    let host = provider::detect(&urls)?;
+    let repo = provider::repo_ref_for(host, &urls)?;
+    let remote = snap.remotes.iter().find(|r| host.handles(&r.url))?.name.clone();
+    Some((host.label(), repo.path, remote))
 }
 
 impl Gitx {
@@ -54,6 +150,8 @@ impl Gitx {
             conn,
             repos,
             repo: None,
+            // 首页是落点：有仓库且开了「恢复上次」时，下面 `open()` 会把它翻成 false。
+            home: true,
             snap: None,
             sel: Sel::Uncommitted,
             commit_files: Vec::new(),
@@ -66,6 +164,7 @@ impl Gitx {
             patch_label: String::new(),
             seq: 0,
             busy: false,
+            push_state: None,
             note: None,
             note_at: None,
             log_filter: String::new(),
@@ -77,7 +176,7 @@ impl Gitx {
             log_more: true,
             log_more_busy: false,
             log_seq: 0,
-            // 搜索一上来是关着的：那一格连日志条都不在（点开侧栏「搜索」才换上去）。
+            // 搜索一上来是关着的：那一格连日志条都不在（点开日志条右端的「搜索」才换上去）。
             search_open: false,
             search_q: String::new(),
             search_hits: Vec::new(),
@@ -93,6 +192,14 @@ impl Gitx {
             default_remote: prefs.default_remote,
             push_tags: prefs.push_tags,
             allow_force: prefs.allow_force,
+            lang: prefs.lang,
+            provider_tokens: prefs.tokens,
+            // 看板开局是关着的：左栏画仓库大纲。取数只在用户切过去那一刻起，
+            // 开仓库不连带问一次网络（国内网络下那一次会挂 15 秒）。
+            board_open: false,
+            board: Board::default(),
+            board_seq: 0,
+            board_open_url: None,
             target: None,
             pending_discard: None,
             history: None,
@@ -101,7 +208,8 @@ impl Gitx {
             modal_focus: false,
             pending_dialog: None,
             last_branch: String::new(),
-            remote_open: Vec::new(),
+            remote_open: default_remote_open(),
+            remote_all: Vec::new(),
             tx,
             rx,
         };
@@ -128,7 +236,7 @@ impl Gitx {
         let path = path.trim();
         let root = git::find_repo_root(path).filter(|r| git::is_repo(r));
         let Some(root) = root else {
-            self.note = Some(format!("那不是仓库：{path}"));
+            self.note = Some(tr!(format!("那不是仓库：{path}"), format!("Not a repository: {path}")));
             return false;
         };
         if !self.repos.iter().any(|r| r.path == root) {
@@ -154,6 +262,9 @@ impl Gitx {
 
     pub(crate) fn open(&mut self, path: &str) {
         self.repo = Some(path.to_string());
+        // 打开仓库 = 离开首页。点仓库 tab、添加仓库、克隆回来都汇到这一条路上，
+        // 所以在入口处翻这一位，而不是在每个调用点各写一遍。
+        self.home = false;
         if let Some(c) = &self.conn {
             let _ = db::set_setting(c, "gitx_last_repo", path);
         }
@@ -227,7 +338,7 @@ impl Gitx {
             eff_scope(&self.scope, snap.status.detached_at.is_some()),
             self.tx.clone(),
         );
-        std::thread::spawn(move || {
+        gitx::lang::spawn(move || {
             let _ = tx.send(match git::commits_page(&repo, skip, LOG_PAGE, topo, &scope) {
                 Ok(commits) => Msg::More { repo, seq, commits },
                 Err(e) => Msg::Failed(format!("{repo}: {e}")),
@@ -235,8 +346,8 @@ impl Gitx {
         });
     }
 
-    /// 侧栏「搜索」那一行：把日志条右边那一格换成搜索框。
-    /// 已经开着就不动命中列表——人只是又点了一下那一行（想不起搜索在哪），
+    /// 打开搜索那一档（唯一入口是日志条右端那枚「搜索」小按钮）：把右边那一格换成搜索框。
+    /// 已经开着就不动命中列表——人只是又点了一下那枚按钮（想不起搜索在哪），
     /// 把上一次的结果抹掉等于告诉他「你刚才搜的那一下不算」。
     pub(crate) fn open_search(&mut self) {
         self.search_open = true;
@@ -315,7 +426,7 @@ impl Gitx {
         let tx = self.tx.clone();
         {
             let (repo2, oid2) = (repo.clone(), oid.clone());
-            std::thread::spawn(move || {
+            gitx::lang::spawn(move || {
                 let files = if stash {
                     git::stash_diff(&repo2, &oid2)
                 } else {
@@ -357,7 +468,7 @@ impl Gitx {
             Target::Working { path, .. } | Target::Commit { path, .. } | Target::Stash { path, .. } => path.is_none(),
         };
         self.busy = true;
-        std::thread::spawn(move || {
+        gitx::lang::spawn(move || {
             let lines = patch_of(&repo, &target).map(|p| layout(&p, show_files)).unwrap_or_default();
             let _ = tx.send(Msg::Patch { repo, seq, label, lines });
         });
@@ -368,10 +479,226 @@ impl Gitx {
     pub(crate) fn start_clone(&mut self, url: String, dest: String) {
         self.busy = true;
         let tx = self.tx.clone();
-        std::thread::spawn(move || {
+        gitx::lang::spawn(move || {
             let r = git::clone_repo(&url, &url, &dest).map_err(|e| format!("{e}"));
             let _ = tx.send(Msg::Cloned(r));
         });
+    }
+
+    /// 切到看板（左栏整栏换掉，DESIGN §2.2）。三步都在 `land` 里跑、不在帧里：
+    /// 认 provider 是纯字符串解析（用快照里已有的远端 URL，不为这一眼再 fork 一次 git），
+    /// 「看过」那份记录要读库，取数交给线程。
+    pub(crate) fn show_board(&mut self) {
+        self.board_open = true;
+        let urls: Vec<String> = self
+            .snap
+            .as_ref()
+            .map(|s| s.remotes.iter().map(|r| r.url.clone()).collect())
+            .unwrap_or_default();
+        let host = provider::detect(&urls);
+        let repo_ref = host.and_then(|h| provider::repo_ref_for(h, &urls));
+        self.board = Board { host, repo_ref, ..Default::default() };
+        // 「看过」按 provider + `owner/repo` 存：切走再回来不该看见满屏蓝点——
+        // 那枚点的意思正是「你上次看之后它又动了」，每次进看板都全亮就是没有意思。
+        let seen: Option<String> = self
+            .board
+            .seen_key()
+            .and_then(|k| self.conn.as_ref().and_then(|c| db::get_setting(c, &k).ok().flatten()));
+        if let Some(json) = seen {
+            if let Ok(map) = serde_json::from_str::<std::collections::HashMap<u32, String>>(&json) {
+                self.board.seen = map;
+            }
+            // 读不懂就当没看过：一次写坏的记录不该把蓝点永久钉死（同 `flag()` 那条规矩）。
+        }
+        self.fetch_board();
+    }
+
+    /// 起一次看板取数。请求由 provider 拼（那一步有 fixture 判据），这里只管发与收。
+    /// 没绑令牌 / 认不出 provider → **不发请求**，把原因直接落在看板上：转圈转到超时
+    /// 再报错，比一上来就写「未绑定 GitHub 令牌」慢了一整圈。
+    pub(crate) fn fetch_board(&mut self) {
+        let (Some(host), Some(repo_ref)) = (self.board.host, self.board.repo_ref.clone()) else {
+            self.board.error = Some(
+                tr!(
+                    "这本仓库的远端不是认得出的代码托管（GitHub / Gitee）。",
+                    "This repository's remote is not a hosting service we recognise (GitHub / Gitee)."
+                )
+                .to_owned(),
+            );
+            self.board.loaded = true;
+            return;
+        };
+        let token = self
+            .provider_tokens
+            .iter()
+            .find(|(id, _)| *id == host.id())
+            .map(|(_, t)| t.clone())
+            .unwrap_or_default();
+        let req = match host.pull_requests_request(&repo_ref, &token) {
+            Ok(r) => r,
+            Err(e) => {
+                self.board.error = Some(e.to_string());
+                self.board.loaded = true;
+                return;
+            }
+        };
+        self.board_seq += 1;
+        let seq = self.board_seq;
+        self.board.fetching = true;
+        self.board.error = None;
+        // 列表重取：每一行的补充请求都要重新允许发一次（在飞的那些会因为号对不上被丢，
+        // 不清这本账就永远没人再问）。**结果缓存 `facts` 留着**：同一版提交不必问第二遍。
+        self.board.asked.clear();
+        let tx = self.tx.clone();
+        gitx::lang::spawn(move || {
+            let r = gitx::net::execute(&req)
+                .and_then(|body| host.parse_pull_requests(&body))
+                .map_err(|e| e.to_string());
+            let _ = tx.send(Msg::PullRequests { seq, prs: r });
+        });
+    }
+
+    /// 给**看得见的**那几行补上列表不给的两格：`mergeable_state`（按号取详情）和
+    /// 检查汇总（按 head 的 sha 取）。
+    ///
+    /// 为什么按可见行而不是整屏一起取：这两个端点都是**每条一次**，50 条开放 PR 就是
+    /// 100 个请求，一次刷新打不完、也不该打——用户扫一眼看板只需要头顶那几行的状态。
+    /// 滚下去才补下去，取过的一次不再取（`asked` / `facts` 两本账）。
+    /// 上限 `ENRICH_IN_FLIGHT`：一次刷屏若不限并发，会把带宽和平台的速率预算一起打爆。
+    pub(crate) fn enrich_rows(&mut self, indices: &[usize]) {
+        let (Some(host), Some(repo_ref)) = (self.board.host, self.board.repo_ref.clone()) else {
+            return;
+        };
+        let caps = host.capabilities();
+        let wants_detail = caps.contains(&provider::Capability::PullRequestDetail);
+        let wants_checks = caps.contains(&provider::Capability::CiStatus);
+        if !wants_detail && !wants_checks {
+            return; // 这一家不给：一行请求都不发，状态列自己会说「还没算出来」
+        }
+        let token = self
+            .provider_tokens
+            .iter()
+            .find(|(id, _)| *id == host.id())
+            .map(|(_, t)| t.clone())
+            .unwrap_or_default();
+        // 没令牌 = 一行都不问。和 `fetch_board` 同一条规矩（「没令牌不发请求，把原因当场
+        // 写在栏上」）：逐行去拼请求会把同一句话写成 N 份，更糟的是把「拼不出来」记成
+        // 「这一行取过了」—— 用户回头绑上令牌、按一下刷新，那些行就永久 blank。
+        if token.trim().is_empty() {
+            self.board.error.get_or_insert_with(|| {
+                tr!(
+                    format!("未绑定 {} 的令牌，请在「设置 → 代码托管」中填写。", host.label()),
+                    format!("No {} token bound — fill one in under Preferences → Hosting.", host.label())
+                )
+                .to_owned()
+            });
+            return;
+        }
+        // 在飞的账见 `Board::outstanding`（并发上限和「首次建账走完了没」用的是同一个数）。
+        let seq = self.board_seq;
+        let tx = self.tx.clone();
+        for &i in indices {
+            if self.board.outstanding() >= ENRICH_IN_FLIGHT {
+                return;
+            }
+            let Some(pr) = self.board.prs.get(i).cloned() else { continue };
+            if pr.head_sha.is_empty() {
+                continue; // 没有 sha 就拼不出第二个请求的 URL；不猜一个
+            }
+            let key = (pr.number, pr.head_sha.clone());
+            let facts = self.board.facts.get(&key).cloned().unwrap_or_default();
+            for ask in [Ask::Detail, Ask::Checks] {
+                let already_have = match ask {
+                    Ask::Detail => facts.detail.is_some(),
+                    Ask::Checks => facts.checks.is_some(),
+                };
+                let allowed = match ask {
+                    Ask::Detail => wants_detail,
+                    Ask::Checks => wants_checks,
+                };
+                if already_have || !allowed || self.board.asked.contains(&(key.clone(), ask)) {
+                    continue;
+                }
+                let built = match ask {
+                    Ask::Detail => host
+                        .pull_request_detail_request(&repo_ref, &token, pr.number)
+                        .map_err(|e| e.to_string()),
+                    Ask::Checks => host
+                        .checks_request(&repo_ref, &token, &pr.head_sha)
+                        .map_err(|e| e.to_string()),
+                };
+                let req = match built {
+                    Ok(r) => r,
+                    Err(e) => {
+                        // 拼不出请求 = 这一行永远不会有结果。记成「已经回过了」，
+                        // 否则每帧都重拼一次、每帧都失败一次。
+                        let f = self.board.facts.entry(key.clone()).or_default();
+                        match ask {
+                            Ask::Detail => f.detail = Some(String::new()),
+                            Ask::Checks => f.checks = Some(gitx::models::Ci::Unknown),
+                        }
+                        self.board.error.get_or_insert(e);
+                        continue;
+                    }
+                };
+                self.board.asked.insert((key.clone(), ask));
+                let number = key.0;
+                let sha = key.1.clone();
+                let tx = tx.clone();
+                match ask {
+                    Ask::Detail => {
+                        gitx::lang::spawn(move || {
+                            let r = gitx::net::execute(&req)
+                                .and_then(|b| host.parse_pull_request_detail(&b))
+                                .map(|one| one.mergeable_state)
+                                .map_err(|e| e.to_string());
+                            let _ = tx.send(Msg::PrDetail { seq, number, sha, r });
+                        });
+                    }
+                    Ask::Checks => {
+                        gitx::lang::spawn(move || {
+                            let r = gitx::net::execute(&req)
+                                .and_then(|b| host.parse_checks(&b))
+                                .map(|checks| gitx::provider::aggregate_ci(&checks))
+                                .map_err(|e| e.to_string());
+                            let _ = tx.send(Msg::PrChecks { seq, number, sha, r });
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// 看板那一击办两件事：把「看到这儿了」落库，请在浏览器里打开那条 PR。
+    /// 走 `Context::open_url` 而不是 `open <url>`：前者进 egui 的命令队列，
+    /// 无头门禁量得到这一条命令，也不会因为跑测试真的弹开浏览器（同 `CopyText` 那一招）。
+    pub(crate) fn open_pull_request(&mut self, index: usize) -> Option<String> {
+        let Some(pr) = self.board.prs.get(index).cloned() else { return None };
+        let host = self.board.host?;
+        // 存的是**签名**而不是 `updated_at`：检查跑完不改 `updated_at`（实测），只存它的话
+        // 「CI 从在跑到全绿」这次用户看得见的变化永远不会让蓝点亮回来。
+        self.board.seen.insert(pr.number, pr.signature());
+        self.persist_seen();
+        let url = self
+            .board
+            .repo_ref
+            .as_ref()
+            .map(|r| host.pull_request_web_url(r, pr.number))
+            .filter(|u| !u.is_empty())
+            // provider 没给地址时退回它自己带的那条 `html_url`：两条都是空就是真没地址，
+            // 这时候不推命令——推一条空 URL 等于用户按了没反应。
+            .or_else(|| (!pr.url.is_empty()).then_some(pr.url.clone()))?;
+        Some(url)
+    }
+
+    /// 「看过」那本账落库。点开一行和首次建账两条路写的是同一本账，所以那段
+    /// 「键怎么拼、值怎么编」只写一处。
+    pub(crate) fn persist_seen(&mut self) {
+        let Some(key) = self.board.seen_key() else { return };
+        let json = serde_json::to_string(&self.board.seen).unwrap_or_default();
+        if let Some(c) = self.conn.as_mut() {
+            let _ = db::set_setting(c, &key, &json);
+        }
     }
 
     /// 起一次 `git init`。产物和克隆一样是「磁盘上多了一本仓库」，所以回复共用
@@ -379,7 +706,7 @@ impl Gitx {
     pub(crate) fn start_init(&mut self, path: String) {
         self.busy = true;
         let tx = self.tx.clone();
-        std::thread::spawn(move || {
+        gitx::lang::spawn(move || {
             let r = git::init_repo(&path).map_err(|e| format!("{e}"));
             let _ = tx.send(Msg::Cloned(r));
         });
@@ -393,13 +720,13 @@ impl Gitx {
         let Some(dialog) = self.pending_dialog.take() else { return };
         match dialog {
             Dialog::Archive { repo, oid, name } => {
-                let Some(path) = rfd::FileDialog::new().set_title("归档成 zip").set_file_name(&name).save_file() else {
+                let Some(path) = rfd::FileDialog::new().set_title(tr!("归档成 zip", "Archive as zip")).set_file_name(&name).save_file() else {
                     return;
                 };
                 self.archive_to(&repo, &oid, &path.to_string_lossy());
             }
             Dialog::PickFolder { field } => {
-                let Some(path) = rfd::FileDialog::new().set_title("选一个目录").pick_folder() else {
+                let Some(path) = rfd::FileDialog::new().set_title(tr!("选一个目录", "Choose a directory")).pick_folder() else {
                     return;
                 };
                 self.fill_folder(field, &path.to_string_lossy());
@@ -413,7 +740,7 @@ impl Gitx {
     pub(crate) fn archive_to(&mut self, repo: &str, oid: &str, dest: &str) {
         self.busy = true;
         let (tx, repo, oid, dest) = (self.tx.clone(), repo.to_owned(), oid.to_owned(), dest.to_owned());
-        std::thread::spawn(move || {
+        gitx::lang::spawn(move || {
             let _ = match git::archive(&repo, &oid, &dest) {
                 Ok(()) => tx.send(Msg::Archived(dest)),
                 Err(e) => tx.send(Msg::Failed(format!("{e}"))),
@@ -490,9 +817,14 @@ impl Gitx {
         // 都得把字留着——否则用户得重打一遍。
         self.clear_msg_on_load =
             matches!(action, Action::Commit(_) | Action::Amend(_) | Action::CommitAndPush { .. });
+        // 推送这一路要让状态栏报「正在推送…」：进线程之前先记下来，线程里只能靠 `Msg` 通信，
+        // 碰不到 `self`。`CommitAndPush` 也走这儿——「提交并推送」整段都算推送。
+        if matches!(action, Action::PushRefs { .. } | Action::CommitAndPush { .. }) {
+            self.push_state = Some(PushPhase::Pushing);
+        }
         let tx = self.tx.clone();
         let (topo, scope) = (self.topo, self.scope.clone());
-        std::thread::spawn(move || {
+        gitx::lang::spawn(move || {
             let r = match &action {
                 Action::Stage(p) => git::stage(&repo, p),
                 Action::Unstage(p) => git::unstage(&repo, p),
@@ -589,9 +921,10 @@ impl Gitx {
                             .arg(format!("https://{}/{}", r.host, r.path))
                             .spawn()
                             .map(|_| ())
-                            .map_err(|e| GitxError::Other(format!("打不开浏览器：{e}"))),
-                        None => Err(GitxError::Other(format!(
-                            "{url} 不是「主机/所有者/仓库」那种远端地址"
+                            .map_err(|e| GitxError::Other(tr!(format!("打不开浏览器：{e}"), format!("Cannot open a browser: {e}")))),
+                        None => Err(GitxError::Other(tr!(
+                            format!("{url} 不是「主机/所有者/仓库」那种远端地址"),
+                            format!("{url} is not a host/owner/repository remote address")
                         ))),
                     }
                 }),
@@ -603,9 +936,15 @@ impl Gitx {
                 // `busy` 就永远没人落了——报错至少把牌子落回工作区。
                 Action::Clone { .. } | Action::Init { .. } | Action::AddExisting { .. }
                 | Action::Archive(_) => Err(
-                    GitxError::Other("开仓库和归档那几条不该走到这条路上（act 的守卫被挪了）".to_owned()),
+                    GitxError::Other(tr!(
+                        "开仓库和归档那几条不该走到这条路上（act 的守卫被挪了）",
+                        "adding a repository and archiving must not reach this path (the guard in act moved)"
+                    ).to_owned()),
                 ),
             };
+            // 推送这一路单独走 `Msg::PushDone`，让状态栏报「正在推送 / 推送完成 / 推送失败」，
+            // 而不是只弹一条 toast。`CommitAndPush` 也是推送。
+            let is_push = matches!(action, Action::PushRefs { .. } | Action::CommitAndPush { .. });
             match r {
                 Ok(()) => {
                     // 动作之后重新取一次快照：排序方式得跟着用户那枚开关，不然「层级顺序」
@@ -614,9 +953,27 @@ impl Gitx {
                         Ok(s) => Msg::Loaded { repo, snap: Box::new(s) },
                         Err(e) => Msg::Failed(format!("{repo}: {e}")),
                     });
+                    if is_push {
+                        let _ = tx.send(Msg::PushDone(Ok(())));
+                    }
                 }
                 Err(e) => {
-                    let _ = tx.send(Msg::Failed(e.to_string()));
+                    if is_push {
+                        // 推送失败只发 `PushDone(Err)`：状态栏报「推送失败」，原因进 toast。
+                        let _ = tx.send(Msg::PushDone(Err(e.to_string())));
+                    } else {
+                        // pull / merge 这类会改写工作区的操作失败时，工作区往往已经进了冲突态
+                        // （git 把冲突文件写进工作区之后才非零退出）。若只弹错误、不重取快照，
+                        // 界面就停在操作前的状态，unmerged 文件不显示，`op_banner`/`conflict_section`
+                        // 也就不画——用户于是以为「冲突没法处理」。这里补一次快照，把已有的冲突
+                        // 解决入口（中止 / 继续 / 标记为已解决）露出来。
+                        if matches!(action, Action::PullFrom { .. } | Action::Merge(_)) {
+                            if let Ok(s) = snapshot_of(&repo, topo, &scope) {
+                                let _ = tx.send(Msg::Loaded { repo, snap: Box::new(s) });
+                            }
+                        }
+                        let _ = tx.send(Msg::Failed(e.to_string()));
+                    }
                 }
             }
         });
@@ -728,9 +1085,9 @@ impl Gitx {
                             pos2(card.max.x - MODAL_PAD, y + (MODAL_ROW_H + SEG_H) / 2.0),
                         ),
                         &[
-                            ("打开已有", AddTab::Open),
-                            ("克隆到本地", AddTab::Clone),
-                            ("新建仓库", AddTab::New),
+                            (tr!("打开已有", "Open existing"), AddTab::Open),
+                            (tr!("克隆到本地", "Clone locally"), AddTab::Clone),
+                            (tr!("新建仓库", "New repository"), AddTab::New),
                         ],
                         tab,
                     );
@@ -744,7 +1101,7 @@ impl Gitx {
                     let mut right = card.max.x - MODAL_PAD;
                     if browse {
                         // 先画按钮、拿它**实测**的宽，文本框右缘才知道要让到哪儿。
-                        let (hit, w) = card_button(ui, "浏览…", right, y + MODAL_ROW_H / 2.0, false);
+                        let (hit, w) = card_button(ui, tr!("浏览…", "Browse…"), right, y + MODAL_ROW_H / 2.0, false);
                         if hit {
                             pick = Some(FolderField::Main);
                         }
@@ -754,7 +1111,7 @@ impl Gitx {
                         pos2(card.min.x + MODAL_PAD, y + (MODAL_ROW_H - FIELD_H) / 2.0),
                         pos2(right, y + (MODAL_ROW_H + FIELD_H) / 2.0),
                     );
-                    let resp = card_field(ui, r, hint, text, 1);
+                    let resp = card_field(ui, r, hint, text, 1, false);
                     if focus {
                         resp.request_focus();
                     }
@@ -764,7 +1121,7 @@ impl Gitx {
                 // `card.max.y` 定位，不跟着正文行数是有意为之（卡片高度已经算进 `rows`）。
                 match &mut m.form {
                     Form::StashSave { include_untracked } => {
-                        pref_switch(ui, card, y, "包含未跟踪文件", include_untracked);
+                        pref_switch(ui, card, y, tr!("包含未跟踪文件", "Include untracked files"), include_untracked);
                     }
                     Form::Merge { branches } => {
                         for (i, b) in branches.iter().enumerate() {
@@ -786,7 +1143,7 @@ impl Gitx {
                             &git::ResetMode::ALL.map(|m| (reset_words(m).0, m)),
                             mode,
                         );
-                        modal_text(ui, card, y + MODAL_ROW_H, RESET_SHARES, TEXT_SECONDARY, 11.0);
+                        modal_text(ui, card, y + MODAL_ROW_H, reset_shares(), TEXT_SECONDARY, 11.0);
                         modal_text(
                             ui,
                             card,
@@ -802,7 +1159,7 @@ impl Gitx {
                         // 目标目录同样给一枚「浏览…」。这一格只有克隆那一档存在，
                         // 所以 `FolderField` 直接给 `CloneDest`，不用再问一次当前是哪一档。
                         let mut right = card.max.x - MODAL_PAD;
-                        let (hit, w) = card_button(ui, "浏览…", right, y + MODAL_ROW_H / 2.0, false);
+                        let (hit, w) = card_button(ui, tr!("浏览…", "Browse…"), right, y + MODAL_ROW_H / 2.0, false);
                         if hit {
                             pick = Some(FolderField::CloneDest);
                         }
@@ -811,7 +1168,7 @@ impl Gitx {
                             pos2(card.min.x + MODAL_PAD, y + (MODAL_ROW_H - FIELD_H) / 2.0),
                             pos2(right, y + (MODAL_ROW_H + FIELD_H) / 2.0),
                         );
-                        let _ = card_field(ui, r, "目标目录", dest, 1);
+                        let _ = card_field(ui, r, tr!("目标目录", "Destination folder"), dest, 1, false);
                     }
                     // 描述那一格 + 两枚勾。行高记在 `rows()` 里（`DESC_ROWS` + 2）。
                     Form::Commit { desc, amend, push_after } => {
@@ -819,11 +1176,11 @@ impl Gitx {
                             pos2(card.min.x + MODAL_PAD, y),
                             pos2(card.max.x - MODAL_PAD, y + MODAL_ROW_H * DESC_ROWS as f32),
                         );
-                        let _ = card_field(ui, r, "扩展描述…", desc, DESC_ROWS);
+                        let _ = card_field(ui, r, tr!("扩展描述…", "Extended description…"), desc, DESC_ROWS, false);
                         let y = y + MODAL_ROW_H * DESC_ROWS as f32;
-                        pref_switch(ui, card, y, "修正上一条提交", amend);
+                        pref_switch(ui, card, y, tr!("修正上一条提交", "Amend the last commit"), amend);
                         let y = y + MODAL_ROW_H;
-                        pref_switch(ui, card, y, "提交之后立刻推送", push_after);
+                        pref_switch(ui, card, y, tr!("提交之后立刻推送", "Push right after committing"), push_after);
                     }
                     // 偏好卡：页签一排 + 每页那几条。开关改一格当场落库当场生效（见 `apply_prefs`）。
                     Form::Settings { prefs, page, repos, database } => {
@@ -834,9 +1191,10 @@ impl Gitx {
                                 pos2(card.max.x - MODAL_PAD, y + (MODAL_ROW_H + SEG_H) / 2.0),
                             ),
                             &[
-                                ("通用", PrefPage::General),
-                                ("推送与拉取", PrefPage::Push),
-                                ("关于", PrefPage::About),
+                                (tr!("通用", "General"), PrefPage::General),
+                                (tr!("推送与拉取", "Push & pull"), PrefPage::Push),
+                                (tr!("代码托管", "Hosting"), PrefPage::Hosting),
+                                (tr!("关于", "About"), PrefPage::About),
                             ],
                             page,
                         );
@@ -846,9 +1204,32 @@ impl Gitx {
                                 // 三条**都真接得通**才摆得上来：一条点了没反应的开关比没有更糟。
                                 // 「启动时重新打开」改的是下一次启动（读配置在 `Gitx::new`），
                                 // 另两条这一帧就看得见效果。
-                                pref_switch(ui, card, y, "启动时重新打开上一次的仓库", &mut prefs.restore_last);
-                                pref_switch(ui, card, y + MODAL_ROW_H, "日志默认按层级顺序（而不是日期）", &mut prefs.topo);
-                                pref_switch(ui, card, y + MODAL_ROW_H * 2.0, "描述列显示远程分支那枚药丸", &mut prefs.show_remote);
+                                pref_switch(ui, card, y, tr!("启动时重新打开上一次的仓库", "Reopen the last repository at launch"), &mut prefs.restore_last);
+                                pref_switch(ui, card, y + MODAL_ROW_H, tr!("日志默认按层级顺序（而不是日期）", "Log defaults to ancestry order (not date)"), &mut prefs.topo);
+                                pref_switch(ui, card, y + MODAL_ROW_H * 2.0, tr!("描述列显示远程分支那枚药丸", "Show the remote-branch pill in the message column"), &mut prefs.show_remote);
+                                // 第四格：界面语言。分段选择（§4.4），改完**当场整屏换字**——
+                                // 语言不是一次取数或一份快照，它只由下一帧 `shell()` 开头那次
+                                // `lang::set` 决定，所以不需要重取任何东西。
+                                let ry = y + MODAL_ROW_H * 3.0;
+                                put_left(
+                                    ui,
+                                    Rect::from_min_max(
+                                        pos2(card.min.x + MODAL_PAD, ry),
+                                        pos2(card.min.x + MODAL_PAD + 96.0, ry + MODAL_ROW_H),
+                                    ),
+                                    |ui| {
+                                        ui.label(RichText::new(tr!("界面语言：", "Language:")).size(11.5));
+                                    },
+                                );
+                                seg_tabs(
+                                    ui,
+                                    Rect::from_min_max(
+                                        pos2(card.min.x + MODAL_PAD + 100.0, ry + (MODAL_ROW_H - SEG_H) / 2.0),
+                                        pos2(card.max.x - MODAL_PAD, ry + (MODAL_ROW_H + SEG_H) / 2.0),
+                                    ),
+                                    &[("中文", Lang::Zh), ("English", Lang::En)],
+                                    &mut prefs.lang,
+                                );
                             }
                             PrefPage::Push => {
                                 // 这一页四条全都真的改得出**看得见的区别**，所以四条都摆（判据见
@@ -867,9 +1248,9 @@ impl Gitx {
                                     ),
                                     |ui| {
                                         ui.spacing_mut().item_spacing.x = 6.0;
-                                        ui.label(RichText::new("默认远端：").size(11.5));
+                                        ui.label(RichText::new(tr!("默认远端：", "Default remote:")).size(11.5));
                                         let label = if prefs.default_remote.is_empty() {
-                                            "（没有）"
+                                            tr!("（没有）", "(none)")
                                         } else {
                                             prefs.default_remote.as_str()
                                         };
@@ -886,10 +1267,10 @@ impl Gitx {
                                     ),
                                     |ui| {
                                         ui.spacing_mut().item_spacing.x = 6.0;
-                                        ui.label(RichText::new("推送时：").size(11.5));
+                                        ui.label(RichText::new(tr!("推送时：", "On push:")).size(11.5));
                                         // 五项文案逐字取自本机那枚 `NSPopUpButton` 的菜单
                                         // （测量记录见 docs/PROCESS.md）；存的是 git 那个键名。
-                                        let items: Vec<String> = PushBehavior::LABELS
+                                        let items: Vec<String> = PushBehavior::labels()
                                             .iter()
                                             .map(|l| l.to_string())
                                             .collect();
@@ -897,7 +1278,7 @@ impl Gitx {
                                             popup_button(ui, prefs.push_behavior.label(), &items)
                                         {
                                             if let Some(i) =
-                                                PushBehavior::LABELS.iter().position(|l| *l == p)
+                                                PushBehavior::labels().iter().position(|l| *l == p)
                                             {
                                                 prefs.push_behavior = PushBehavior::from_index(i);
                                             }
@@ -908,24 +1289,62 @@ impl Gitx {
                                     ui,
                                     card,
                                     y + MODAL_ROW_H * 2.0,
-                                    "推送所有标签到远程仓库",
+                                    tr!("推送所有标签到远程仓库", "Push all tags to the remote"),
                                     &mut prefs.push_tags,
                                 );
                                 pref_switch(
                                     ui,
                                     card,
                                     y + MODAL_ROW_H * 3.0,
-                                    "允许强制推送",
+                                    tr!("允许强制推送", "Allow force push"),
                                     &mut prefs.allow_force,
                                 );
                             }
+                            PrefPage::Hosting => {
+                                // 一格一家：令牌输入框（掩码——它会被人站在屏幕后面看见）+
+                                // 下面一行「怎么拿」。只摆**声明了 PR 能力**的 provider：给做不了
+                                // 事的 provider 留一格输入框，就是留一格按下去没反应的空壳。
+                                let mut row = 0usize;
+                                for h in gitx::provider::HOSTS.iter().filter(|h| {
+                                    h.capabilities()
+                                        .contains(&gitx::provider::Capability::PullRequests)
+                                }) {
+                                    let ry = y + MODAL_ROW_H * row as f32;
+                                    let r = Rect::from_min_max(
+                                        pos2(card.min.x + MODAL_PAD, ry + (MODAL_ROW_H - FIELD_H) / 2.0),
+                                        pos2(card.max.x - MODAL_PAD, ry + (MODAL_ROW_H + FIELD_H) / 2.0),
+                                    );
+                                    card_field(
+                                        ui,
+                                        r,
+                                        &tr!(format!("{} 访问令牌", h.label()), format!("{} access token", h.label())).to_owned(),
+                                        prefs.token_mut(h.id()),
+                                        1,
+                                        true,
+                                    );
+                                    let bound = if prefs.token(h.id()).is_empty() {
+                                        tr!("未绑定", "not linked")
+                                    } else {
+                                        tr!("已绑定 · 只存本机", "linked · stored on this machine only")
+                                    };
+                                    modal_text(
+                                        ui,
+                                        card,
+                                        ry + MODAL_ROW_H,
+                                        &format!("{bound} · {}", h.token_hint()),
+                                        TEXT_SECONDARY,
+                                        11.0,
+                                    );
+                                    row += 2;
+                                }
+                            }
                             PrefPage::About => {
-                                modal_text(ui, card, y, &format!("书签里的仓库：{repos} 本"), TEXT_PRIMARY, 11.5);
+                                modal_text(ui, card, y, &tr!(format!("书签里的仓库：{repos} 本"), format!("Repositories in the shelf: {repos}")), TEXT_PRIMARY, 11.5);
                                 modal_text(
                                     ui,
                                     card,
                                     y + MODAL_ROW_H,
-                                    &database.clone().unwrap_or_else(|| "没有可用的数据库".to_owned()),
+                                    &database.clone().unwrap_or_else(|| tr!("没有可用的数据库", "No database available").to_owned()),
                                     TEXT_SECONDARY,
                                     11.0,
                                 );
@@ -976,7 +1395,7 @@ impl Gitx {
                 }
                 let mut cancel_hit = false;
                 if !primary_closes(&m) {
-                    let (hit, _) = card_button(ui, "取消", right, cy, false);
+                    let (hit, _) = card_button(ui, tr!("取消", "Cancel"), right, cy, false);
                     cancel_hit = hit;
                 }
                 if cancel_hit || bg_resp.clicked() {
@@ -1006,8 +1425,22 @@ impl Gitx {
             self.pending_dialog = Some(Dialog::PickFolder { field });
         }
         // 偏好卡的开关「改一格算一格」：卡还开着就要生效、就要落库，所以在这儿回写一次。
-        if let Form::Settings { prefs, .. } = &m.form {
-            self.apply_prefs(prefs.clone());
+        // 换过语言要把这张卡**当场重拼**：卡的标题和说明是打开那一刻按当时语言算死的
+        // `&'static str`，不重拼就是一屏英文挂着「设置」两个汉字。
+        // 重拼只能在这儿做：`apply_prefs` 里读的是 `self.modal`，而这一帧卡正被上面那个
+        // `take()` 握在手里，那儿是空的——以前挂在 `apply_prefs` 里的那段重拼是条死路，
+        // 判据 `the_language_segment_switches_the_whole_shell_and_persists` 第一次跑就红在这儿。
+        if let Form::Settings { page, repos, database, prefs } = &m.form {
+            let (page, repos, database, prefs) = (*page, *repos, database.clone(), prefs.clone());
+            if self.apply_prefs(prefs) {
+                let mut card = Modal::settings(self.prefs(), repos, database);
+                // 页签停在原来那一页：切语言不该把人从「代码托管」弹回「通用」。
+                if let Form::Settings { page: now, .. } = &mut card.form {
+                    *now = page;
+                }
+                self.modal = Some(card);
+                return;
+            }
         }
         // 关卡的决定只有这一处：按「取消」、点遮罩、按 Esc 都算 `close`；有动作要发时先按
         // 「动作会被接住」收，`land` 报没接住（填的路径不是仓库、手上根本还没仓库）就把卡连字
@@ -1064,6 +1497,11 @@ impl Gitx {
                     // 「到底」），既白跑 git，也让无头门禁里的线程数不确定。
                     self.log_more = snap.commits.len() as u32 == LOG_PAGE;
                     self.snap = Some(snap);
+                    // 看板开着的时候换了仓库（切 tab、点首页那张卡）：那一栏对着的
+                    // provider 得跟着新快照重认，不然画的是上一本仓库的 PR 列表。
+                    if self.board_open {
+                        self.show_board();
+                    }
                     self.busy = false;
                     if std::mem::take(&mut self.clear_msg_on_load) {
                         self.commit_msg.clear();
@@ -1214,13 +1652,142 @@ impl Gitx {
                     match r {
                         // 成了就当书签加进去并打开：`add_repo` 自己会发 `Msg::Loaded`。
                         Ok(root) => { self.add_repo(&root); }
-                        Err(e) => self.note = Some(format!("仓库没落地：{e}")),
+                        Err(e) => self.note = Some(tr!(format!("仓库没落地：{e}"), format!("The repository never landed: {e}"))),
                     }
                 }
                 // 归档成了：只报一句落在哪儿，界面什么都不换（它没动仓库，快照还是对的）。
                 Msg::Archived(dest) => {
                     self.busy = false;
-                    self.note = Some(format!("已导出 {dest}"));
+                    self.note = Some(tr!(format!("已导出 {dest}"), format!("Exported to {dest}")));
+                }
+                Msg::PullRequests { seq, prs } => {
+                    // 对不上号的回复一律丢：切仓库、按刷新、再点进看板都重新编过号，
+                    // 旧回复落地就是「A 仓库的列表挂在 B 仓库名下」。
+                    if seq != self.board_seq {
+                        continue;
+                    }
+                    self.board.fetching = false;
+                    self.board.loaded = true;
+                    match prs {
+                        Ok(list) => {
+                            self.board.prs = list;
+                            self.board.error = None;
+                            // 列表是新的（那两格全空），`(号, sha)` 的缓存还有效：涂回去。
+                            // 同一版提交不该因为「按了一次刷新」就被再问一遍。
+                            self.board.apply_facts();
+                            // 库里读回来是空的 = 这一栏第一次打开。见 `Board::seeding`。
+                            self.board.seeding = self.board.seen.is_empty();
+                        }
+                        Err(e) => {
+                            self.board.prs.clear();
+                            self.board.error = Some(e);
+                        }
+                    }
+                }
+                // 单条 PR 的 `mergeable_state`（列表端点**不给**这一格，实测）。
+                // 两道闸都在「涂进行」之前：号对不上 = 这一笔属于上一代列表；
+                // sha 对不上 = 作者在这一趟在飞时推了新提交，旧那一版的「可以合并」
+                // 挂在新提交上是这一栏最要命的那种谎。丢掉的回复**不解在途**——
+                // 那一本账跟着列表重开，动它等于把谎接着说。
+                Msg::PrDetail { seq, number, sha, r } => {
+                    if seq != self.board_seq {
+                        continue;
+                    }
+                    let live = self
+                        .board
+                        .prs
+                        .iter()
+                        .find(|p| p.number == number)
+                        .map(|p| p.head_sha.clone());
+                    if live.as_deref() != Some(sha.as_str()) {
+                        continue;
+                    }
+                    let now = ctx.input(|i| i.time);
+                    match r {
+                        Err(e) => {
+                            // 回不来就当这一格**没有结论**（空串），而不是让这一行
+                            // 一辈子挂着「正在看它卡在哪」。
+                            let key = (number, sha);
+                            self.board.facts.entry(key).or_default().detail = Some(String::new());
+                            self.board.error.get_or_insert(e);
+                        }
+                        Ok(ms) => {
+                            // GitHub 那一格是后台补的，第一次常常还是 `unknown`。
+                            // 当结论落地 = 这一行挂着一句「还没算出来」直到用户手动刷新，
+                            // 所以排一次到点重问；试够了才认下来。见 `retry_unknown_details`。
+                            let usable = !ms.is_empty() && ms != "unknown";
+                            let exhausted = self
+                                .board
+                                .facts
+                                .get(&(number, sha.clone()))
+                                .map(|f| f.detail_tries >= DETAIL_RETRY_MAX)
+                                .unwrap_or(false);
+                            if !usable && !exhausted {
+                                self.board
+                                    .facts
+                                    .entry((number, sha))
+                                    .or_default()
+                                    .retry_at = Some(now + DETAIL_RETRY_SECS);
+                            } else {
+                                self.board.facts.entry((number, sha.clone())).or_default().detail = Some(ms.clone());
+                                if let Some(pr) = self.board.prs.iter_mut().find(|p| p.number == number) {
+                                    pr.mergeable_state = ms;
+                                }
+                            }
+                        }
+                    }
+                }
+                // head 那一版提交的检查汇总（后台已经 `aggregate_ci` 过）。
+                // 和详情同一两道闸，理由同上一条。失败也记成「已经有了」= `Ci::Unknown`：
+                // 「取失败」和「还没取」是两件事，前者不许画成后者。
+                Msg::PrChecks { seq, number, sha, r } => {
+                    if seq != self.board_seq {
+                        continue;
+                    }
+                    let live = self
+                        .board
+                        .prs
+                        .iter()
+                        .find(|p| p.number == number)
+                        .map(|p| p.head_sha.clone());
+                    if live.as_deref() != Some(sha.as_str()) {
+                        continue;
+                    }
+                    let (ci, why) = match r {
+                        Ok(ci) => (ci, None),
+                        Err(e) => (gitx::models::Ci::Unknown, Some(e)),
+                    };
+                    // `sha` 那道闸已经证明列表里这一号的 head 就是它，按号找即可。
+                    if let Some(pr) = self
+                        .board
+                        .prs
+                        .iter_mut()
+                        .find(|p| p.number == number)
+                    {
+                        pr.ci = ci.clone();
+                    }
+                    self.board.facts.entry((number, sha)).or_default().checks = Some(ci);
+                    if let Some(e) = why {
+                        self.board.error.get_or_insert(e);
+                    }
+                }
+                Msg::PushDone(r) => {
+                    // 推送状态落到状态栏：成功「推送完成」、失败「推送失败」，都带时间戳，
+                    // 几秒后由 `status_bar` 清掉。失败原因同时进 toast（`note`）。
+                    let now = ctx.input(|i| i.time);
+                    match r {
+                        Ok(()) => {
+                            self.push_state = Some(PushPhase::Done(now));
+                            self.note = Some(tr!("推送完成", "Push complete").to_owned());
+                        }
+                        Err(e) => {
+                            self.push_state = Some(PushPhase::Failed(now));
+                            if !e.is_empty() {
+                                self.note = Some(e);
+                            }
+                        }
+                    }
+                    self.busy = false;
                 }
                 Msg::Failed(e) => {
                     if !e.is_empty() {
@@ -1241,9 +1808,62 @@ impl Gitx {
                 }
             }
         }
+        // 看板那一击攒下的地址在这儿交给 egui：`land` 手上没有 `Context`，而起进程
+        // `open <url>` 会让跑测试真的弹出浏览器。走命令队列 = 无头门禁量得到这一条。
+        if let Some(url) = self.board_open_url.take() {
+            ctx.output_mut(|o| {
+                o.commands.push(egui::OutputCommand::OpenUrl(egui::OpenUrl::same_tab(url)))
+            });
+            ctx.request_repaint();
+        }
+        // 首次建账那一趟（见 `Board::seeding`）：把当前每一行的签名记成「看过了」。
+        // 要等补充的两格都落定才记 —— 列表刚落地时那两格还是空的，拿那份签名当基线，
+        // 「CI 在用户眼皮底下跑完」就会亮成一条他没看过的动静。
+        if self.board.seeding && !self.board.fetching && self.board.outstanding() == 0 {
+            if self.board.seed_seen() {
+                self.persist_seen();
+            }
+        }
+        // `unknown` 的到点重问。返回最早下一次到点，让静止的窗口自己醒来看这一眼：
+        // 没人要重绘就没人看表，「等 4 秒再问」会等到用户下次动鼠标。
+        let now = ctx.input(|i| i.time);
+        if let Some(at) = self.retry_unknown_details(now) {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64((at - now).max(0.05)));
+        }
         if got || self.busy {
             ctx.request_repaint();
         }
+    }
+
+    /// 到点重取那些「详情回了 `unknown`、还没试够」的行，返回最早的下一次到点。
+    ///
+    /// 只做「摘账」：把 `asked` 里那一格和 `facts.detail` 一起清掉，重发交给 `enrich_rows`
+    /// —— 它本来就只给**看得见**的行发请求，所以滚出屏幕的行不会在这一趟里白问一次。
+    /// 上限 `DETAIL_RETRY_MAX`：GitHub 后台算不出来时不该把这一格变成无休止的重发，
+    /// 试够了就认下 `unknown`，状态那句老实说「还没算出来」。
+    pub(crate) fn retry_unknown_details(&mut self, now: f64) -> Option<f64> {
+        let due: Vec<(u32, String)> = self
+            .board
+            .facts
+            .iter()
+            .filter(|(_, f)| f.detail.is_none() && f.detail_tries < DETAIL_RETRY_MAX)
+            .filter_map(|(k, f)| f.retry_at.map(|t| (t, k.clone())))
+            .filter(|(t, _)| *t <= now)
+            .map(|(_, k)| k)
+            .collect();
+        for key in &due {
+            if let Some(f) = self.board.facts.get_mut(key) {
+                f.retry_at = None;
+                f.detail_tries += 1;
+            }
+            self.board.asked.remove(&(key.clone(), Ask::Detail));
+        }
+        self.board
+            .facts
+            .values()
+            .filter(|f| f.detail.is_none() && f.detail_tries < DETAIL_RETRY_MAX)
+            .filter_map(|f| f.retry_at)
+            .min_by(|a, b| a.total_cmp(b))
     }
 
     // -------------------------------------------------------------------- 顶栏
@@ -1255,6 +1875,7 @@ impl Gitx {
         let mut tool: Option<usize> = None;
         let mut pick: Option<String> = None;
         let mut want_add = false;
+        let mut want_home = false;
         let current = self.repo.clone();
         let repos = self.repos.clone();
         // 分支那一格拆成两段：名字是次要灰，`↑n ↓m` 是主色 + 真字重（预览稿 `.branch-chip b`）。
@@ -1280,15 +1901,56 @@ impl Gitx {
                 // 一整行。分两行的话按钮 + tab 会把 46pt 的带撑出去（无头测试量出来的）。
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = TAB_GAP;
-                    for r in &repos {
-                        if repo_tab(ui, &r.name, current.as_deref() == Some(r.path.as_str())) {
+                    // §2「窗口收窄时溢出收进 `»` 菜单」。右边那一组（分支 + 11 枚按钮）是**有界**
+                    // 的，先量它；左边的仓库 tab 是无界的一串，只在剩下的宽度里排，排不下的收进 `»`。
+                    // 不收纳的话英文档就露馅：「+ Add repository」比「＋ 添加仓库」宽出一截，
+                    // 直接压进分支名和 `↑↓` 里（判据 `the_header_still_fits_in_english` 量到的就是它）。
+                    let band_w = ui.available_width();
+                    let right_w = header_right_group_width(ui, &head);
+                    let add_label = tr!("＋ 添加仓库", "+ Add repository");
+                    // 首页 tab 固定在最左（§2.1）、「添加仓库」永远是最后入口，两枚都不收纳。
+                    let fixed_w = repo_tab_width(ui, home_tab(), self.home) + TAB_GAP
+                        + ghost_tab_width(ui, &add_label) + TAB_GAP;
+                    let tab_widths: Vec<f32> = repos
+                        .iter()
+                        .map(|r| repo_tab_width(ui, &r.name, !self.home && current.as_deref() == Some(r.path.as_str())))
+                        .collect();
+                    let (kept, needs_more) =
+                        fit_header_tabs(&tab_widths, (band_w - right_w - fixed_w).max(0.0), more_tab_width(ui));
+                    // 「首页」固定在仓库 tab 的**左边**，不跟着书签列表滚。选中它时仓库 tab
+                    // 全部回到未选中态；点任一仓库 tab 就离开首页（`open()` 翻这一位）。
+                    if repo_tab(ui, home_tab(), self.home) {
+                        want_home = true;
+                    }
+                    for r in repos.iter().take(kept) {
+                        if repo_tab(ui, &r.name, !self.home && current.as_deref() == Some(r.path.as_str())) {
                             pick = Some(r.path.clone());
+                        }
+                    }
+                    if needs_more {
+                        let resp = more_tab(ui);
+                        // 菜单项按 §5.4 那套走 egui 的 menu 样式；`CloseOnClick` = 挑完就收，
+                        // 点外面也收（同筛选条那三枚弹出按钮的行为）。
+                        let chosen = egui::Popup::menu(&resp)
+                            .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+                            .show(|ui| {
+                                let mut hit: Option<String> = None;
+                                for r in &repos[kept..] {
+                                    if ui.button(&r.name).clicked() {
+                                        hit = Some(r.path.clone());
+                                    }
+                                }
+                                hit
+                            })
+                            .and_then(|inner| inner.inner);
+                        if let Some(p) = chosen {
+                            pick = Some(p);
                         }
                     }
                     // 空列表时这枚是**唯一**的入口。以前它旁边摊着一格路径输入和
                     // 「打开 / 克隆…」两枚，用户说太简陋：三件事各有一格输入，挤在一条里根本
                     // 读不清在填什么，现在统一收成一张卡（`Modal::add_repo`）。
-                    if ghost_tab(ui, "＋ 添加仓库") {
+                    if ghost_tab(ui, &add_label) {
                         want_add = true;
                     }
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
@@ -1300,9 +1962,9 @@ impl Gitx {
                             }
                         }
                         // 组与组之间让 14（`.header{gap:14}`），按钮自己那 2 已经吃进去了。
-                        ui.add_space(14.0 - ICON_BTN_GAP);
+                        ui.add_space(HEADER_GROUP_GAP - ICON_BTN_GAP);
                         if let Some((branch, counts)) = &head {
-                            ui.spacing_mut().item_spacing.x = 6.0;
+                            ui.spacing_mut().item_spacing.x = BRANCH_GAP;
                             if let Some(c) = counts {
                                 ui.label(RichText::new(c).size(BRANCH_FONT).color(TEXT_PRIMARY).family(crate::ui::fonts::semibold_family()));
                             }
@@ -1320,6 +1982,9 @@ impl Gitx {
         );
         if want_add {
             self.show_modal(Modal::add_repo());
+        }
+        if want_home {
+            self.home = true;
         }
         if let Some(p) = pick {
             self.open(&p);
@@ -1360,7 +2025,7 @@ impl Gitx {
             }
             // 没有快照 = 还没开仓库：卡里那格提交迟早要落到一本不存在的仓库上，
             // 先把话说清楚，而不是让按钮按下去一点反应都没有。
-            0 => self.note = Some("还没有仓库，先按「添加仓库」开一本".to_owned()),
+            0 => self.note = Some(tr!("还没有仓库，先按「添加仓库」开一本", "No repository yet — press \"Add repository\" to open one").to_owned()),
             // 拉取/推送那两枚先端的是**卡**，不是当场就跑的那一条 git：SourceTree 那两枚
             // 也是分别端出 `GitPullSheet` / `GitPushSheet`。卡上的初值全从打开那一刻的快照
             // 与偏好现算，算不出来就报一句，不要按下去一点反应都没有。
@@ -1377,13 +2042,13 @@ impl Gitx {
             5 => {
                 // 合并要有对象：先把本地分支摊出来挑（当前那条自己不算）。
                 let Some(s) = &self.snap else {
-                    self.note = Some("还没有可用的快照".to_owned());
+                    self.note = Some(tr!("还没有可用的快照", "No snapshot ready yet").to_owned());
                     return;
                 };
                 let branches: Vec<String> =
                     s.branches.iter().filter(|b| !b.is_current).map(|b| b.name.clone()).collect();
                 if branches.is_empty() {
-                    self.note = Some("没有别的分支可以合并".to_owned());
+                    self.note = Some(tr!("没有别的分支可以合并", "There is no other branch to merge").to_owned());
                 } else {
                     self.show_modal(Modal::merge(branches));
                 }
@@ -1407,7 +2072,7 @@ impl Gitx {
                 }
             }
             10 => self.show_modal(Modal::settings(self.prefs(), self.repos.len(), db_path())),
-            n => self.note = Some(format!("egui 版还没接：{}（{n}）", TOOLS[n].1)),
+            n => self.note = Some(tr!(format!("egui 版还没接：{}（{n}）", tool_label(n)), format!("Not wired in the egui shell: {} ({n})", tool_label(n)))),
         }
     }
 
@@ -1427,10 +2092,10 @@ impl Gitx {
     /// 一本仓库可以先推到 fork 再推到 upstream，猜错一次就把提交推到别人的仓库上去。
     pub(crate) fn push_modal(&self) -> std::result::Result<Modal, String> {
         let Some(s) = self.snap.as_ref() else {
-            return Err("还没有仓库，先按「添加仓库」开一本".to_owned());
+            return Err(tr!("还没有仓库，先按「添加仓库」开一本", "No repository yet — press \"Add repository\" to open one").to_owned());
         };
         if s.remotes.is_empty() {
-            return Err("这本仓库还没有远端可推。".to_owned());
+            return Err(tr!("这本仓库还没有远端可推。", "This repository has no remote to push to.").to_owned());
         }
         let remote = Self::upstream_of(s)
             .map(|(r, _)| r)
@@ -1458,10 +2123,10 @@ impl Gitx {
     /// 拉得进当前分支，这一格摆出来是为了「目标不是当前分支时先切过去」那条路说得清。
     pub(crate) fn pull_modal(&self) -> std::result::Result<Modal, String> {
         let Some(s) = self.snap.as_ref() else {
-            return Err("还没有仓库，先按「添加仓库」开一本".to_owned());
+            return Err(tr!("还没有仓库，先按「添加仓库」开一本", "No repository yet — press \"Add repository\" to open one").to_owned());
         };
         if s.remotes.is_empty() {
-            return Err("这本仓库还没有远端可拉。".to_owned());
+            return Err(tr!("这本仓库还没有远端可拉。", "This repository has no remote to pull from.").to_owned());
         }
         let up = Self::upstream_of(s);
         let remote = up
@@ -1496,16 +2161,21 @@ impl Gitx {
             default_remote: self.default_remote.clone(),
             push_tags: self.push_tags,
             allow_force: self.allow_force,
+            lang: self.lang,
+            tokens: self.provider_tokens.clone(),
         }
     }
 
     /// 偏好卡上那几枚开关**当场生效、当场落库**（macOS 的偏好窗口没有「应用」按钮）。
     /// 一条都没动就直接返回：`topo` 那一条要重取整份快照，每帧白跑一次是看得见的开销。
-    pub(crate) fn apply_prefs(&mut self, p: Prefs) {
+    /// 返回值只有一件事要说：**语言换档了**——换档那一刻正开着的卡要按新档重拼一次，
+    /// 而那张卡握在调用方手里（见 `modal_layer`），在这儿够不着。
+    pub(crate) fn apply_prefs(&mut self, p: Prefs) -> bool {
         if p == self.prefs() {
-            return;
+            return false;
         }
         let re_sort = p.topo != self.topo;
+        let re_lang = p.lang != self.lang;
         // 落库要的是**改之前**那一份完整的值：下面几条里有 `String` 字段会被移走，
         // 移走之后再 `p.save()` 就编译不过，所以先拷一份专门用来写。
         let to_save = p.clone();
@@ -1515,11 +2185,39 @@ impl Gitx {
         self.default_remote = p.default_remote;
         self.push_tags = p.push_tags;
         self.allow_force = p.allow_force;
+        self.lang = p.lang;
+        self.provider_tokens = p.tokens;
         to_save.save(self.conn.as_ref());
         if re_sort {
             // 排序变了要让日志重取一份，不然屏幕上还是旧顺序。
             self.set_topo(p.topo);
         }
+        if re_lang {
+            // 换档要把**后台拼好、缓存下来**的那些文案重算一遍：药丸上的「超前 2 个版本」、
+            // 差异里的 hunk 头、历史卡每条提交下面的补丁名，都是取数线程按当时语言写死的。
+            // 不重取，切完 English 屏幕上就留下一半英文一半中文——那是看得见的半截翻译。
+            // 先把线程档位刷成新语言再重取：`shell()` 那一行要等下一帧才跑，而
+            // `patch_label` 现在就在这条主线程上读档位。
+            gitx::lang::set(self.lang);
+            // 正开着的卡由调用方（`modal_layer`）按新档重拼——那张卡这一帧握在它手里，
+            // 在这儿读 `self.modal` 是空的，够不着（判据第一次就跑红在那儿）。
+            let hist = self.history.as_ref().map(|h| h.path.clone());
+            let target = self.target.clone();
+            // `set_topo` 里已经 `open()` 过一次，别在这儿再来一遍：快照会取两份。
+            if !re_sort {
+                if let Some(repo) = self.repo.clone() {
+                    self.open(&repo);
+                }
+            }
+            // `open()` 固定回到「未提交变更」，重新指回用户本来在看的那一格差异。
+            if let Some(t) = target {
+                self.request(t);
+            }
+            if let Some(path) = hist {
+                self.open_history(&path);
+            }
+        }
+        re_lang
     }
 
     /// 打开「文件历史」浮层。列表自己走线程，帧里不等 git。
@@ -1573,7 +2271,7 @@ impl Gitx {
                     |ui| {
                         ui.add(
                             Label::new(
-                                RichText::new(format!("文件历史 · {}", h.path))
+                                RichText::new(tr!(format!("文件历史 · {}", h.path), format!("File history · {}", h.path)))
                                     .size(12.5)
                                     .color(TEXT_PRIMARY)
                                     .strong(),
@@ -1583,7 +2281,7 @@ impl Gitx {
                         );
                     },
                 );
-                if hunk_button(ui, "关闭", card.max.x - HIST_PAD, head_cy).0 {
+                if hunk_button(ui, tr!("关闭", "Close"), card.max.x - HIST_PAD, head_cy).0 {
                     close = true;
                 }
 
@@ -1596,23 +2294,23 @@ impl Gitx {
                     ),
                     |ui| {
                         ui.horizontal(|ui| {
-                            if ui.selectable_label(h.tab == HistTab::History, "历史").clicked() {
+                            if ui.selectable_label(h.tab == HistTab::History, tr!("历史", "History")).clicked() {
                                 want_tab = Some(HistTab::History);
                             }
-                            if ui.selectable_label(h.tab == HistTab::Blame, "逐行归属").clicked() {
+                            if ui.selectable_label(h.tab == HistTab::Blame, tr!("逐行归属", "Blame")).clicked() {
                                 want_tab = Some(HistTab::Blame);
                             }
                             if h.tab == HistTab::History {
                                 ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                                     let can_restore = !h.entries.is_empty() && h.sel < h.entries.len();
-                                    let btn = egui::Button::new(RichText::new("恢复到这一版").size(11.0));
+                                    let btn = egui::Button::new(RichText::new(tr!("恢复到这一版", "Restore this version")).size(11.0));
                                     if ui.add_enabled(can_restore, btn).clicked() {
                                         restore = true;
                                     }
-                                    if ui.selectable_label(h.view == HistView::Full, "全文").clicked() {
+                                    if ui.selectable_label(h.view == HistView::Full, tr!("全文", "Full text")).clicked() {
                                         want_view = Some(HistView::Full);
                                     }
-                                    if ui.selectable_label(h.view == HistView::Diff, "改动").clicked() {
+                                    if ui.selectable_label(h.view == HistView::Diff, tr!("改动", "Changes")).clicked() {
                                         want_view = Some(HistView::Diff);
                                     }
                                 });
@@ -1638,7 +2336,7 @@ impl Gitx {
                             history_note(
                                 ui,
                                 list,
-                                if h.log_loading { "读取历史…" } else { "这个文件没有历史。" },
+                                if h.log_loading { tr!("读取历史…", "Reading history…") } else { tr!("这个文件没有历史。", "This file has no history.") },
                             );
                         } else {
                             let now = chrono::Local::now();
@@ -1668,9 +2366,9 @@ impl Gitx {
                             match h.view {
                                 HistView::Diff => {
                                     if h.diff.is_empty() && h.patch_loading {
-                                        history_note(ui, right, "读取改动…");
+                                        history_note(ui, right, tr!("读取改动…", "Reading the change…"));
                                     } else if h.diff.is_empty() {
-                                        history_note(ui, right, "这个版本对这个文件没有可显示的改动。");
+                                        history_note(ui, right, tr!("这个版本对这个文件没有可显示的改动。", "This version shows no change for this file."));
                                     } else {
                                         ScrollArea::vertical().auto_shrink([false, false]).show_rows(
                                             ui,
@@ -1687,9 +2385,9 @@ impl Gitx {
                                 }
                                 HistView::Full => {
                                     if h.full.is_empty() && h.full_loading {
-                                        history_note(ui, right, "读取全文…");
+                                        history_note(ui, right, tr!("读取全文…", "Reading the full text…"));
                                     } else if h.full.is_empty() {
-                                        history_note(ui, right, "这个版本里没有内容。");
+                                        history_note(ui, right, tr!("这个版本里没有内容。", "Nothing at this version."));
                                     } else {
                                         ScrollArea::vertical().auto_shrink([false, false]).show_rows(
                                             ui,
@@ -1712,7 +2410,7 @@ impl Gitx {
                             history_note(
                                 ui,
                                 body,
-                                if h.blame_loading { "读取逐行归属…" } else { "这个文件没有可归属的行。" },
+                                if h.blame_loading { tr!("读取逐行归属…", "Reading blame…") } else { tr!("这个文件没有可归属的行。", "This file has no lines to blame.") },
                             );
                         } else {
                             ui.scope_builder(egui::UiBuilder::new().max_rect(body), |ui| {
@@ -1807,11 +2505,57 @@ impl Gitx {
         if let Some(n) = it.note {
             self.note = Some(n);
         }
-        // 侧栏「搜索」那一行。放在 `goto` 之前：那一行点的是**开一格**，不是选一行，
-        // 两者同一帧里不会互相覆盖（开着搜索再点某一行，选中的还是那一行）。
-        if it.open_search {
-            self.open_search();
+        // 侧栏「远端」的展开/收起。`Intent` 里那两格从加进来就没人接：注释写着「见 land」，
+        // 而 land 里没有对应的一段——点一下远端行什么都不发生（2026-10-26 查 `origin` 默认
+        // 展开时发现的）。收在这里一次接上，展开与「摊开全部」各一条。
+        if let Some(name) = it.toggle_remote {
+            match self.remote_open.iter().position(|n| n == &name) {
+                Some(i) => {
+                    self.remote_open.remove(i);
+                }
+                None => self.remote_open.push(name),
+            }
         }
+        if let Some(name) = it.toggle_remote_all {
+            if self.remote_all.iter().any(|n| n == &name) {
+                self.remote_all.retain(|n| n != &name);
+            } else {
+                self.remote_all.push(name);
+            }
+        }
+        // 左栏那枚「看板 / 仓库」切换（DESIGN §2.2）：切过去就认 provider、读「看过」、
+        // 起一次取数；切回来只翻旗子，`board` 里那份数据留着——下次进来先画旧的，
+        // 新取数落地再顶掉（列表闪一下比整栏空白一下好）。
+        if it.toggle_board {
+            if self.board_open {
+                self.board_open = false;
+                // 首次建账只覆盖**这一趟**看着它取数的过程。关栏即结束：下一次打开
+                // 有上一趟的基线可比，那时候「动了」才是真动了。
+                self.board.seeding = false;
+            } else {
+                self.show_board();
+            }
+        }
+        // 「刷新」只在看板开着时有意义：关着的那一栏没人看，请求发了也是白跑一次网络。
+        if it.refresh_board && self.board_open {
+            self.fetch_board();
+        }
+        // 点开一条 PR：记「看到这儿了」+ 把地址攒给 `poll` 推给 egui。没算出地址
+        // （认不出 provider 又没有 `html_url`）就只记号、不推命令——推一条空 URL
+        // 等于按下去没反应。
+        if let Some(i) = it.open_pr {
+            self.board_open_url = self.open_pull_request(i);
+        }
+        // 这一帧画在可见区里的那几行：补上列表不给的两格。放在最后，是因为上面
+        // 「切栏 / 刷新」会换掉 `board.prs` 和 `asked` 那本账，先补就补到旧的一代上去。
+        if !it.enrich.is_empty() {
+            self.enrich_rows(&it.enrich);
+        }
+        // 日志条右端那枚「搜索」（侧栏那行 2026-10-26 已删）。放在 `goto` 之前：
+        // 它点的是**开一格**、不是选一行，两者同一帧里不会互相覆盖
+        // （开着搜索再点某一行，选中的还是那一行）。
+        if it.open_search {
+            self.open_search();        }
         if let Some(hit) = it.goto {
             self.select(hit);
         }
@@ -1824,7 +2568,10 @@ impl Gitx {
                 Some(i) => self.select(Sel::Commit(i)),
                 None => {
                     let short = oid.chars().take(8).collect::<String>();
-                    self.note = Some(format!("{short} 还不在已经加载的那几页历史里（往下滚会取到）"));
+                    self.note = Some(tr!(
+                        format!("{short} 还不在已经加载的那几页历史里（往下滚会取到）"),
+                        format!("{short} is not in the pages loaded yet — scroll down to fetch more")
+                    ));
                 }
             }
         }
@@ -1847,6 +2594,177 @@ impl Gitx {
         }
     }
 
+    // -------------------------------------------------------------------- 首页
+    /// 顶栏最左那枚「首页」tab 打开的那一页：仓库列表为主（A）+ 当前仓库的代码托管信息
+    /// （少量 B，用户 2026-10-26 的要求）。详细的 provider 面板（PR / CI）留到下一批——
+    /// 这一批不引 HTTP 依赖，也不摆按下去没反应的按钮。
+    ///
+    /// 首页**整页**替掉侧栏 / 日志 / 暂存带，只留顶栏与状态栏：那三块讲的都是「当前仓库」，
+    /// 而首页面前还没有当前仓库。窗口里仍保留「首页」tab，随时点仓库 tab 回去。
+    pub(crate) fn home_page(&mut self, ui: &mut egui::Ui) {
+        let mut open_repo: Option<String> = None;
+        let mut want_add = false;
+        let mut want_clone = false;
+        let mut browse: Option<String> = None;
+
+        let repos = self.repos.clone();
+        let current = self.repo.clone();
+        // 当前仓库那一行右端的备注：分支 + 只在有上游时出现的 ↑↓。
+        let current_note = self
+            .snap
+            .as_ref()
+            .map(|s| {
+                let st = &s.status;
+                let mut note = st.branch.clone();
+                if st.upstream.is_some() && (st.ahead > 0 || st.behind > 0) {
+                    note.push_str(&format!(" · ↑{} ↓{}", st.ahead, st.behind));
+                }
+                note
+            })
+            .unwrap_or_default();
+        let provider = self.snap.as_ref().and_then(home_provider);
+
+        // 居中靠**自己划一块竖排矩形**，不是 `horizontal + add_space`：
+        // `ScrollArea` 里的子 ui 会继承父布局，塞进 `horizontal` 之后整页内容会横着排、
+        // 全部叠在同一列 y 上（2026-10-26 第一版就是这样，判据量出来每块文字 y≈70）。
+        let outer = ui.available_rect_before_wrap();
+        let width = outer.width().min(HOME_MAX_W);
+        let side = ((outer.width() - width) / 2.0).max(16.0);
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(BG_WINDOW))
+            .show(ui, |ui| {
+                let rect = Rect::from_min_size(outer.min + vec2(side, 0.0), vec2(width, outer.height()));
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(rect)
+                        .layout(egui::Layout::top_down(Align::Min)),
+                    |ui| {
+                        ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                            ui.set_width(width - 10.0);
+                            ui.add_space(HOME_TOP);
+                            ui.label(
+                                RichText::new(home_tab())
+                                    .size(20.0)
+                                    .color(TEXT_PRIMARY)
+                                    .family(crate::ui::fonts::semibold_family()),
+                            );
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new(tr!("打开一个仓库继续，或添加新的仓库。", "Open a repository to continue, or add a new one."))
+                                    .size(13.0)
+                                    .color(TEXT_SECONDARY),
+                            );
+                            ui.add_space(16.0);
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new(tr!("打开仓库…", "Open repository…")).size(13.0).color(Color32::WHITE),
+                                        )
+                                        .fill(ACCENT)
+                                        .corner_radius(egui::CornerRadius::same(6)),
+                                    )
+                                    .clicked()
+                                {
+                                    want_add = true;
+                                }
+                                if ui.add(egui::Button::new(tr!("克隆仓库…", "Clone repository…")).small()).clicked() {
+                                    want_clone = true;
+                                }
+                            });
+                            ui.add_space(24.0);
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(tr!("仓库", "Repositories"))
+                                        .size(13.0)
+                                        .color(TEXT_PRIMARY)
+                                        .family(crate::ui::fonts::semibold_family()),
+                                );
+                                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                    ui.label(
+                                        RichText::new(tr!(format!("{} 个", repos.len()), format!("{} shown", repos.len())))
+                                            .size(11.0)
+                                            .color(TEXT_MUTED),
+                                    );
+                                });
+                            });
+                            ui.add_space(8.0);
+                            if repos.is_empty() {
+                                ui.label(
+                                    RichText::new(tr!(
+                                        "还没有添加仓库：用上面的「打开仓库…」或「克隆仓库…」开始。",
+                                        "Nothing added yet — start with \"Open repository…\" or \"Clone repository…\" above."
+                                    ))
+                                        .size(12.0)
+                                        .color(TEXT_MUTED),
+                                );
+                            } else {
+                                ui.spacing_mut().item_spacing.y = HOME_CARD_GAP;
+                                for r in &repos {
+                                    let is_current = current.as_deref() == Some(r.path.as_str());
+                                    let note = if is_current { current_note.as_str() } else { "" };
+                                    if home_repo_card(ui, &r.name, &r.path, note, is_current) {
+                                        open_repo = Some(r.path.clone());
+                                    }
+                                }
+                            }
+                            // 少量 B：当前仓库能认出是哪一家代码托管，就把那句 `GitHub · owner/repo`
+                            // 摆出来，并给一个**真的能用**的「在浏览器打开」。PR/CI 那些详细 B
+                            // 要等 provider 面板接上 HTTP 之后另开一批。
+                            if let Some((label, path, remote)) = &provider {
+                                ui.add_space(24.0);
+                                ui.label(RichText::new(tr!("代码托管", "Hosting")).size(11.0).color(TEXT_SECONDARY));
+                                ui.add_space(6.0);
+                                egui::Frame::NONE
+                                    .fill(BG_WINDOW)
+                                    .stroke(Stroke::new(1.0, BORDER_SUBTLE))
+                                    .corner_radius(egui::CornerRadius::same(HOME_CARD_RAD))
+                                    .inner_margin(Margin::symmetric(12, 10))
+                                    .show(ui, |ui| {
+                                        // 卡内宽 = 外层 710 − 左右内边距 24 − 边 2；
+                                        // 再按 `width - 26` 算一次会多出 10pt，横向被裁。
+                                        ui.set_width(ui.available_width());
+                                        ui.horizontal(|ui| {
+                                            provider_badge(ui, label);
+                                            ui.label(
+                                                RichText::new(path).size(12.0).color(TEXT_PRIMARY),
+                                            );
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(Align::Center),
+                                                |ui| {
+                                                    if ui
+                                                        .add(egui::Button::new(tr!("在浏览器打开", "Open in browser")).small())
+                                                        .clicked()
+                                                    {
+                                                        browse = Some(remote.clone());
+                                                    }
+                                                },
+                                            );
+                                        });
+                                    });
+                            }
+                            ui.add_space(HOME_TOP);
+                        });
+                    },
+                );
+            });
+
+        if want_add {
+            self.show_modal(Modal::add_repo());
+        }
+        if want_clone {
+            let mut m = Modal::add_repo();
+            m.form = Form::AddRepo { tab: AddTab::Clone, dest: String::new() };
+            self.show_modal(m);
+        }
+        if let Some(path) = open_repo {
+            self.open(&path);
+        }
+        if let Some(remote) = browse {
+            self.act(Action::BrowseRemote(remote));
+        }
+    }
+
     // ------------------------------------------------------------------ 侧栏
     /// §2：188pt 灰底一栏，分组头 = 11px 灰字 + 右对齐计数（**无图标**），子项行高 26、
     /// 选中 = 浅蓝药丸（圆角 6），当前分支 = 蓝点 + 中黑字，底置一枚 26pt 筛选输入框。
@@ -1860,12 +2778,58 @@ impl Gitx {
         };
         let sel = self.sel.clone();
         let mut filter = self.side_filter.clone();
-        // 「搜索」那一行开着的时候它得看起来是选中的：`Sel` 里没这一档（搜索不是一个**行**，
-        // 是日志条那一格的另一种状态），所以单独读一份布尔进来。
-        let search_open = self.search_open;
         // 展开着的那几条远端的名字，**开局读一份**：面板闭包里 `self` 正被借走，
         // 而这一份只用来决定画不画，改它走 `Intent::toggle_remote`（见 `land`）。
         let remote_open = self.remote_open.clone();
+        // 已经点过「还有 N 个」的那些远端：默认每个远端只画前 3 条分支。
+        let remote_all = self.remote_all.clone();
+        // 看板那一栏要在闭包里画，`self` 那时候正被借走——所以数据**开局拷一份**。
+        // `Board` 本身不 Clone（里面存的是 `&'static dyn Host`），拷的是画得出来的那几块。
+        let board_head = self.board.host.map(|h| h.label().to_owned());
+        // 底置那格筛选框在看板档筛的是**这一栏**（标题 / #号 / 状态那句），和它筛大纲同一句话。
+        // 不接的话框还挂在那儿却什么都不筛——那是个看得见的假控件。
+        // 行上带**原始下标**：`open_pr` 要指回 `board.prs` 里的那一条，不能指到筛完的位置。
+        let needle = filter.trim().to_owned();
+        let lang = self.lang;
+        // 一句话状态不只读 PR 自己那一格：「正在看它卡在哪」要读这一行有没有在飞的
+        // 补充请求，「大概率与本次改动无关」要读**别条 PR** 上是不是也挂着同一个 job。
+        // 两件都不属于某一条 PR 的数据，所以从 `Board` 那两本账现取（见 `StatusContext`）。
+        let ctx_of = |pr: &gitx::models::PullRequest| provider::StatusContext {
+            fetching: self.board.row_fetching(pr),
+            failing_elsewhere: self.board.failing_elsewhere(pr.number),
+        };
+        let board_rows: Vec<(usize, u32, String, String, Color32, bool)> = self
+            .board
+            .prs
+            .iter()
+            .enumerate()
+            .filter(|(_, pr)| {
+                needle.is_empty()
+                    || pr.title.contains(needle.as_str())
+                    || pr.number.to_string().contains(needle.as_str())
+                    // 筛的是**看得见的那一句**：英文档下敲「ready」要命中的就是英文状态句。
+                    || provider::pr_status(pr, &ctx_of(pr)).label(lang).contains(needle.as_str())
+            })
+            .map(|(i, pr)| {
+                let status = provider::pr_status(pr, &ctx_of(pr));
+                (
+                    i,
+                    pr.number,
+                    pr.title.clone(),
+                    status.label(lang).to_owned(),
+                    board_status_color(status),
+                    self.board.is_new(pr),
+                )
+            })
+            .collect();
+        // 「一行都没有」和「有一行但被筛掉了」是两件事：后者写「没有开放的 PR」就是骗人。
+        let board_hidden = !needle.is_empty() && board_rows.is_empty() && !self.board.prs.is_empty();
+        let (board_loaded, board_fetching, board_error) = (
+            self.board.loaded,
+            self.board.fetching,
+            self.board.error.clone(),
+        );
+        let (board_open, board_hidden) = (self.board_open, board_hidden);
         let mut intent = Intent::default();
         egui::Panel::left("sidebar")
             .exact_size(SIDEBAR_W)
@@ -1879,24 +2843,98 @@ impl Gitx {
                 // 不扣的话「筛选器」会被挤到窗口外（无头测试里侧栏的底色矩形超出窗口 27pt）。
                 let list_h = (ui.available_height() - SIDE_FILTER_H).max(60.0);
                 ScrollArea::vertical().auto_shrink([false, false]).max_height(list_h).show(ui, |ui| {
+                    // §2.2 看板：**整栏替掉**下面那套大纲。左缘一行是回大纲的入口，
+                    // 顶上是「代码托管 · 哪一家 · 几条」加一枚真的会重发请求的刷新。
+                    if board_open {
+                        if side_row(ui, tr!("‹ 仓库", "‹ Repositories"), false, false).clicked() {
+                            intent.toggle_board = true;
+                        }
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            ui.label(
+                                RichText::new(tr!("代码托管", "Hosting"))
+                                    .size(SIDE_GROUP_FONT)
+                                    .color(TEXT_SECONDARY),
+                            );
+                            if let Some(head) = &board_head {
+                                ui.label(RichText::new(head).size(SIDE_GROUP_FONT).color(TEXT_PRIMARY));
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui
+                                    .add(egui::Button::new(RichText::new(tr!("刷新", "Fetch")).size(11.0)).small())
+                                    .clicked()
+                                {
+                                    intent.refresh_board = true;
+                                }
+                            });
+                        });
+                        if board_rows.is_empty() {
+                            // 三种「没有行」是三件不同的事，各说各的：在飞、失败、真的没有。
+                            // 合成一句「没有开放的 PR」会在取数失败时骗人。
+                            // 第四件是「有，但被筛选框滤掉了」——那一格单独一句，
+                            // 因为清空筛选框就有行，说「没有开放的 PR」同样是在骗人。
+                            let line = if board_hidden {
+                                tr!("都被筛选框里那几个字滤掉了", "All hidden by what is in the filter box")
+                            } else if board_fetching {
+                                tr!("正在取…", "Fetching…")
+                            } else if let Some(e) = &board_error {
+                                e.as_str()
+                            } else if board_loaded {
+                                tr!("没有开放的 PR", "No open pull requests")
+                            } else {
+                                tr!("还没有取：按「刷新」取一次", "Never fetched — press \"Fetch\"")
+                            };
+                            ui.label(
+                                RichText::new(line).size(11.0).color(if board_fetching {
+                                    TEXT_MUTED
+                                } else if board_error.is_some() {
+                                    DANGER
+                                } else {
+                                    TEXT_MUTED
+                                }),
+                            );
+                        }
+                        for (i, number, title, status, color, is_new) in board_rows.iter()
+                        {
+                            let row = board_pr_row(ui, *number, title, status, *color, *is_new, false);
+                            // 只补**画在可见区里**的那几行（见 `Intent::enrich`）。
+                            // 滚动区外的行有自己的矩形，只是被 clip 掉了 —— 所以判据是
+                            // 行矩形和 `clip_rect` 相交，不是「这行画没画」。
+                            if row.rect.intersects(ui.clip_rect()) {
+                                intent.enrich.push(*i);
+                            }
+                            if row.clicked() {
+                                intent.open_pr = Some(*i);
+                            }
+                        }
+                        return;
+                    }
+                    // 大纲最顶上一行 = 进看板的入口（§2.2）。点它和点「看板」那一组
+                    // 是同一条路：认 provider、读「看过」、起一次取数。
+                    if side_row(ui, tr!("看板", "Board"), false, false).clicked() {
+                        intent.toggle_board = true;
+                    }
                     // 「工作区」那一档固定三条，所以计数写死 3；它不是从 `items` 数出来的。
-                    side_group_row(ui, "工作区", 3);
-                    for (label, hit) in [("文件状态", Sel::Uncommitted), ("历史", Sel::Commit(0))] {
+                    side_group_row(ui, tr!("工作区", "Working tree"), 3);
+                    for (label, hit) in [
+                        (tr!("文件状态", "File status"), Sel::Uncommitted),
+                        (tr!("历史", "History"), Sel::Commit(0)),
+                    ] {
                         if side_row(ui, label, sel == hit, false).clicked() {
                             intent.goto = Some(hit);
                         }
                     }
-                    // SourceTree 这一行点开的是它自己那块**带作用域条的搜索面板**。本机没有
-                    // SourceTree.app（`/Applications` 和 `mdfind` 都查过），那块面板的控件一个数
-                    // 都没量到，参考图也只拍到这一行本身——所以这里**不照抄它**，按 2026-10-21
-                    // 规则②做成我们的增强：把日志条右边那一格换成搜索框，搜整本历史的
-                    // 提交说明 + 改动过的文件名。文案与档位都是自定，登记在 DESIGN §7。
-                    if side_row(ui, "搜索", search_open, false).clicked() {
-                        intent.open_search = true;
-                    }
+                    // SourceTree 的工作区组里有「搜索」这一行，点开的是它自己那块**带作用域条
+                    // 的搜索面板**。本机没有 SourceTree.app（`/Applications` 和 `mdfind` 都查过），
+                    // 那块面板的控件一个数都没量到，参考图也只拍到这一行本身——所以这里
+                    // **不照抄它**，按 2026-10-21 规则②做成我们的增强：把日志条右边那一格
+                    // 换成搜索框，搜整本历史的提交说明 + 改动过的文件名。文案与档位都是自定，
+                    // 登记在 DESIGN §7。
+                    // 2026-10-26 用户要求**去掉侧栏这一行**：入口只在日志条右边那一格，
+                    // 免得「搜索中」看起来有两种状态。
                     side_category(
                         ui,
-                        "分支",
+                        tr!("分支", "Branches"),
                         &filter,
                         branches,
                         |b| b.name.clone(),
@@ -1906,21 +2944,21 @@ impl Gitx {
                         |b| b.is_current,
                         |b, intent| intent.run(Action::Checkout(b.name.clone())),
                         |ui, b, intent| {
-                            menu_item(ui, "切换过去", || Action::Checkout(b.name.clone()), intent);
+                            menu_item(ui, tr!("切换过去", "Check out"), || Action::Checkout(b.name.clone()), intent);
                             menu_card(
                                 ui,
-                                "从这里新建分支",
+                                tr!("从这里新建分支", "New branch from here"),
                                 || Modal::new_branch_at(Some(b.target.clone())),
                                 intent,
                             );
-                            menu_item(ui, "合并到当前分支", || Action::Merge(b.name.clone()), intent);
+                            menu_item(ui, tr!("合并到当前分支", "Merge into current branch"), || Action::Merge(b.name.clone()), intent);
                             menu_card(
                                 ui,
-                                "重命名分支…",
+                                tr!("重命名分支…", "Rename branch…"),
                                 || Modal::rename_branch(b.name.clone()),
                                 intent,
                             );
-                            menu_item(ui, "删除这个分支", || Action::DeleteBranch(b.name.clone()), intent);
+                            menu_item(ui, tr!("删除这个分支", "Delete this branch"), || Action::DeleteBranch(b.name.clone()), intent);
                         },
                         // 本地分支没有第三级：点开没有下一步，硬摆一格空的只会让用户以为坏了。
                         |_, _, _| {},
@@ -1928,7 +2966,7 @@ impl Gitx {
                     );
                     side_category(
                         ui,
-                        "标签",
+                        tr!("标签", "Tags"),
                         &filter,
                         tags,
                         |t| t.name.clone(),
@@ -1936,22 +2974,22 @@ impl Gitx {
                         |_| false,
                         |t, intent| intent.reveal = Some(t.target.clone()),
                         |ui, t, intent| {
-                            menu_go(ui, "到那条提交", t.target.clone(), intent);
-                            menu_item(ui, "检出这个标签", || Action::Checkout(t.target.clone()), intent);
+                            menu_go(ui, tr!("到那条提交", "Go to that commit"), t.target.clone(), intent);
+                            menu_item(ui, tr!("检出这个标签", "Check out this tag"), || Action::Checkout(t.target.clone()), intent);
                             menu_card(
                                 ui,
-                                "在这条提交上新建分支",
+                                tr!("在这条提交上新建分支", "New branch from this commit"),
                                 || Modal::new_branch_at(Some(t.target.clone())),
                                 intent,
                             );
-                            menu_item(ui, "删除这个标签", || Action::DeleteTag(t.name.clone()), intent);
+                            menu_item(ui, tr!("删除这个标签", "Delete this tag"), || Action::DeleteTag(t.name.clone()), intent);
                         },
                         |_, _, _| {},
                         &mut intent,
                     );
                     side_category(
                         ui,
-                        "远端",
+                        tr!("远端", "Remotes"),
                         &filter,
                         remotes,
                         |r| r.name.clone(),
@@ -1963,11 +3001,11 @@ impl Gitx {
                             intent.toggle_remote = Some(r.name.clone());
                         },
                         |ui, r, intent| {
-                            menu_item(ui, "抓取这个远端", || Action::FetchRemote(r.name.clone()), intent);
-                            menu_item(ui, "抓取全部远端", || Action::Fetch, intent);
-                            menu_item(ui, "在浏览器里打开主页", || Action::BrowseRemote(r.name.clone()), intent);
+                            menu_item(ui, tr!("抓取这个远端", "Fetch this remote"), || Action::FetchRemote(r.name.clone()), intent);
+                            menu_item(ui, tr!("抓取全部远端", "Fetch all remotes"), || Action::Fetch, intent);
+                            menu_item(ui, tr!("在浏览器里打开主页", "Open home page in browser"), || Action::BrowseRemote(r.name.clone()), intent);
                             // 地址那一格从**点一下**挪到了右键：左键现在管展开，不能再兼着念地址。
-                            if ui.button("看地址").clicked() {
+                            if ui.button(tr!("看地址", "Show URL")).clicked() {
                                 intent.note = Some(format!("{} → {}", r.name, r.url));
                                 ui.close();
                             }
@@ -1982,14 +3020,26 @@ impl Gitx {
                                 return;
                             }
                             let prefix = format!("{}/", r.name);
+                            let all = remote_all.iter().any(|n| n == &r.name);
+                            let mut shown = 0usize;
+                            let total = remote_refs.iter().filter(|x| x.name.starts_with(&prefix)).count();
                             for rr in remote_refs.iter().filter(|x| x.name.starts_with(&prefix)) {
+                                // 默认只露前 3 条：`origin` 上的分支一多，侧栏会被一整列拉到底，
+                                // 把「标签 / 已贮藏」挤到看不见（用户 2026-10-26 要求）。
+                                if !all && shown == 3 {
+                                    if side_sub_row(ui, &tr!(format!("还有 {} 个分支", total - shown), format!("{} more branches", total - shown))).clicked() {
+                                        intent.toggle_remote_all = Some(r.name.clone());
+                                    }
+                                    break;
+                                }
+                                shown += 1;
                                 let tail = &rr.name[prefix.len()..];
                                 let resp = side_sub_row(ui, tail);
                                 let name = rr.name.clone();
                                 let target = rr.target.clone();
                                 resp.context_menu(|ui| {
-                                    menu_item(ui, "切换过去", || Action::CheckoutRemote(name.clone()), intent);
-                                    menu_go(ui, "到那条提交", target.clone(), intent);
+                                    menu_item(ui, tr!("切换过去", "Check out"), || Action::CheckoutRemote(name.clone()), intent);
+                                    menu_go(ui, tr!("到那条提交", "Go to that commit"), target.clone(), intent);
                                 });
                                 if resp.clicked() {
                                     intent.run(Action::CheckoutRemote(rr.name.clone()));
@@ -2000,7 +3050,7 @@ impl Gitx {
                     );
                     side_category(
                         ui,
-                        "已贮藏",
+                        tr!("已贮藏", "Stashed"),
                         &filter,
                         stashes,
                         // `stash@{0}:` 是列表包装、`On <分支>:` 是 git 的包装，两截在核心层都剥掉了。
@@ -2017,9 +3067,9 @@ impl Gitx {
                         |_| false,
                         |s, intent| intent.goto = Some(Sel::Stash(s.index as usize)),
                         |ui, s, intent| {
-                            menu_item(ui, "应用到工作区", || Action::StashApply(s.index), intent);
-                            menu_item(ui, "弹出并删掉这条", || Action::StashPop(s.index), intent);
-                            menu_item(ui, "丢弃这条贮藏", || Action::StashDrop(s.index), intent);
+                            menu_item(ui, tr!("应用到工作区", "Apply to working tree"), || Action::StashApply(s.index), intent);
+                            menu_item(ui, tr!("弹出并删掉这条", "Pop this stash"), || Action::StashPop(s.index), intent);
+                            menu_item(ui, tr!("丢弃这条贮藏", "Drop this stash"), || Action::StashDrop(s.index), intent);
                         },
                         |_, _, _| {},
                         &mut intent,
@@ -2039,7 +3089,7 @@ impl Gitx {
                     ui.spacing_mut().interact_size.y = box_h;
                     ui.add_sized(
                         Vec2::new(ui.available_width(), box_h),
-                        TextEdit::singleline(&mut filter).hint_text("筛选器"),
+                        TextEdit::singleline(&mut filter).hint_text(tr!("筛选器", "Filter")),
                     );
                 });
             });
@@ -2093,12 +3143,12 @@ impl Gitx {
             ui.horizontal(|ui| {
                 // 参考图这一条的文字起在 x 169.5，和下面分类行的标签**同一列**（面板左缘 + 8 + 13 + 7 = 28）。
                 ui.add_space(CHK_HEAD_X + CHK_S + 7.0);
-                ui.label(RichText::new(PENDING_SORTED_BY_PATH).size(11.0).color(TEXT_MUTED));
+                ui.label(RichText::new(pending_sorted_by_path()).size(11.0).color(TEXT_MUTED));
                 ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                    if ui.small_button("全部暂存").clicked() {
+                    if ui.small_button(tr!("全部暂存", "Stage all")).clicked() {
                         act = Some(Action::StageAll);
                     }
-                    if ui.small_button("全部取消暂存").clicked() {
+                    if ui.small_button(tr!("全部取消暂存", "Unstage all")).clicked() {
                         act = Some(Action::UnstageAll);
                     }
                 });
@@ -2110,12 +3160,21 @@ impl Gitx {
             // 不这么做的话文件一多，提交框整格被顶出窗口（真窗口目视抓到过，判据见
             // `the_commit_box_stays_inside_a_short_band`）。
             let list_h = (ui.available_height() - COMMIT_H).max(40.0);
+            let total_files = conflicts.len() + staged.len() + unstaged.len();
+            if total_files > 5_000 {
+                // 普通 ScrollArea（非 show_rows）会为**所有**文件行生成图元、只靠裁剪隐藏，
+                // 文件数到这个量级就可能把顶点缓冲顶爆。崩溃前若看到这条，元凶就是文件列表。
+                eprintln!(
+                    "gitx-app[WARN] file_list 未虚拟化渲染 {} 个文件 (conflicts={} staged={} unstaged={})",
+                    total_files, conflicts.len(), staged.len(), unstaged.len()
+                );
+            }
             ScrollArea::vertical().auto_shrink([false, false]).max_height(list_h).show(ui, |ui| {
-                conflict_section(ui, &conflicts, &current, &mut act, &mut pick, &mut hist);
-                section(ui, "已暂存文件", &staged, true, &current, &mut act, &mut pick, &mut hist);
-                section(ui, "未暂存文件", &unstaged, false, &current, &mut act, &mut pick, &mut hist);
+                conflict_section(ui, &conflicts, &current, self.repo.as_deref().unwrap_or(""), &mut act, &mut pick, &mut hist);
+                section(ui, tr!("已暂存文件", "Staged files"), &staged, true, &current, &mut act, &mut pick, &mut hist);
+                section(ui, tr!("未暂存文件", "Unstaged files"), &unstaged, false, &current, &mut act, &mut pick, &mut hist);
                 if files.is_empty() {
-                    ui.label(RichText::new("工作区是干净的。").color(TEXT_SECONDARY).size(12.0));
+                    ui.label(RichText::new(tr!("工作区是干净的。", "The working tree is clean.")).color(TEXT_SECONDARY).size(12.0));
                 }
             });
 
@@ -2124,10 +3183,10 @@ impl Gitx {
             let branch = self.snap.as_ref().map(|s| s.status.branch.clone()).unwrap_or_default();
             let staged_count = staged.len();
             let w = ui.available_width();
-            ui.add(TextEdit::singleline(&mut self.commit_msg).hint_text("提交摘要… (⌘/Ctrl+Enter 提交)").desired_width((w - 8.0).max(80.0)));
+            ui.add(TextEdit::singleline(&mut self.commit_msg).hint_text(tr!("提交摘要… (⌘/Ctrl+Enter 提交)", "Commit summary… (⌘/Ctrl+Enter to commit)")).desired_width((w - 8.0).max(80.0)));
             ui.add(
                 TextEdit::multiline(&mut self.commit_desc)
-                    .hint_text("扩展描述…")
+                    .hint_text(tr!("扩展描述…", "Extended description…"))
                     .desired_rows(3)
                     .desired_width((w - 8.0).max(80.0)),
             );
@@ -2135,7 +3194,11 @@ impl Gitx {
             // amend 允许没有新暂存内容：只改写上一条的信息也是合法用法。
             let can = !msg.is_empty() && (staged_count > 0 || self.amend);
             // 两句话分开报，措辞抄 core 那句（`gitx-core/src/git.rs:1082`）。
-            let why = if msg.is_empty() { "提交信息不能为空" } else { "先勾选要提交的文件" };
+            let why = if msg.is_empty() {
+                tr!("提交信息不能为空", "The commit message is empty")
+            } else {
+                tr!("先勾选要提交的文件", "Tick the files to commit first")
+            };
             // ⌘/Ctrl+Enter 提交（参考版 placeholder 里就写着这条）。读不了 `Ui::input`——0.37 的
             // `InputState` 只挂在 `Context` 上（egui-0.37.0/src/ui.rs 里没有 `fn input`）。
             // `i.modifiers` 是**按下修饰键时那条 `ModifiersChanged`** 更新出来的（input_state/mod.rs:434），
@@ -2148,12 +3211,15 @@ impl Gitx {
                 act = Some(if self.amend { Action::Amend(msg.clone()) } else { Action::Commit(msg.clone()) });
             }
             ui.horizontal(|ui| {
-                ui.checkbox(&mut self.amend, RichText::new("修正上一条").size(11.0))
-                    .on_hover_text("改写 HEAD：换掉上一条提交的信息，已暂存的内容会一起并进去");
+                ui.checkbox(&mut self.amend, RichText::new(tr!("修正上一条", "Amend last")).size(11.0))
+                    .on_hover_text(tr!(
+                        "改写 HEAD：换掉上一条提交的信息，已暂存的内容会一起并进去",
+                        "Rewrites HEAD: the last commit's message is replaced and staged content folds in"
+                    ));
                 let label = if self.amend {
-                    "修正上一条提交".to_owned()
+                    tr!("修正上一条提交", "Amend the last commit").to_owned()
                 } else {
-                    format!("提交到 {branch} ({staged_count})")
+                    tr!(format!("提交到 {branch} ({staged_count})"), format!("Commit to {branch} ({staged_count})"))
                 };
                 let btn = egui::Button::new(RichText::new(label).size(11.5));
                 if ui.add_enabled(can, btn).clicked() {
@@ -2191,14 +3257,14 @@ impl Gitx {
             }
             .unwrap_or_default();
             let head = if stash {
-                format!("这条贮藏改了 {} 个文件", files.len())
+                tr!(format!("这条贮藏改了 {} 个文件", files.len()), format!("This stash touches {} file(s)", files.len()))
             } else {
-                format!("这个提交改了 {} 个文件", files.len())
+                tr!(format!("这个提交改了 {} 个文件", files.len()), format!("This commit touches {} file(s)", files.len()))
             };
             ui.horizontal(|ui| {
                 ui.label(RichText::new(head).size(11.0).color(TEXT_SECONDARY));
                 if let Some(o) = &oid {
-                    if ui.small_button("全部变更").clicked() {
+                    if ui.small_button(tr!("全部变更", "All changes")).clicked() {
                         pick = Some(if stash {
                             Target::Stash { oid: o.clone(), path: None }
                         } else {
@@ -2208,6 +3274,12 @@ impl Gitx {
                 }
             });
             ui.label(RichText::new(subject).size(11.5).color(TEXT_SECONDARY));
+            if files.len() > 5_000 {
+                eprintln!(
+                    "gitx-app[WARN] file_list(commit) 未虚拟化渲染 {} 个文件",
+                    files.len()
+                );
+            }
             ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 let current = self.file.clone();
                 for d in files {
@@ -2277,7 +3349,7 @@ impl Gitx {
             x = b.max.x + 6.0;
         }
         if busy {
-            p.text(head.right_center(), Align2::RIGHT_CENTER, "读取中…", FontId::proportional(11.0), TEXT_MUTED);
+            p.text(head.right_center(), Align2::RIGHT_CENTER, tr!("读取中…", "Reading…"), FontId::proportional(11.0), TEXT_MUTED);
         }
         // 搜索框固定钉在灰带右端：参考图有这条，但没量到它的宽高（见 docs/PROCESS.md），
         // 宽度只按「搜索差异」四个字 + 输入余量估。
@@ -2291,7 +3363,7 @@ impl Gitx {
                     [DIFF_SEARCH_W, DIFF_SEARCH_H],
                     egui::TextEdit::singleline(&mut self.diff_search)
                         .id_salt("diff-search")
-                        .hint_text("搜索差异")
+                        .hint_text(tr!("搜索差异", "Search the diff"))
                         .font(TextStyle::Small),
                 )
                 .changed()
@@ -2313,7 +3385,7 @@ impl Gitx {
         });
         // 搜索把每一行都筛掉了：整块空白会让人以为差异没取回来，得说清是「筛没了」。
         if rows.is_empty() {
-            let msg = if lines.is_empty() { "没有差异" } else { "没有匹配的行" };
+            let msg = if lines.is_empty() { tr!("没有差异", "Nothing to diff") } else { tr!("没有匹配的行", "No matching lines") };
             ui.centered_and_justified(|ui| ui.label(RichText::new(msg).color(TEXT_MUTED)));
             return;
         }
@@ -2339,7 +3411,21 @@ impl Gitx {
         // 点了哪个文件的折叠开关。文件行画在 `show_rows` 里，改可见行得等这一帧画完。
         let mut fold: Option<usize> = None;
         // 只画视口里的行：comic 那份 28 875 行的差异，帧里出现的行数与窗口高度有关，与文件多大无关。
+        // 右键菜单的**容器响应必须注册在滚动区之前**：后注册的那一格会抢走整块差异的 hover，
+        // 而 egui 的标签选区（`LabelSelectionState`）在右键按下时用「指针下面有没有标签悬停着」
+        // 来判断这是不是「点到别处」——抢走 hover 就等于把选区清掉，复制也就没了
+        // （用户 2026-10-26 报的「选中内容右击就没了」）。容器判据只看 rect，不要求悬停。
+        let area = ui.interact(ui.available_rect_before_wrap(), ui.scope_id().with("diff-copy-menu"), Sense::hover());
         ScrollArea::both().auto_shrink([false, false]).show_rows(ui, DIFF_ROW_H, rows.len(), |ui, range| {
+            if rows.len() > 20_000 {
+                // 顶点缓冲上限 ~256MiB ≈ 8.3M 顶点（32B/顶点）。`show_rows` 本应只画视口内
+                // 几十行；若下面这行的 `range` 长度接近 `rows.len()`，说明虚拟化没生效、整份
+                // 补丁的图元全进了缓冲——那就是崩在 diff_pane。
+                eprintln!(
+                    "gitx-app[diag] diff_pane 视口绘制 {} 行 (range {}..{}) / 总计 {} 行",
+                    range.len(), range.start, range.end, rows.len()
+                );
+            }
             for r in range {
                 bump_rows_painted();
                 let line = &lines[rows[r]];
@@ -2349,7 +3435,7 @@ impl Gitx {
                     let p = ui.painter_at(rect);
                     p.rect_filled(rect, 0.0, DIFF_HEAD_BG);
                     let folded = collapsed.contains(&line.file);
-                    let label = format!("{}  {}", if folded { "已折叠" } else { "文件" }, line.text);
+                    let label = format!("{}  {}", if folded { tr!("已折叠", "Folded") } else { tr!("文件", "File") }, line.text);
                     let avail = (ui.clip_rect().right() - rect.min.x - 64.0).max(24.0);
                     p.text(
                         band(rect, rect.min.x + 6.0, avail, th).left_center(),
@@ -2361,7 +3447,7 @@ impl Gitx {
                     p.text(
                         rect.right_center(),
                         Align2::RIGHT_CENTER,
-                        if folded { "点击展开" } else { "点击折叠" },
+                        if folded { tr!("点击展开", "Click to expand") } else { tr!("点击折叠", "Click to fold") },
                         FontId::proportional(10.5),
                         TEXT_MUTED,
                     );
@@ -2423,7 +3509,7 @@ impl Gitx {
                             let armed = pending == Some(n);
                             let (hit_drop, w) = hunk_button(
                                 ui,
-                                if armed { "确认放弃" } else { "放弃区块" },
+                                if armed { tr!("确认放弃", "Confirm discard") } else { tr!("放弃区块", "Discard hunk") },
                                 right,
                                 cy,
                             );
@@ -2441,7 +3527,7 @@ impl Gitx {
                         }
                         let (hit_stage, _) = hunk_button(
                             ui,
-                            if staged { "取消暂存区块" } else { "暂存区块" },
+                            if staged { tr!("取消暂存区块", "Unstage hunk") } else { tr!("暂存区块", "Stage hunk") },
                             right,
                             cy,
                         );
@@ -2464,6 +3550,44 @@ impl Gitx {
                 fix_pitch(ui, rect);
             }
         });
+        // 差异区的右键菜单：**复制**。
+        //
+        // 差异正文是 painter 画出来的，egui 的选中/复制那套只认 `Label` 与 `TextEdit`，
+        // 所以这里不接「选中一段再复制」，而是给整块差异一个容器级菜单——右键落在
+        // 任何一行（正文、文件头、hunk 头）都算。容器菜单不要求子控件让出点击
+        // （`container_context_menu`），滚动区里的行照样能点。
+        let file = self.file.clone().or_else(|| match &self.target {
+            Some(Target::Working { path, .. })
+            | Some(Target::Commit { path, .. })
+            | Some(Target::Stash { path, .. }) => path.clone(),
+            _ => None,
+        });
+        let oid = match &self.target {
+            Some(Target::Commit { oid, .. }) | Some(Target::Stash { oid, .. }) => Some(oid.clone()),
+            _ => None,
+        };
+        let mut copy: Option<String> = None;
+        area.container_context_menu(|ui| {
+            ui.label(RichText::new(tr!("复制", "Copy")).size(11.0).color(TEXT_MUTED));
+            if ui
+                .add_enabled(file.is_some(), egui::Button::new(tr!("文件路径", "File path")).small())
+                .clicked()
+            {
+                copy = file.clone();
+                ui.close();
+            }
+            if ui.add(egui::Button::new(tr!("整份差异", "Whole diff")).small()).clicked() {
+                copy = Some(self.diff.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n"));
+                ui.close();
+            }
+            if oid.is_some() && ui.add(egui::Button::new(tr!("提交号", "Commit SHA")).small()).clicked() {
+                copy = oid.clone();
+                ui.close();
+            }
+        });
+        if let Some(text) = copy {
+            ui.ctx().copy_text(text);
+        }
         if let Some(next) = arm {
             self.pending_discard = next;
         }
@@ -2539,7 +3663,7 @@ impl Gitx {
         let sel = self.sel.clone();
         let Some(snap) = self.snap.as_ref() else {
             egui::CentralPanel::default().frame(egui::Frame::NONE.fill(Color32::WHITE)).show(ui, |ui| {
-                ui.centered_and_justified(|ui| ui.label(RichText::new("左侧选一个仓库").color(TEXT_MUTED)));
+                ui.centered_and_justified(|ui| ui.label(RichText::new(tr!("左侧选一个仓库", "Pick a repository on the left")).color(TEXT_MUTED)));
             });
             return;
         };
@@ -2554,16 +3678,20 @@ impl Gitx {
         let mut sq = self.search_q.clone();
         let mut run_search = false;
         let mut close_search = false;
+        // 日志条右端那枚「搜索」：侧栏那一行去掉之后它是**唯一**的入口。
+        let mut open_search = false;
         let width = ui.available_width();
         let mut want_topo = self.topo;
         let mut want_scope = self.scope.clone();
         let mut want_remote = self.show_remote;
-        let show_remote = self.show_remote;
-        let scope_label = scope_label(&self.scope);
+        // 闭包里碰不了 `self`，所以先把「远程药丸看不看」拷成局部。名字避开 `show_remote()`
+        // 那枚文案函数：同名的局部会把函数项盖掉，`show_remote()` 就变成「调用一个 bool」。
+        let remote_shown = self.show_remote;
+        let scope_label = scope_label_for(&self.scope, snap.status.detached_at.is_some());
         // 前两档是 SourceTree 官方的两态（LogBranchesAll ⇄ LogBranchesCurrent）；
         // 后面列本地分支是我们自己加的——它那一档只切两态，想只看某条支线得自己挑。
-        let scope_items: Vec<String> = std::iter::once(ALL_BRANCHES.to_owned())
-            .chain(std::iter::once(CURRENT_BRANCH.to_owned()))
+        let scope_items: Vec<String> = std::iter::once(all_branches().to_owned())
+            .chain(std::iter::once(current_branch().to_owned()))
             .chain(snap.branches.iter().map(|b| b.name.clone()))
             .collect();
         let mut need_more = false;
@@ -2574,30 +3702,32 @@ impl Gitx {
                 // + 一枚还没接的「紧凑视图」+ 右侧「转到Commit的SHA-1」。
                 ui.horizontal(|ui| {
                     if let Some(p) = popup_button(ui, &scope_label, &scope_items) {
-                        want_scope = match p.as_str() {
-                            ALL_BRANCHES => git::Scope::All,
-                            CURRENT_BRANCH => git::Scope::Current,
-                            _ => git::Scope::Rev(p),
+                        want_scope = if p == all_branches() {
+                            git::Scope::All
+                        } else if p == current_branch() {
+                            git::Scope::Current
+                        } else {
+                            git::Scope::Rev(p)
                         };
                     }
                     if let Some(p) = popup_button(
                         ui,
-                        if want_remote { SHOW_REMOTE } else { HIDE_REMOTE },
-                        &[SHOW_REMOTE.to_owned(), HIDE_REMOTE.to_owned()],
+                        if want_remote { show_remote() } else { hide_remote() },
+                        &[show_remote().to_owned(), hide_remote().to_owned()],
                     ) {
-                        want_remote = p == SHOW_REMOTE;
+                        want_remote = p == show_remote();
                     }
                     if let Some(p) = popup_button(
                         ui,
-                        if want_topo { TOPO_ORDER } else { DATE_ORDER },
-                        &[DATE_ORDER.to_owned(), TOPO_ORDER.to_owned()],
+                        if want_topo { topo_order() } else { date_order() },
+                        &[date_order().to_owned(), topo_order().to_owned()],
                     ) {
-                        want_topo = p == TOPO_ORDER;
+                        want_topo = p == topo_order();
                     }
                     // 没有箭头 = 点开没有第二层。这一枚的真实行为还没对着参考图量过（见 PROCESS
                     // 「仍然没量过的」），与其给个假菜单，不如把「还没接」这句话留着。
-                    if ui.add(egui::Button::new("紧凑视图").small()).clicked() {
-                        intent.note = Some("egui 版还没接：紧凑视图".to_owned());
+                    if ui.add(egui::Button::new(tr!("紧凑视图", "Compact view")).small()).clicked() {
+                        intent.note = Some(tr!("egui 版还没接：紧凑视图", "Not wired in the egui shell: compact view").to_owned());
                     }
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                         if searching {
@@ -2614,10 +3744,10 @@ impl Gitx {
                             let resp = ui.add_sized(
                                 Vec2::new(w, 20.0),
                                 TextEdit::singleline(&mut sq)
-                                    .hint_text(SEARCH_HINT)
+                                    .hint_text(search_hint())
                                     .id_salt("log-search"),
                             );
-                            // 光标落在这一格：点侧栏「搜索」的人下一步就是打字，不该再点一下框。
+                            // 光标落在这一格：点「搜索」的人下一步就是打字，不该再点一下框。
                             // `focus_search` 是上一帧 `open_search()` 立的牌子，这一帧消费掉。
                             if focus_search {
                                 resp.request_focus();
@@ -2628,19 +3758,26 @@ impl Gitx {
                             // 状态那一格（在途 / 几条 / 没搜到）跟着框一起换位置，
                             // 免得搜索开着的时候日志条左半边多出一个会跳的数。
                             let status = if search_busy {
-                                "搜索中…".to_owned()
+                                tr!("搜索中…", "Searching…").to_owned()
                             } else if sq.trim().is_empty() {
-                                "回车开搜".to_owned()
+                                tr!("回车开搜", "Press Enter to search").to_owned()
                             } else if hits.is_empty() {
-                                "没搜到".to_owned()
+                                tr!("没搜到", "Nothing found").to_owned()
                             } else {
-                                format!("{} 条命中", hits.len())
+                                tr!(format!("{} 条命中", hits.len()), format!("{} hits", hits.len()))
                             };
                             ui.label(RichText::new(status).size(11.0).color(TEXT_SECONDARY));
                             return;
                         }
                         let w = (ui.available_width() - 8.0).clamp(90.0, 260.0);
-                        ui.add_sized(Vec2::new(w, 20.0), TextEdit::singleline(&mut query).hint_text(JUMP_TO_SHA));
+                        ui.add_sized(Vec2::new(w, 20.0), TextEdit::singleline(&mut query).hint_text(jump_to_sha()));
+                        // 搜索入口：侧栏那一行 2026-10-26 去掉了（用户嫌重复），
+                        // 现在只在日志条右端这枚小按钮上——点一下就把跳转框换成搜索框。
+                        if ui.add(egui::Button::new(tr!("搜索", "Search")).small()).clicked() {
+                            close_search = false;
+                            run_search = false;
+                            open_search = true;
+                        }
                     });
                 });
                 header_row(ui, width);
@@ -2648,7 +3785,10 @@ impl Gitx {
                 // 空态得写明，不然看着像「搜索坏了」而不像「没有命中」——尤其框里那个词
                 // 是人自己打的，他会怀疑自己敲错了地方。
                 if searching && hits.is_empty() && !search_busy {
-                    ui.label(RichText::new(format!("没有提交命中「{}」：说明和改过的文件名都不含它", sq.trim())).size(11.0).color(TEXT_MUTED));
+                    ui.label(RichText::new(tr!(
+                        format!("没有提交命中「{}」：说明和改过的文件名都不含它", sq.trim()),
+                        format!("No commit matches \"{}\" — neither the message nor the file names it touched", sq.trim())
+                    )).size(11.0).color(TEXT_MUTED));
                 }
                 let q = query.trim().to_lowercase();
                 let keep: Vec<usize> = snap
@@ -2688,9 +3828,10 @@ impl Gitx {
                             let h = &hits[r];
                             let cells = Cells {
                                 subject: h.commit.subject.clone(),
+                                short: h.commit.short_id.clone(),
                                 author: format!("{} <{}>", h.commit.author, h.commit.author_email),
                                 date: h.date.clone(),
-                                badges: visible_badges(&h.badges, show_remote),
+                                badges: visible_badges(&h.badges, remote_shown),
                                 ring: None,
                                 stem: false,
                             };
@@ -2714,6 +3855,8 @@ impl Gitx {
                             // （「今天 14:46」）而不是分支名。几个文件待提交写在下面文件表那一格里。
                             Cells {
                                 subject: "Uncommitted changes".to_owned(),
+                                // 虚拟行不是提交，没有号：这一格空着，整列仍然占位对齐。
+                                short: String::new(),
                                 author: "*".to_owned(),
                                 date: date_label(&snap.taken_at.to_rfc3339(), snap.taken_at),
                                 badges: Vec::new(),
@@ -2726,12 +3869,13 @@ impl Gitx {
                             let c = &snap.commits[i];
                             Cells {
                                 subject: c.subject.clone(),
+                                short: c.short_id.clone(),
                                 // 作者列：名字带尖括号邮箱（旧参考图这一格是
                                 // `baorong <superlbr@126.com>`；§2 只给了列宽 96，超出的部分
                                 // 由 `band` 截断）。
                                 author: format!("{} <{}>", c.author, c.author_email),
                                 date: snap.dates.get(i).cloned().unwrap_or_default(),
-                                badges: snap.badges.get(i).map(|b| visible_badges(b, show_remote)).unwrap_or_default(),
+                                badges: snap.badges.get(i).map(|b| visible_badges(b, remote_shown)).unwrap_or_default(),
                                 ring: None,
                                 stem: false,
                             }
@@ -2782,6 +3926,9 @@ impl Gitx {
         // 再消费「这一帧要请求焦点」那块牌子，最后才开搜/关档。
         self.search_q = sq;
         self.search_focus = false;
+        if open_search {
+            self.open_search();
+        }
         if run_search {
             self.run_search();
         }
@@ -2827,7 +3974,32 @@ impl Gitx {
                 );
                 let mut left: Vec<String> = Vec::new();
                 let mut back: Option<String> = None;
-                if let Some(snap) = &self.snap {
+                // 推送状态优先占住左下角：推送中/完成/失败时不显示分支名（那格平时就一个
+                // `main`，用户觉得没意义）。`Done`/`Failed` 带时间戳，超过 6 秒清回 `None`。
+                let push_now = ui.ctx().input(|i| i.time);
+                let push_text: Option<String> = match &mut self.push_state {
+                    None => None,
+                    Some(PushPhase::Pushing) => Some(tr!("正在推送…", "Pushing…").to_owned()),
+                    Some(PushPhase::Done(t)) => {
+                        if push_now - *t > 6.0 {
+                            self.push_state = None;
+                            None
+                        } else {
+                            Some(tr!("推送完成", "Push complete").to_owned())
+                        }
+                    }
+                    Some(PushPhase::Failed(t)) => {
+                        if push_now - *t > 6.0 {
+                            self.push_state = None;
+                            None
+                        } else {
+                            Some(tr!("推送失败", "Push failed").to_owned())
+                        }
+                    }
+                };
+                if let Some(text) = push_text {
+                    left.push(text);
+                } else if let Some(snap) = &self.snap {
                     let st = &snap.status;
                     match &st.detached_at {
                         // 分离 HEAD。`branch.head` 那一行 git 写的是字面量 `(detached)`，
@@ -2836,7 +4008,7 @@ impl Gitx {
                         // 以及怎么回去。
                         Some(oid) => {
                             let short: String = oid.chars().take(8).collect();
-                            left.push(format!("分离 HEAD · {short}"));
+                            left.push(tr!(format!("分离 HEAD · {short}"), format!("detached HEAD · {short}")));
                             if !self.last_branch.is_empty() {
                                 back = Some(self.last_branch.clone());
                             }
@@ -2853,7 +4025,10 @@ impl Gitx {
                         }
                     }
                     if !st.repo_state.is_empty() && st.repo_state != "none" {
-                        left.push(format!("· {}进行中", op_noun(&st.repo_state)));
+                        left.push(tr!(
+                            format!("· {}进行中", op_noun(&st.repo_state)),
+                            format!("· {} in progress", op_noun(&st.repo_state))
+                        ));
                     }
                 }
                 // 一段一段画而不是拼成一条：段与段之间要能被判据单独认出来
@@ -2876,7 +4051,7 @@ impl Gitx {
                     let r = ui.painter().text(
                         pos2(x + 8.0, rect.center().y),
                         Align2::LEFT_CENTER,
-                        format!("回到 {b}"),
+                        tr!(format!("回到 {b}"), format!("Back to {b}")),
                         FontId::proportional(11.0),
                         ACCENT,
                     );
@@ -2919,15 +4094,24 @@ impl Gitx {
     /// 多出一条斜茬（无头判据 `bands_match_the_measured_reference` 量得出来）。
     /// 单独抽出来是为了让无头测试能拿到同一份 `Ui`，不必伪造 `eframe::Frame`。
     pub(crate) fn shell(&mut self, ui: &mut egui::Ui) {
+        // 每帧第一件事：把这档偏好刷给当前线程。`tr!` 读的就是它，而核心层那些
+        // 拼给人看的错误解释也由同一档位决定（后台那份走 `lang::spawn`，见 `gitx::lang`）。
+        gitx::lang::set(self.lang);
         reset_rows_painted();
         let ctx = ui.ctx().clone();
         self.poll(&ctx);
         self.toolbar(ui);
         // 底部面板从窗底往上叠：先声明的贴着窗底。状态栏要贴底，所以排在暂存带前面。
         self.status_bar(ui);
-        self.sidebar(ui);
-        self.bottom_band(ui);
-        self.log_band(ui);
+        if self.home {
+            // 首页整页替掉侧栏 / 日志 / 暂存带：那三块都对着「当前仓库」，
+            // 而首页面前还没选仓库。状态栏留着——版本号与当前仓库路径仍然有用。
+            self.home_page(ui);
+        } else {
+            self.sidebar(ui);
+            self.bottom_band(ui);
+            self.log_band(ui);
+        }
         // 卡片与历史浮层压在最上面一层（`Order::Foreground`），它们自己那一格可点矩形铺满整屏，
         // 所以底下的面板这帧只会收到 hover=false / clicked=false —— 不用在每个面板里各问一次。
         // 顺序就是层序：确认卡最后画，压住历史面板。
@@ -2940,10 +4124,42 @@ impl Gitx {
 
 impl eframe::App for Gitx {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // 每次把窗口从后台切回前台就拉一次远程，不必手动按刷新。只看本帧那条
+        // `WindowFocused(true)` 事件，所以只在「失焦 → 聚焦」那一帧触发，不会每帧重拉；
+        // 仓库还没加载好（`busy`）或根本没打开仓库时跳过，免得启动/加载中误触发。
+        if self.repo.is_some() && !self.busy {
+            let regained = ui.ctx().input(|i| {
+                i.events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::WindowFocused(true)))
+            });
+            if regained {
+                self.land(Intent {
+                    act: Some(Action::Fetch),
+                    ..Default::default()
+                });
+            }
+        }
         // 原生面板画在 `shell` **之前**：`rfd` 的面板是嵌套事件循环，塞进一帧的中间等于让
         // 同一个窗口同时在两个循环里跑。`take()` 一次消费一个，所以一次点击最多弹一个面板。
         // 无头判据调的是 `shell()`，永远走不到这一行——这是「测试不会弹真面板」那条边界。
         self.run_dialogs();
         self.shell(ui);
+    }
+
+    /// macOS 上**关窗必崩**：带 Touch Bar 的机器（这台是 MacBookPro17,1）在 `Window` 被 drop
+    /// 之后，下一轮 display-cycle flush 里 AppKit 会对一条已经不存在的 KVO 观察做
+    /// `removeObserver`，抛 objc 异常 → `abort()`。上游记在 winit #4728（master）和 #4764
+    /// （0.30 维护分支，eframe/egui 还住在这里），两条都还没合。
+    ///
+    /// 这里直接结束进程绕过它：eframe 的 `save_and_destroy` 顺序是 `egui_ctx.on_exit()` →
+    /// `save()` → `app.on_exit()` → 收拾 painter → 才 drop 窗口，所以走到这一位时**该存的都存完了**，
+    /// 崩的那一条路整个不走。数据没有可丢的：偏好、书签、上次那本仓库全是改一格就当场落库，
+    /// 没有攒到退出才写的东西（见 `apply_prefs`、`Prefs::save`）。
+    /// 这一格能被判据钉住，靠的是判据读**这段源码本身**（`quitting_exits_before_the_window_is_dropped`）：
+    /// 崩溃要真窗口 + 真显示周期才复现，无头画布量不到，能钉的只有「结束进程写在不在写在这一位」。
+    #[cfg(target_os = "macos")]
+    fn on_exit(&mut self) {
+        std::process::exit(0);
     }
 }
