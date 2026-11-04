@@ -1,7 +1,9 @@
 pub mod db;
 pub mod error;
 pub mod git;
+pub mod lang;
 pub mod models;
+pub mod net;
 pub mod preview;
 pub mod provider;
 pub mod ssh;
