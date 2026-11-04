@@ -1,5 +1,6 @@
 use crate::models::PullRequest;
 use crate::provider::{err, ApiRequest, Capability, Host, RepoRef, Result};
+use crate::tr;
 
 /// Recognised but not wired up: Codeup's OpenAPI signs requests with an Alibaba
 /// Cloud AK/SK pair (plus an organization id), which is a different credential
@@ -12,7 +13,7 @@ impl Host for Codeup {
     }
 
     fn label(&self) -> &'static str {
-        "阿里云 Codeup"
+        tr!("阿里云 Codeup", "Aliyun Codeup")
     }
 
     fn handles(&self, url: &str) -> bool {
@@ -26,7 +27,10 @@ impl Host for Codeup {
     }
 
     fn token_hint(&self) -> &'static str {
-        "暂不支持：Codeup OpenAPI 需要阿里云 AK/SK 签名与 organizationId，尚未接入"
+        tr!(
+            "暂不支持：Codeup OpenAPI 需要阿里云 AK/SK 签名与 organizationId，尚未接入",
+            "Not supported yet: the Codeup OpenAPI signs with an Aliyun AK/SK pair plus an organizationId, which is not wired up"
+        )
     }
 
     fn pull_requests_request(&self, _repo: &RepoRef, _token: &str) -> Result<ApiRequest> {

@@ -1,7 +1,8 @@
 use serde_json::Value;
 
-use crate::models::PullRequest;
+use crate::models::{Ci, PullRequest};
 use crate::provider::{err, field, list_values, ApiRequest, Capability, Host, RepoRef, Result};
+use crate::tr;
 
 pub struct Gitee;
 
@@ -25,12 +26,18 @@ impl Host for Gitee {
     }
 
     fn token_hint(&self) -> &'static str {
-        "私人令牌（个人设置 → 私人令牌，勾选 projects 权限）"
+        tr!(
+            "私人令牌（个人设置 → 私人令牌，勾选 projects 权限）",
+            "a private token (personal settings → private tokens, tick the projects scope)"
+        )
     }
 
     fn pull_requests_request(&self, repo: &RepoRef, token: &str) -> Result<ApiRequest> {
         if token.trim().is_empty() {
-            return Err(err("未绑定 Gitee 令牌，请在「设置 → 代码托管」中填写。"));
+            return Err(err(tr!(
+                "未绑定 Gitee 令牌，请在「设置 → 代码托管」中填写。",
+                "No Gitee token bound — fill one in under Preferences → Hosting."
+            )));
         }
         // Gitee v5 takes the token as a query parameter, not a header.
         let url = format!(
@@ -42,10 +49,17 @@ impl Host for Gitee {
     }
 
     fn parse_pull_requests(&self, body: &str) -> Result<Vec<PullRequest>> {
-        let v: Value =
-            serde_json::from_str(body).map_err(|e| err(format!("Gitee 响应解析失败：{}", e)))?;
+        let v: Value = serde_json::from_str(body).map_err(|e| {
+            err(tr!(
+                format!("Gitee 响应解析失败：{}", e),
+                format!("Cannot parse the Gitee response: {e}")
+            ))
+        })?;
         if let Some(msg) = v.get("message").and_then(|m| m.as_str()) {
-            return Err(err(format!("Gitee：{}", msg)));
+            return Err(err(tr!(
+                format!("Gitee：{}", msg),
+                format!("Gitee answered: {msg}")
+            )));
         }
         Ok(list_values(&v, &["pull_requests", "data"])
             .into_iter()
@@ -58,9 +72,16 @@ impl Host for Gitee {
                     author: field(pr, &["user.login"]),
                     head: field(pr, &["head.ref"]),
                     base: field(pr, &["base.ref"]),
+                    head_sha: field(pr, &["head.sha"]),
                     draft: pr.get("draft").and_then(Value::as_bool).unwrap_or(false),
                     url: field(pr, &["html_url"]),
                     updated: field(pr, &["updated_at"]),
+                    // Gitee 的列表里没有 `mergeable_state` 这一格（它在单条 PR 的详情里，
+                    // 而且叫 `mergeable` 布尔）。列表留空串：看板那一行退成「还没算出来」，
+                    // 不猜。**GitHub 的列表同样不给这一格**（2026-10-31 实测），
+                    // 所以这一格在两家都是「等详情那一次」。
+                    mergeable_state: field(pr, &["mergeable_state"]),
+                    ci: Ci::NotFetched,
                 })
             })
             .collect())
@@ -115,6 +136,19 @@ mod tests {
     fn only_handles_gitee() {
         assert!(Gitee.handles("git@gitee.com:a/b.git"));
         assert!(!Gitee.handles("git@github.com:a/b.git"));
+    }
+
+    /// 没接的两格必须**明说不接**，而不是回一个空对象让看板当成「状态是干净的」。
+    /// 默认实现回 Err，且 `capabilities()` 里没有它们——外壳靠后者决定发不发请求。
+    #[test]
+    fn refuses_the_endpoints_it_has_not_wired_up() {
+        assert_eq!(Gitee.capabilities(), vec![Capability::PullRequests]);
+        let e = Gitee
+            .pull_request_detail_request(&repo(), "tok", 7)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("没有接"), "{}", e);
+        assert!(Gitee.checks_request(&repo(), "tok", "abc").unwrap_err().to_string().contains("没有接"));
     }
 }
 

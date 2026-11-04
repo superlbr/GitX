@@ -4,6 +4,7 @@
 //! Pure string work — the UI layer only opens the URL it hands back.
 
 use crate::provider::{err, parse_remote};
+use crate::tr;
 use crate::Result;
 
 const GITHUB1S: &str = "https://github1s.com";
@@ -13,12 +14,16 @@ const GITHUB_HOST: &str = "github.com";
 /// same `/tree/<ref>` and `/blob/<ref>/<path>` tail GitHub uses. `branch` and
 /// `path` are optional: repo root → tree at a ref → one file at a ref.
 pub fn github1s_url(remote_url: &str, branch: Option<&str>, path: Option<&str>) -> Result<String> {
-    let rr = parse_remote(remote_url)
-        .ok_or_else(|| err("无法从 remote 地址解析出 owner/repo，这个仓库可能还没有远程。"))?;
+    let rr = parse_remote(remote_url).ok_or_else(|| {
+        err(tr!(
+            "无法从 remote 地址解析出 owner/repo，这个仓库可能还没有远程。",
+            "Cannot read owner/repo out of the remote URL — this repository may not have one yet."
+        ))
+    })?;
     if rr.host != GITHUB_HOST {
-        return Err(err(format!(
-            "极速预览目前只支持 github.com，当前远程在 {} 上。",
-            rr.host
+        return Err(err(tr!(
+            format!("极速预览目前只支持 github.com，当前远程在 {} 上。", rr.host),
+            format!("Fast preview only supports github.com for now; this remote is on {}.", rr.host)
         )));
     }
     let branch = branch.map(str::trim).filter(|b| !b.is_empty());

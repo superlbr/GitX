@@ -8,6 +8,7 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{GitxError, Result};
+use crate::tr;
 
 /// The private-key names `ssh-keygen` creates by default, most preferred first.
 pub const DEFAULT_KEY_NAMES: &[&str] = &["id_ed25519", "id_ecdsa", "id_rsa", "id_dsa"];
@@ -242,7 +243,9 @@ pub fn public_key_in(dir: &str, path: &str) -> Result<String> {
     let base = std::path::Path::new(dir);
     let p = std::path::Path::new(path);
     if !base.as_os_str().is_empty() && p.parent() != Some(base) {
-        return Err(GitxError::Other("只能复制 ~/.ssh 里的公钥。".into()));
+        return Err(GitxError::Other(
+            tr!("只能复制 ~/.ssh 里的公钥。", "Only public keys inside ~/.ssh can be copied.").into(),
+        ));
     }
     if !p
         .file_name()
@@ -250,10 +253,19 @@ pub fn public_key_in(dir: &str, path: &str) -> Result<String> {
         .unwrap_or(false)
     {
         return Err(GitxError::Other(
-            "只有 .pub 公钥可以复制，私钥不会离开磁盘。".into(),
+            tr!(
+                "只有 .pub 公钥可以复制，私钥不会离开磁盘。",
+                "Only .pub public keys can be copied; private keys never leave the disk."
+            )
+            .into(),
         ));
     }
-    std::fs::read_to_string(p).map_err(|e| GitxError::Other(format!("读取公钥失败: {}", e)))
+    std::fs::read_to_string(p).map_err(|e| {
+        GitxError::Other(tr!(
+            format!("读取公钥失败: {}", e),
+            format!("Cannot read the public key: {e}")
+        ))
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -316,11 +328,14 @@ pub fn interpret_auth(text: &str) -> AuthReport {
     let (outcome, label) = if hit(&["successfully authenticated", "welcome to gitlab"])
         || (lower.contains("hi ") && !account.is_empty())
     {
-        (AuthOutcome::Success, "认证通过")
+        (AuthOutcome::Success, tr!("认证通过", "Authenticated"))
     } else if hit(&["bad owner or permissions", "unprotected private key"]) {
         (
             AuthOutcome::KeyPermissions,
-            "密钥文件权限太宽，ssh 拒绝使用（改成 600）",
+            tr!(
+                "密钥文件权限太宽，ssh 拒绝使用（改成 600）",
+                "The key file's permissions are too open, so ssh refuses to use it (chmod 600)"
+            ),
         )
     } else if hit(&[
         "permission denied",
@@ -331,15 +346,27 @@ pub fn interpret_auth(text: &str) -> AuthReport {
     ]) {
         (
             AuthOutcome::PermissionDenied,
-            "被拒绝：服务器不认识这台机器的密钥",
+            tr!(
+                "被拒绝：服务器不认识这台机器的密钥",
+                "Denied: the server does not recognise this machine's key"
+            ),
         )
     } else if hit(&["host key verification failed", "known hosts", "fingerprint"]) {
         (
             AuthOutcome::UnknownHost,
-            "主机指纹未被信任：先在终端里 ssh 一次确认",
+            tr!(
+                "主机指纹未被信任：先在终端里 ssh 一次确认",
+                "The host fingerprint is not trusted: run ssh once in a terminal to accept it"
+            ),
         )
     } else if hit(&["timed out", "timeout"]) {
-        (AuthOutcome::Timeout, "连接超时，可能被网络或代理挡住")
+        (
+            AuthOutcome::Timeout,
+            tr!(
+                "连接超时，可能被网络或代理挡住",
+                "The connection timed out, possibly blocked by the network or a proxy"
+            ),
+        )
     } else if hit(&[
         "could not resolve",
         "connection refused",
@@ -347,9 +374,18 @@ pub fn interpret_auth(text: &str) -> AuthReport {
         "no route to host",
         "connection closed",
     ]) {
-        (AuthOutcome::Network, "连不上服务器，检查网络或代理")
+        (
+            AuthOutcome::Network,
+            tr!(
+                "连不上服务器，检查网络或代理",
+                "Cannot reach the server: check the network or the proxy"
+            ),
+        )
     } else {
-        (AuthOutcome::Unknown, "没有得到明确的答复")
+        (
+            AuthOutcome::Unknown,
+            tr!("没有得到明确的答复", "No clear answer from the server"),
+        )
     };
     AuthReport {
         outcome,
@@ -367,7 +403,13 @@ pub fn interpret_auth(text: &str) -> AuthReport {
 pub fn probe(host: &str, user: Option<&str>) -> Result<AuthReport> {
     let host = host.trim();
     if host.is_empty() || host.split_whitespace().count() != 1 {
-        return Err(GitxError::Other("主机名不能为空，也不能包含空格。".into()));
+        return Err(GitxError::Other(
+            tr!(
+                "主机名不能为空，也不能包含空格。",
+                "The host name cannot be empty or contain spaces."
+            )
+            .into(),
+        ));
     }
     let user = user
         .map(str::trim)

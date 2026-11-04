@@ -3,6 +3,7 @@ use std::process::Command;
 
 use crate::error::{GitxError, Result};
 use crate::models::*;
+use crate::tr;
 
 /// Without this, git escapes every non-ASCII path into `"\344\270\255..."`,
 /// which is what makes SourceTree unusable for Chinese file names.
@@ -51,47 +52,57 @@ fn decode(out: &[u8]) -> String {
 /// git's own wording is English and unhelpful to most domestic users, but the
 /// original text is the only thing searchable when something is truly odd, so
 /// every message keeps it after the explanation.
+///
+/// 每一行是 `(触发串, 中文, English)`：解释**两档都要给**。少写一格不是「退成中文」，
+/// 而是这条错误在英文档下长出一个中文字——那条由判据 `every_git_hint_speaks_both_languages`
+/// 兜住，而不是靠人记得填。表摆在模块级而不是留在函数里，也正是为了让那条判据能**逐条**过：
+/// 留在函数里，判据只能挑几条样本，而漏的那几条恰恰是样本照不到的地方。
+const GIT_HINTS: [(&str, &str, &str); 30] = [
+        ("not a git repository", "这里不是一个 git 仓库（没有 .git），请先在侧栏添加正确的目录。", "This is not a git repository (no .git). Add the right folder in the sidebar first."),
+        ("has no upstream branch", "当前分支没有关联远程分支，首次推送请用「推送」里的设置上游（git push -u origin 分支名）。", "This branch has no upstream. For the first push, use Push and set the upstream (git push -u origin <branch>)."),
+        ("no such branch", "找不到这个分支，名字可能写错了或已被删除。", "Branch not found — the name may be misspelled, or the branch was deleted."),
+        ("pathspec", "没有匹配到这些路径，可能已经被移动、删除或拼写不一致。", "No paths matched — they may have been moved, deleted, or spelled differently."),
+        ("non-fast-forward", "远程有你本地没有的提交，请先 Fetch 并 Pull / 变基之后再推送，强推会丢掉对方的提交。", "The remote has commits you don't have. Fetch, then pull or rebase before pushing — forcing would discard theirs."),
+        ("rejected", "远程拒绝了这次推送，通常是远端有新提交或权限不足。", "The remote rejected this push — usually new commits on the remote, or missing permissions."),
+        ("permission denied (publickey)", "SSH 公钥没被对方接受：请确认密钥已加到平台的 SSH Keys，且用的是 ssh_config 里那把（可在「设置 → SSH」试连）。", "The SSH key was not accepted: check that it is added to the platform's SSH Keys and that it is the one in ssh_config (Preferences → SSH can test the connection)."),
+        ("could not read username", "远程要求账号密码。HTTP 令牌方式请在 remote 地址里带上用户名，或改用 SSH。", "The remote asked for a username and password. Put the user name in the HTTP remote URL, or switch to SSH."),
+        ("connection refused", "连不上远端服务器：端口不通、代理没走或地址写错了。", "Cannot reach the remote server: the port is closed, no proxy is in use, or the address is wrong."),
+        ("timed out", "连接超时：国内直连 GitHub 常见，建议在「克隆/远程」里改用加速节点或配好代理。", "Connection timed out — common when reaching GitHub directly. Try an acceleration node or a proxy in Clone / Remotes."),
+        ("could not resolve host", "域名解析失败：网络不通或需要代理。", "DNS lookup failed: no network, or a proxy is required."),
+        ("authentication failed", "认证失败：令牌过期、拼错或权限不足，请到平台的设置里重新生成访问令牌。", "Authentication failed: the token expired, is misspelled, or lacks permission. Generate a new one in the platform's settings."),
+        ("repository not found", "远程仓库不存在：地址写错、仓库已改名或被删除，也可能是私有仓库而你的令牌/公钥没有读取权限。", "Remote repository not found: wrong URL, renamed or deleted, or it is private and your token or key cannot read it."),
+        ("requested url returned error", "远程拒绝了这次访问：私有仓库需要有效的访问令牌，或仓库地址（含组织名）写错了。", "The remote refused this access: a private repository needs a valid token, or the URL (including the organisation) is wrong."),
+        ("destination path", "目标目录已存在且不是空目录：换一个目录，或把已有仓库直接添加到侧栏。", "The target folder already exists and is not empty. Pick another folder, or add the existing repository to the sidebar."),
+        ("rpc failed", "传输中断：国内直连 GitHub 常见，请改用加速节点或配好代理后重试。", "Transfer interrupted — common when reaching GitHub directly. Use an acceleration node or a proxy and retry."),
+        ("recv failure", "网络在传输途中断开：通常是代理或加速节点不稳定，重试或换一个节点。", "The connection dropped mid-transfer, usually an unstable proxy or node. Retry or switch node."),
+        ("early eof", "传输提前结束：网络不稳定，重试一次通常就能通过。", "The transfer ended early: the connection is unstable, and a retry usually gets through."),
+        ("server certificate verification failed", "证书校验失败：常见于公司代理/网关替换证书，需要配置根证书或改用 SSH。", "Certificate verification failed — typical behind a corporate proxy that replaces certificates. Install the root certificate or switch to SSH."),
+        ("diverged", "本地和远程都有新提交（分叉了）。请选择变基或合并后再同步。", "Both sides have new commits (diverged). Rebase or merge before syncing."),
+        ("nothing to commit", "没有可提交的内容：先勾选要提交的改动文件。", "Nothing to commit: tick the files you want to commit first."),
+        ("working tree not clean", "工作区还有未提交的改动，git 不肯继续。请先提交或贮藏。", "The working tree still has uncommitted changes and git will not continue. Commit or stash them first."),
+        ("would be overwritten by merge", "本地改动会被覆盖：请先提交或贮藏这些改动再继续。", "Local changes would be overwritten: commit or stash them before continuing."),
+        ("merge conflict", "存在合并冲突，请先在「冲突」列表里逐个解决。", "There are merge conflicts. Resolve them one by one in the Conflicts list first."),
+        ("author identity unknown", "还没配置 git 用户身份，请在「设置」或运行 git config user.name / user.email。", "No git identity is configured. Set it in Preferences, or run git config user.name / user.email."),
+        ("empty message", "提交信息不能为空。", "The commit message cannot be empty."),
+        ("unmerged files", "还有未解决的合并冲突文件，先解决再提交。", "Unresolved merge conflicts remain — resolve them before committing."),
+        ("lock file", "上一个 git 操作可能没干净退出（存在锁文件）。确认没有其它 git 进程在跑后删除该锁文件。", "The last git operation may not have exited cleanly (a lock file exists). Make sure no other git process is running, then remove it."),
+        ("dubious ownership", "目录属主和当前用户不一致，git 出于安全拒绝操作。请用对应账号运行，或把该目录加入 git 的安全目录。", "The folder belongs to another user, so git refuses to operate. Run as that account, or add the folder to git's safe directories."),
+        ("file exists", "目标已经存在，换个名字再试。", "The target already exists. Try another name."),
+];
+
 fn explain_git_error(stderr: &str) -> String {
     let trimmed = stderr.trim();
     let lower = trimmed.to_lowercase();
-    let hint = [
-        ("not a git repository", "这里不是一个 git 仓库（没有 .git），请先在侧栏添加正确的目录。"),
-        ("has no upstream branch", "当前分支没有关联远程分支，首次推送请用「推送」里的设置上游（git push -u origin 分支名）。"),
-        ("no such branch", "找不到这个分支，名字可能写错了或已被删除。"),
-        ("pathspec", "没有匹配到这些路径，可能已经被移动、删除或拼写不一致。"),
-        ("non-fast-forward", "远程有你本地没有的提交，请先 Fetch 并 Pull / 变基之后再推送，强推会丢掉对方的提交。"),
-        ("rejected", "远程拒绝了这次推送，通常是远端有新提交或权限不足。"),
-        ("permission denied (publickey)", "SSH 公钥没被对方接受：请确认密钥已加到平台的 SSH Keys，且用的是 ssh_config 里那把（可在「设置 → SSH」试连）。"),
-        ("could not read username", "远程要求账号密码。HTTP 令牌方式请在 remote 地址里带上用户名，或改用 SSH。"),
-        ("connection refused", "连不上远端服务器：端口不通、代理没走或地址写错了。"),
-        ("timed out", "连接超时：国内直连 GitHub 常见，建议在「克隆/远程」里改用加速节点或配好代理。"),
-        ("could not resolve host", "域名解析失败：网络不通或需要代理。"),
-        ("authentication failed", "认证失败：令牌过期、拼错或权限不足，请到平台的设置里重新生成访问令牌。"),
-        ("repository not found", "远程仓库不存在：地址写错、仓库已改名或被删除，也可能是私有仓库而你的令牌/公钥没有读取权限。"),
-        ("requested url returned error", "远程拒绝了这次访问：私有仓库需要有效的访问令牌，或仓库地址（含组织名）写错了。"),
-        ("destination path", "目标目录已存在且不是空目录：换一个目录，或把已有仓库直接添加到侧栏。"),
-        ("rpc failed", "传输中断：国内直连 GitHub 常见，请改用加速节点或配好代理后重试。"),
-        ("recv failure", "网络在传输途中断开：通常是代理或加速节点不稳定，重试或换一个节点。"),
-        ("early eof", "传输提前结束：网络不稳定，重试一次通常就能通过。"),
-        ("server certificate verification failed", "证书校验失败：常见于公司代理/网关替换证书，需要配置根证书或改用 SSH。"),
-        ("diverged", "本地和远程都有新提交（分叉了）。请选择变基或合并后再同步。"),
-        ("nothing to commit", "没有可提交的内容：先勾选要提交的改动文件。"),
-        ("working tree not clean", "工作区还有未提交的改动，git 不肯继续。请先提交或贮藏。"),
-        ("would be overwritten by merge", "本地改动会被覆盖：请先提交或贮藏这些改动再继续。"),
-        ("merge conflict", "存在合并冲突，请先在「冲突」列表里逐个解决。"),
-        ("author identity unknown", "还没配置 git 用户身份，请在「设置」或运行 git config user.name / user.email。"),
-        ("empty message", "提交信息不能为空。"),
-        ("unmerged files", "还有未解决的合并冲突文件，先解决再提交。"),
-        ("lock file", "上一个 git 操作可能没干净退出（存在锁文件）。确认没有其它 git 进程在跑后删除该锁文件。"),
-        ("dubious ownership", "目录属主和当前用户不一致，git 出于安全拒绝操作。请用对应账号运行，或把该目录加入 git 的安全目录。"),
-        ("file exists", "目标已经存在，换个名字再试。"),
-    ]
+    let hint = GIT_HINTS
     .iter()
-    .find(|(needle, _)| lower.contains(needle))
-    .map(|(_, msg)| *msg);
+    .find(|(needle, _, _)| lower.contains(needle))
+    .map(|(_, zh, en)| tr!(*zh, *en));
 
     match hint {
-        Some(msg) => format!("{msg}\n\n—— git 原文 ——\n{trimmed}"),
+        Some(msg) => format!(
+            "{msg}\n\n{}\n{trimmed}",
+            tr!("—— git 原文 ——", "—— git output ——")
+        ),
         None => trimmed.to_string(),
     }
 }
@@ -276,7 +287,10 @@ pub fn head(repo: &str) -> Result<String> {
 pub fn scan_repos(root: &str, max_depth: usize, limit: usize) -> Result<Vec<String>> {
     let start = std::path::Path::new(root);
     if !start.is_dir() {
-        return Err(GitxError::Other(format!("文件夹不存在: {}", root)));
+        return Err(GitxError::Other(tr!(
+            format!("文件夹不存在: {}", root),
+            format!("Folder does not exist: {}", root)
+        )));
     }
     let mut found: Vec<String> = Vec::new();
     let mut queue = std::collections::VecDeque::from([(start.to_path_buf(), 0usize)]);
@@ -633,7 +647,9 @@ pub fn recent_activity_all(
         .map(|s| {
             s.unwrap_or_else(|| RepoOutcome {
                 repo: String::new(),
-                result: Err(GitxError::Other("该仓库的 worker 没有产出结果".into())),
+                result: Err(GitxError::Other(
+                    tr!("该仓库的 worker 没有产出结果", "This repository's worker produced no result").into(),
+                )),
             })
         })
         .collect()
@@ -1108,13 +1124,19 @@ pub fn rev_file_text(repo: &str, oid: &str, path: &str) -> Result<String> {
     match run_git(repo, &["show", &spec]) {
         Ok(text) => {
             if text.len() > 2 * 1024 * 1024 {
-                return Ok(format!("（该版本约 {} KB，未展示内容）", text.len() / 1024));
+                return Ok(tr!(
+                    format!("（该版本约 {} KB，未展示内容）", text.len() / 1024),
+                    format!("(this version is about {} KB; its content is not shown)", text.len() / 1024)
+                ));
             }
             Ok(text)
         }
         // Binary blobs fail the UTF-8 conversion, and deleted paths fail in git;
         // either way report it in the pane rather than raising an error toast.
-        Err(e) => Ok(format!("（无法展示该版本：{}）", e)),
+        Err(e) => Ok(tr!(
+            format!("（无法展示该版本：{}）", e),
+            format!("(cannot show this version: {e})")
+        )),
     }
 }
 
@@ -1136,7 +1158,10 @@ pub fn restore_file(repo: &str, oid: &str, path: &str) -> Result<()> {
 /// failure toast — and the save panel would then treat that stub as an existing file.
 pub fn archive(repo: &str, oid: &str, dest: &str) -> Result<()> {
     if run_git(repo, &["cat-file", "-e", &format!("{oid}^{{commit}}")]).is_err() {
-        return Err(GitxError::Git(format!("读不出这条提交：{oid}")));
+        return Err(GitxError::Git(tr!(
+            format!("读不出这条提交：{oid}"),
+            format!("Cannot read this commit: {oid}")
+        )));
     }
     run_git(repo, &["archive", "--format=zip", "--output", dest, oid])?;
     Ok(())
@@ -1213,7 +1238,10 @@ fn local_branch_exists(repo: &str, name: &str) -> Result<bool> {
 /// there is one, otherwise create it tracking exactly the ref that was clicked.
 pub fn checkout_remote_branch(repo: &str, remote_ref: &str) -> Result<()> {
     let tail = remote_ref_tail(remote_ref).ok_or_else(|| {
-        GitxError::Git(format!("{remote_ref} 不是一条远程分支（应为「远端/分支」那种名字）"))
+        GitxError::Git(tr!(
+            format!("{remote_ref} 不是一条远程分支（应为「远端/分支」那种名字）"),
+            format!("{remote_ref} is not a remote branch (expected <remote>/<branch>)")
+        ))
     })?;
     if local_branch_exists(repo, tail)? {
         return checkout_branch(repo, tail);
@@ -1259,7 +1287,9 @@ pub fn conflict_content(repo: &str, path: &str) -> Result<String> {
         .trim()
         .to_string();
     if root.is_empty() {
-        return Err(GitxError::Other("无法确定仓库根目录".into()));
+        return Err(GitxError::Other(
+            tr!("无法确定仓库根目录", "Cannot work out the repository root").into(),
+        ));
     }
     let full = std::path::Path::new(&root).join(path);
     std::fs::read_to_string(&full).map_err(GitxError::Io)
@@ -1271,7 +1301,9 @@ pub fn resolve_manual(repo: &str, path: &str, content: &str) -> Result<()> {
         .trim()
         .to_string();
     if root.is_empty() {
-        return Err(GitxError::Other("无法确定仓库根目录".into()));
+        return Err(GitxError::Other(
+            tr!("无法确定仓库根目录", "Cannot work out the repository root").into(),
+        ));
     }
     let full = std::path::Path::new(&root).join(path);
     std::fs::write(&full, content)?;
@@ -1463,15 +1495,25 @@ pub fn untracked_patch(repo: &str, path: &str) -> Result<String> {
     let meta = std::fs::metadata(&full)?;
     let header = format!("diff --git a/{p} b/{p}\n", p = path);
     if meta.len() > 2 * 1024 * 1024 {
-        return Ok(format!(
-            "{}（新文件较大，约 {} KB，未展示内容）",
-            header,
-            meta.len() / 1024
+        return Ok(tr!(
+            format!(
+                "{}（新文件较大，约 {} KB，未展示内容）",
+                header,
+                meta.len() / 1024
+            ),
+            format!(
+                "{}(new file is about {} KB; its content is not shown)",
+                header,
+                meta.len() / 1024
+            )
         ));
     }
     let bytes = std::fs::read(&full)?;
     if bytes.iter().take(8000).any(|b| *b == 0) {
-        return Ok(format!("{}（二进制新文件，{} 字节）", header, bytes.len()));
+        return Ok(tr!(
+            format!("{}（二进制新文件，{} 字节）", header, bytes.len()),
+            format!("{}(binary new file, {} bytes)", header, bytes.len())
+        ));
     }
     let text = String::from_utf8_lossy(&bytes);
     let lines: Vec<&str> = if text.is_empty() {
@@ -1631,7 +1673,10 @@ fn run_git_stdin(repo: &str, args: &[&str], input: &str) -> Result<String> {
 pub fn stage_hunk(repo: &str, path: &str, index: usize) -> Result<()> {
     let patch = working_patch(repo, false, Some(path))?;
     let one = hunk_patch(&patch, index).ok_or_else(|| {
-        GitxError::Other(format!("{path} 没有第 {index} 块改动，可能列表刚刷新过"))
+        GitxError::Other(tr!(
+            format!("{path} 没有第 {index} 块改动，可能列表刚刷新过"),
+            format!("{path} has no hunk number {index} — the list may have just refreshed")
+        ))
     })?;
     run_git_stdin(repo, &["apply", "--cached", "--whitespace=nowarn", "-"], &one)?;
     Ok(())
@@ -1642,7 +1687,10 @@ pub fn stage_hunk(repo: &str, path: &str, index: usize) -> Result<()> {
 pub fn unstage_hunk(repo: &str, path: &str, index: usize) -> Result<()> {
     let patch = working_patch(repo, true, Some(path))?;
     let one = hunk_patch(&patch, index).ok_or_else(|| {
-        GitxError::Other(format!("{path} 的暂存区里没有第 {index} 块改动，可能列表刚刷新过"))
+        GitxError::Other(tr!(
+            format!("{path} 的暂存区里没有第 {index} 块改动，可能列表刚刷新过"),
+            format!("{path} has no staged hunk number {index} — the list may have just refreshed")
+        ))
     })?;
     run_git_stdin(
         repo,
@@ -1658,7 +1706,10 @@ pub fn unstage_hunk(repo: &str, path: &str, index: usize) -> Result<()> {
 pub fn discard_hunk(repo: &str, path: &str, index: usize) -> Result<()> {
     let patch = working_patch(repo, false, Some(path))?;
     let one = hunk_patch(&patch, index).ok_or_else(|| {
-        GitxError::Other(format!("{path} 没有第 {index} 块改动，可能列表刚刷新过"))
+        GitxError::Other(tr!(
+            format!("{path} 没有第 {index} 块改动，可能列表刚刷新过"),
+            format!("{path} has no hunk number {index} — the list may have just refreshed")
+        ))
     })?;
     // 不带 `--cached`：反打的落点就是工作区那个文件。
     run_git_stdin(repo, &["apply", "-R", "--whitespace=nowarn", "-"], &one)?;
@@ -1703,7 +1754,9 @@ pub fn ignore_path(repo: &str, path: &str) -> Result<()> {
         .trim()
         .to_string();
     if root.is_empty() {
-        return Err(GitxError::Other("无法确定仓库根目录".into()));
+        return Err(GitxError::Other(
+            tr!("无法确定仓库根目录", "Cannot work out the repository root").into(),
+        ));
     }
     let ignore_file = std::path::Path::new(&root).join(".gitignore");
     let mut content = std::fs::read_to_string(&ignore_file).unwrap_or_default();
@@ -1726,7 +1779,9 @@ pub fn read_gitignore(repo: &str) -> Result<String> {
         .trim()
         .to_string();
     if root.is_empty() {
-        return Err(GitxError::Other("无法确定仓库根目录".into()));
+        return Err(GitxError::Other(
+            tr!("无法确定仓库根目录", "Cannot work out the repository root").into(),
+        ));
     }
     let ignore_file = std::path::Path::new(&root).join(".gitignore");
     Ok(std::fs::read_to_string(&ignore_file).unwrap_or_default())
@@ -1738,7 +1793,9 @@ pub fn write_gitignore(repo: &str, content: &str) -> Result<()> {
         .trim()
         .to_string();
     if root.is_empty() {
-        return Err(GitxError::Other("无法确定仓库根目录".into()));
+        return Err(GitxError::Other(
+            tr!("无法确定仓库根目录", "Cannot work out the repository root").into(),
+        ));
     }
     let ignore_file = std::path::Path::new(&root).join(".gitignore");
     std::fs::write(&ignore_file, content)?;
@@ -1927,7 +1984,13 @@ pub fn interactive_rebase(repo: &str, base: &str, plan: &[(String, String)]) -> 
     for (oid, action) in plan {
         let a = action.as_str();
         if !valid.contains(&a) {
-            return Err(GitxError::Other(format!("不支持的变基操作: {}", a)));
+            return Err(GitxError::Other(
+                tr!(
+                    format!("不支持的变基操作: {}", a),
+                    format!("Unsupported rebase action: {}", a)
+                )
+                .into(),
+            ));
         }
         let subject = run_git(repo, &["log", "--format=%s", "-n", "1", oid])
             .unwrap_or_default()
@@ -1936,7 +1999,9 @@ pub fn interactive_rebase(repo: &str, base: &str, plan: &[(String, String)]) -> 
         todo.push_str(&format!("{} {} {}\n", a, oid, subject));
     }
     if todo.trim().is_empty() {
-        return Err(GitxError::Other("变基计划为空".into()));
+        return Err(GitxError::Other(
+            tr!("变基计划为空", "The rebase plan is empty").into(),
+        ));
     }
 
     // Write the todo list to a temp file and replay it via GIT_SEQUENCE_EDITOR.
@@ -2059,13 +2124,25 @@ pub fn apply_node_template(tpl: &str, url: &str) -> String {
 /// break git's `key=value` parse are refused instead of escaped.
 pub fn node_rewrite_args(node_tpl: &str, remote_url: &str) -> Result<Vec<String>> {
     if node_tpl.trim().is_empty() {
-        return Err(GitxError::Other("请先填写一个加速节点地址。".into()));
+        return Err(GitxError::Other(
+            tr!(
+                "请先填写一个加速节点地址。",
+                "Fill in an acceleration node address first."
+            )
+            .into(),
+        ));
     }
     let url = remote_url.trim();
     if !url.starts_with("https://") && !url.starts_with("http://") {
-        return Err(GitxError::Other(format!(
-            "加速节点只能改写 https 形式的远程，「{}」走不了节点。SSH 地址请配置代理，或在「设置 → SSH」里试连。",
-            url
+        return Err(GitxError::Other(tr!(
+            format!(
+                "加速节点只能改写 https 形式的远程，「{}」走不了节点。SSH 地址请配置代理，或在「设置 → SSH」里试连。",
+                url
+            ),
+            format!(
+                "A node can only rewrite http(s) remotes — “{}” cannot go through one. Configure a proxy for SSH addresses, or test the connection in Preferences → SSH.",
+                url
+            )
         )));
     }
     let section = apply_node_template(node_tpl, url);
@@ -2073,9 +2150,15 @@ pub fn node_rewrite_args(node_tpl: &str, remote_url: &str) -> Result<Vec<String>
         || section.contains(['=', '"', '\''])
         || section.chars().any(char::is_whitespace);
     if unusable {
-        return Err(GitxError::Other(format!(
-            "加速节点「{}」不是 git 能接受的地址。请填写完整 https 地址，例如 https://node.example/{{url}}。",
-            node_tpl.trim()
+        return Err(GitxError::Other(tr!(
+            format!(
+                "加速节点「{}」不是 git 能接受的地址。请填写完整 https 地址，例如 https://node.example/{{url}}。",
+                node_tpl.trim()
+            ),
+            format!(
+                "The node “{}” is not an address git can accept. Give a full https URL, for example https://node.example/{{url}}.",
+                node_tpl.trim()
+            )
         )));
     }
     Ok(vec![
@@ -2090,9 +2173,9 @@ pub fn remote_url(repo: &str, remote: &str) -> Result<String> {
     let url = run_git(repo, &["remote", "get-url", remote])?;
     let url = url.trim().to_string();
     if url.is_empty() {
-        return Err(GitxError::Other(format!(
-            "这个仓库没有名为「{}」的远程。",
-            remote
+        return Err(GitxError::Other(tr!(
+            format!("这个仓库没有名为「{}」的远程。", remote),
+            format!("This repository has no remote named “{}”.", remote)
         )));
     }
     Ok(url)
@@ -2189,7 +2272,11 @@ pub fn push(
         // set, and the user retries the push a second time to no visible effect.
         if remote.is_none() || branch.is_none() {
             return Err(GitxError::Other(
-                "设置上游分支必须同时指定远程与分支名。".into(),
+                tr!(
+                    "设置上游分支必须同时指定远程与分支名。",
+                    "Setting an upstream needs both a remote and a branch name."
+                )
+                .into(),
             ));
         }
         args.push("--set-upstream".into());
@@ -2224,7 +2311,11 @@ pub fn push_ref(
 ) -> Result<()> {
     if remote.is_empty() || local.is_empty() || remote_name.is_empty() {
         return Err(GitxError::Other(
-            "推送必须同时指定远端、本地分支和远端分支名。".into(),
+            tr!(
+                "推送必须同时指定远端、本地分支和远端分支名。",
+                "Pushing needs a remote, a local branch, and a remote branch name."
+            )
+            .into(),
         ));
     }
     let spec = format!("{local}:{remote_name}");
@@ -2393,7 +2484,7 @@ pub fn draft_pr_context(repo: &str) -> Result<(String, String, String)> {
     let current = branches
         .iter()
         .find(|b| b.is_current)
-        .ok_or_else(|| GitxError::Other("未找到当前分支".into()))?;
+        .ok_or_else(|| GitxError::Other(tr!("未找到当前分支", "Current branch not found").into()))?;
 
     let base = if let Some(up) = &current.upstream {
         up.clone()
@@ -2405,7 +2496,11 @@ pub fn draft_pr_context(repo: &str) -> Result<(String, String, String)> {
             .map(|c| c.to_string())
             .ok_or_else(|| {
                 GitxError::Other(
-                    "无法确定基准分支：当前分支无 upstream，且未发现 main/master".into(),
+                    tr!(
+                        "无法确定基准分支：当前分支无 upstream，且未发现 main/master",
+                        "Cannot work out the base branch: this branch has no upstream, and neither main nor master exists"
+                    )
+                    .into(),
                 )
             })?
     };
@@ -2413,9 +2508,9 @@ pub fn draft_pr_context(repo: &str) -> Result<(String, String, String)> {
     let range = format!("{}..HEAD", base);
     let log = run_git(repo, &["log", &range, "--format=%h %s"])?;
     if log.trim().is_empty() {
-        return Err(GitxError::Other(format!(
-            "当前分支相对基准 {} 没有新的提交",
-            base
+        return Err(GitxError::Other(tr!(
+            format!("当前分支相对基准 {} 没有新的提交", base),
+            format!("This branch has no new commits relative to {}", base)
         )));
     }
     let diff = run_git(repo, &["diff", &format!("{}...HEAD", base)])?;
@@ -4732,6 +4827,28 @@ mod tests {
         );
     }
 
+    /// 每一条解释在**两个档位**都要说人话：英文档不许夹进一个汉字，中文档不许退回英文。
+    ///
+    /// 逐条过，而不是挑几条样本：判据读的就是 `GIT_HINTS` 这一张表本身，所以「某一行
+    /// 忘了填英文半支」这种漏法当场就红——不需要有人记得这张表里一共有哪 30 条。
+    #[test]
+    fn every_git_hint_speaks_both_languages() {
+        for (needle, zh, en) in GIT_HINTS {
+            let stderr = format!("fatal: {needle} (while doing something)");
+            {
+                let _g = crate::lang::scoped(crate::lang::Lang::En);
+                let out = explain_git_error(&stderr);
+                assert!(out.contains(en), "英文档「{needle}」没端出那句英文：{out:?}");
+                assert!(!crate::lang::has_han(&out), "英文档「{needle}」的解释里还有汉字：{out:?}");
+            }
+            {
+                let _g = crate::lang::scoped(crate::lang::Lang::Zh);
+                let out = explain_git_error(&stderr);
+                assert!(out.contains(zh), "中文档「{needle}」没给出中文解释：{out:?}");
+            }
+        }
+    }
+
     #[test]
     fn git_failures_are_explained_in_chinese_and_keep_the_original() {
         let out = explain_git_error(
@@ -4952,6 +5069,11 @@ mod tests {
         git(&p, &["checkout", "-q", "-"]);
         git(&p, &["branch", "-D", "side"]);
         git(&p, &["fetch", "-q", "origin"]);
+        // Turn off git's own "branching off a remote branch implies tracking" default.
+        // Without this the `--track` flag cannot be killed by removing it — measured
+        // 2026-10-30: dropping `--track` left this test green because the machine default
+        // had already set the upstream. With it off, only the flag can set one.
+        git(&p, &["config", "branch.autoSetupMerge", "false"]);
         assert!(!branches(&p).unwrap().iter().any(|b| b.name == "side"), "夹具该没有本地 side");
 
         checkout_remote_branch(&p, "origin/side").unwrap();
@@ -4965,7 +5087,9 @@ mod tests {
     }
 
     /// A local branch of that name already answers the click. Repointing it at the remote ref
-    /// would move a branch the user may not have wanted touched, so the existing one wins.
+    /// would move a branch the user may not have wanted touched, so the existing one wins —
+    /// and so would rewriting its upstream: the row clicked names a commit to stand on, not a
+    /// tracking relationship to change.
     #[test]
     fn checking_out_a_remote_ref_reuses_the_local_branch_of_that_name() {
         let (_d, p) = init_repo();
@@ -4986,9 +5110,26 @@ mod tests {
         git(&p, &["branch", "-D", "far"]);
         git(&p, &["branch", "side", &local_head]);
         assert_eq!(other, run_git(&p, &["rev-parse", "origin/side"]).unwrap().trim(), "夹具自己没生效：远端那条 ref 没建起来");
+        // 本地那条 `side` 挂的是**另一个远端**（`up`）。点 origin/side 只该把人挪过去站上去，
+        // 不该顺手把上游改写成 origin——那是用户自己配的追踪关系。
+        let up = tempfile::tempdir().unwrap();
+        let u = up.path().to_str().unwrap();
+        git(u, &["init", "-q", "--bare", "."]);
+        git(&p, &["remote", "add", "up", u]);
+        git(&p, &["push", "-q", "-u", "up", "side"]);
+        assert_eq!(
+            run_git(&p, &["rev-parse", "--abbrev-ref", "side@{upstream}"]).unwrap().trim(),
+            "up/side",
+            "夹具自己没生效：本地 side 的上游没挂到 up 上"
+        );
 
         checkout_remote_branch(&p, "origin/side").unwrap();
         assert_eq!(status(&p).unwrap().branch, "side");
+        assert_eq!(
+            run_git(&p, &["rev-parse", "--abbrev-ref", "side@{upstream}"]).unwrap().trim(),
+            "up/side",
+            "复用已有本地分支时把它原本的上游改写掉了（点一下切分支不该动追踪关系）"
+        );
         assert_eq!(
             run_git(&p, &["rev-parse", "HEAD"]).unwrap().trim(),
             local_head,
