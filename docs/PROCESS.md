@@ -2410,9 +2410,11 @@ Current+分离→All、Current+在分支→Current、All+分离→All、**Rev+�
 
 **改了什么**
 
-- `gen-icon.mjs`：`SIZE 512 → 1024`，像素常量按 `K` 等比放大
-- `assets/icon.png`：首次生成并入库（1024×1024 RGBA，112 KB）
-- `src/ui/icon.rs`：`include_bytes!` + `png` 解码，附两条判据；`main.rs` 接 `with_icon`
+- `gen-icon.mjs`：`SIZE 512 → 1024`，像素常量按 `K` 等比放大；再加 `ART = 824/1024`，
+  把整幅造型（底板 + 字 + 光晕）缩进 macOS 的图标网格，四周各留 100 的透明边——
+  满幅画的图标在 Dock 里会比别人**大一圈**（用户 2026-10-26 反馈）
+- `assets/icon.png`：首次生成并入库（1024×1024 RGBA，109 KB）
+- `src/ui/icon.rs`：`include_bytes!` + `png` 解码，附三条判据；`main.rs` 接 `with_icon`
 - `src/ui/mod.rs`：`VERSION` 常量（`CARGO_PKG_VERSION`）
 - `src/ui/app.rs`：状态栏最右常驻 `v0.0.1`，仓库路径让出位置
 - `scripts/bundle-macos.sh`：`.app` + `.icns` + `Info.plist` + ad-hoc 签名 + `ditto` 打 zip
@@ -2427,6 +2429,9 @@ Current+分离→All、Current+在分支→Current、All+分离→All、**Rev+�
   变异：把底板改成整幅不透明 → 四角那条红（这条防的是「Dock 里方角」）。
 - `geometry_tests::the_status_bar_shows_the_package_version`：`v0.0.1` 贴右缘，**有仓库与空态各验一次**。
   变异：删掉状态栏那一段 → `text_rect` panic；把文案硬编码成别的串 → 找不到。
+- `ui::icon::tests::the_icon_leaves_a_transparent_margin_for_the_dock`：沿中心横线扫不透明像素，
+  左右透明边各 ≥80（1024 上实测 99）。变异：把 `ART` 改回 1（满幅）→ 0，红。
+  这条是「Dock 里大一圈」的回归闸，光有「四角透明」那条挡不住它。
 
 **仍然没看到过的**
 
@@ -2439,3 +2444,585 @@ Current+分离→All、Current+在分支→Current、All+分离→All、**Rev+�
 - **`.icns` 的 Retina 档**是从 1024 缩出来的，`iconutil` 会不会对 `512@2x` 再做一次缩放没量过；
   Finder 里看过一次，Dock 里没有逐尺寸比对。
 
+---
+
+## 历史列表补回提交号 + 差异区右键复制（2026-10-26）
+
+用户反馈两条：**「历史记录页面没有 hash 值」**、**「文件改动明细，选中了不能右键复制」**。
+
+**改了什么**
+
+- 日志列从四条回到**五条**：图 48 | **提交号 66** | 提交信息（弹性）| 作者 96 | 日期 78。
+  提交号用等宽 11px `TEXT_MUTED`——它是指认坐标，不跟正文抢。虚拟行（未提交）那一格留空。
+  表头加回「提交号」，列边线从三条回到四条（236 / 302 / 876 / 972）。
+  S6-4 删掉这一列的理由是「筛选条能搜前缀、右键能读全号」，但用户要的是**一眼看得见**。
+- 差异区加了容器级右键菜单（`container_context_menu`）：`文件路径` / `整份差异` / `提交号`
+  （后两项按当前目标有没有值启用）。差异正文是 painter 画的，egui 的选中-复制那套接不上，
+  所以是「整块差异都能右键复制」，不是「先选中一段再复制」。
+
+**判据**
+
+- `every_log_column_starts_at_its_own_header` 扩成五列，钉死 248 / 314 / 888 / 984 与
+  列宽字面值 `(48, 66, 96, 78)`——只比「加减后的和」会把改列宽同时改内缩的变异放过去。
+- `the_status_bar_...` 之外新加 `the_diff_pane_copies_the_whole_patch_from_its_context_menu`：
+  真右键、真点菜单项，从 `platform_output.commands` 里读 `CopyText`，断言含增删两行。
+  变异：把菜单挂到滚动区外面 → 右键点正文时 `container_contains_pointer` 为假，找不到菜单项。
+
+**没看到的**：差异区**选中一段文字**再复制仍不支持（painter 绘制的文本没有选区），
+要做得把差异行换成 `Label` 并接管选区，那是另一批的量。
+
+## 首页 tab + 侧栏收口（2026-10-26）
+
+用户三条：**首页稍微带点 B**（详细 B 留给 provider，针对 GitHub 项目）、**去掉左侧栏「搜索」**、
+**侧栏 origin 默认展开分支、默认不超过 3 个**。
+
+**决定与依据**
+
+- 首页走 A+B 结合：主体是仓库列表（A，打开/克隆 + 书签卡），补一小块 provider（B）。
+  详细 B（PR / CI）当前做不了——代码里没有 HTTP 依赖，provider 只到「拼 `ApiRequest`」。
+  所以这一批只摆**认得出的平台 + `owner/repo` + 在浏览器打开**，一个按下去没反应的空壳都不放。
+- 首页是**整页**，不是侧栏里的一列：侧栏 / 日志 / 暂存带讲的都是「当前仓库」，
+  而首页面前还没选仓库。顶栏与状态栏保留。
+- 「首页」tab 固定在顶栏最左，排在所有仓库 tab 之前；点仓库 tab 或 `open()` 即离开首页。
+  `Gitx::new` 的落点是首页，恢复上次仓库时由 `open()` 翻走。
+- 侧栏「搜索」那一行与日志条右端的「搜索」小按钮指向同一档，用户嫌重复 → 删侧栏那行，
+  入口只留日志条右端。
+- `origin` 默认展开；每个远端默认只露 3 条分支，第 4 条起折进「还有 N 个分支」，
+  点一下整组摊开。初值走 `default_remote_open()`，和 `default_scope()` 同一招——
+  无头夹具读不到构造函数，默认值必须有一个两边同源的函数可读。
+- 顺手修用户上一轮报的「差异区选中文字、右击后选区没了」：`container_context_menu` 的
+  容器响应原先注册在滚动区**之后**，后注册的那一格抢走整块差异的 hover；
+  `LabelSelectionState` 在右键按下时用「指针下面有没有标签悬停」判断「是不是点到别处」，
+  抢走 hover 等于把选区清掉。把容器响应前移到滚动区之前即可（容器判据只看 rect）。
+
+**改了什么**
+
+- `Gitx.home`：首页态；`home_page()` 画标题 / 打开与克隆 / 仓库卡 / 代码托管；
+  `home_repo_card()` 是整卡可点、54pt、圆角 8、当前仓库铺 `ACCENT_SOFT` 的白底卡；
+  `provider_badge()` 是平台药丸。正文 720pt 居中、顶部 32pt。
+- 首页的居中不用 `horizontal + add_space`：`ScrollArea` 会继承父布局，塞进横向布局后
+  整页内容横着排、全部叠在同一列 y 上（第一版实测每块文字 y≈70）。改成 `CentralPanel`
+  自己的左右内边距。
+- 顶栏第一格改成 `HOME_TAB`；仓库 tab 的选中态在首页时全部为假。
+- 侧栏删「搜索」行；日志条右端保留「搜索」按钮。
+- `remote_open` 初值走 `default_remote_open()`；新增 `remote_all` 状态、`Intent::toggle_remote_all`，
+  并在 `land()` 里把此前从未被消费的 `toggle_remote` 一并接上（点远端行现在真的开合）。
+- 差异区容器响应前移（上面那条）。
+
+**判据**
+
+- `the_home_tab_opens_the_repo_list_and_a_card_goes_back`：真点「首页」→ 首页出现
+  「打开仓库…」与仓库路径、侧栏「文件状态」消失；真点卡上的 `/other` → `home=false`、仓库换过去。
+- `the_home_page_names_the_github_project_of_the_open_repo`：GitHub 远端 → 「代码托管 / GitHub /
+  acme/app / 在浏览器打开」四块都在；换成 gitlab.example.com → 整块不画。
+- `the_origin_is_open_before_anyone_clicks_it`：`remote_open = default_remote_open()` 后，
+  不点任何东西，`origin/topic-1..3` 的尾巴就在帧里。
+- `a_remote_shows_three_branches_until_the_rest_is_asked_for`：5 条时只看得到前 3 条 +
+  「还有 2 个分支」；真点收口 → `remote_all = ["origin"]`、5 条全出、收口消失。
+- 顶栏两处旧锚点（「红绿灯下面第一枚 tab 在 103」「幽灵 tab 从 92 起」）改成
+  「首页在仓库 tab 左边」与「胶囊包住自己那枚文字」——首页插在最左之后，92 那个数不再属于仓库 tab。
+
+**没看到的**
+
+- 差异区「右键不清选区」这一条**没有补跨帧判据**：要在同一个 `Context` 里拖选、右键，
+  再读 `LabelSelectionState::has_selection()`；这一批先修路径，判据记在这里。
+- 首页代码托管只认**当前仓库快照**的远端：书签里没打开的仓库不显示平台（那要为每个仓库跑
+  `git remote`，不能在帧里做）。PR / CI 的真实数据要等 provider 面板接 HTTP。
+- 首页在窗口地板 394 高时只露出标题与按钮，仓库卡要滚——没有专门的「矮窗首页」判据。
+
+## 看板读半场：第一条真 HTTP 通路 + 左栏整栏替换（2026-10-27）
+
+用户两条：继续推进 DESIGN 落地（含英语），以及看 Pingboard 那张看板给 provider 的启发——
+**provider 可以替换左侧视图**、可以不克隆直接远程操作、每个 PR 一行、一句话说明它卡在哪、
+上次看过之后有变化的亮蓝点。追问之后拍定：**切到看板时整个左栏换成 PR 列表**，批次顺序与
+写操作范围「看情况处理」。
+
+**决定与依据**
+
+- 顺序：**先读半场，i18n 放最后**。看板要新增十来条状态文案，先做 i18n 等于同一批文案翻两遍。
+  写半场（Run CI / 更新分支并重跑 / 重跑失败任务 / 合并）在读半场站稳后再接——四个全是写操作，
+  合并还得先定确认档位。
+- provider 层**只到拼 `ApiRequest`** 这个边界不动，发送单独开一层 `net::execute`。
+  好处：请求拼装与响应解析继续由 provider 的 fixture 判据守着（不连网），`net` 那层只测薄封装
+  （非法请求头在开 socket 之前拒绝、错误体截成 300 字给 toast）。
+- `ureq = "2"`：阻塞、rustls、不用起 tokio。只在后台线程调用，一帧里绝不碰。
+- 状态一句话从 `mergeable_state` 翻（GitHub 列表自带）；**Gitee 列表没这一格 → 留空串**，
+  退成「状态还没算出来」，不猜。CI 那一档需要第二个端点，本批不做。
+- 看板**整栏替换**而不是在大纲里插一段：插一行只撞得出「这一行点得动吗」，替换整栏撞得出
+  「栏里那些组确实不画了」。侧栏旧判据量的是**相对行距**（标签→远端→已贮藏），所以新画的东西
+  必须由**新判据**钉住——「旧套件没红」不算证据。
+- 「看过」按 `pr_seen_<provider id>_<owner>_<repo>` 存库、进看板时读回，判据是
+  `seen[号] != pr.updated`。不这么做的话每次切回看板都满屏蓝点，那枚点就没意思了。
+  读不懂的记录当**没看过**（同 `flag()` 那条规矩）。
+- 点开 PR 走 `OutputCommand::OpenUrl`，不走 `std::process::Command("open")`：命令队列无头量得到，
+  跑测试也不弹浏览器（和 `CopyText` 那一招同源）。
+- 没令牌 / 认不出托管 = **不发请求**，当场把原因写在栏上；「没有行」分四句（在飞 / 失败 /
+  真的没有 / 还没取），第四句是「有行但被筛选框滤掉了」——底置那格筛选框在看板档必须真筛，
+  不然它是个看得见的假控件。
+
+**改了什么**
+
+- 新增 `src/net.rs`（`pub mod net;` 进 lib）+ `Cargo.toml` 的 `ureq`。
+- `models::PullRequest` 加 `mergeable_state`；`provider::pr_status()` 把 state/draft/
+  mergeable_state 翻成一句话（9 档具名 + 兜底），GitHub/Gitee 各自解析这一格。
+- `state.rs`：`Prefs.tokens` + `KEY_TOKEN_PREFIX` + load/save；`PrefPage::Hosting`；
+  `Board { host, repo_ref, prs, loaded, fetching, error, seen }` + `seen_key()` / `is_new()`；
+  `Gitx` 加 `provider_tokens / board_open / board / board_seq / board_open_url`；`Msg::PullRequests { seq, prs }`。
+- `app.rs`：`show_board()`（认 provider + 读回看过 + 取数）、`fetch_board()`（早退不建线程；
+  否则起线程 `net::execute` → `parse_pull_requests`）、`open_pull_request()`、
+  `board_status_color()`；`land()` 接 `toggle_board / refresh_board / open_pr`；`poll()` 落
+  `Msg::PullRequests`（认 `seq`）并把 `board_open_url` 刷给 egui；`Msg::Loaded` 里换仓库时重挂看板；
+  `sidebar()` 的看板分支（`‹ 仓库` / 栏头 + 刷新 / PR 行 / 四句空态），行上带**原始下标**
+  以配合筛选。
+- `widgets.rs`：`board_pr_row()`；`card_field(..., secret: bool)`（令牌那格打码）。
+- 底置那格筛选框在看板档**接上真用途**（筛标题 / `#号` / 状态那句），行上带**原始下标**，
+  不然筛过一次之后点开的会是别的 PR；「有行但被滤掉了」另起一句，不混进「没有开放的 PR」。
+- 设置卡「代码托管」那一页（上一批做的界面）这一批补上判据：只给声明了 PR 能力的两家摆格、
+  填完三处都认账（屏上「已绑定」/ `app.provider_tokens` / 库），且**重开卡**还得念回那一份。
+- `theme.rs`：`BOARD_ROW_H 40` / `BOARD_LINE_H 20` / `BOARD_TITLE_FONT 12` / `BOARD_STATUS_FONT 11`；
+  顺手把 §3.1 里一直没落地的 `WARN_FG` / `WARN_BG` / `CONF_FG` / `CONF_BG` / `DANGER` 补上，
+  并让「进行中的操作」横幅按 `conflicts > 0` 分冲突/警告两档。
+
+**判据 + 反向变异表**（新 14 条：`cargo test --bin gitx` 216 绿、`--lib` 143 绿）
+
+| 判据 | 改坏什么 | 红在哪 |
+| --- | --- | --- |
+| `clicking_the_board_replaces_the_whole_sidebar` | `land` 里 `toggle_board` 两个分支写反 | 「点了「看板」但栏没换过去」 |
+| 同上 | 看板那一档整体不走（= 只在大纲上插一行「看板」） | 「换成看板之后，大纲那一行「工作区」还留在栏里」 |
+| `a_repo_no_host_can_work_out_says_so_instead_of_an_empty_list` | 认不出托管退成「没有开放的 PR」 | 「认不出托管却没写出原因」 |
+| `an_empty_board_says_which_kind_of_empty_it_is` | 四句合成一句 | 红在**在飞**那一格（「没写正在取」），不是最直观的那格 |
+| `every_pr_row_carries_its_own_one_line_status` | `board_pr_row` 里状态那格不画 | 「没有状态那句」 |
+| 同上 | 两格的矩形对调（状态画到标题上面） | 「状态写在标题上面了」 |
+| `the_status_line_is_coloured_by_what_blocks_it` | `"dirty" => TEXT_MUTED` | `left #8B949E / right #CF222E` |
+| `the_board_dot_marks_only_the_pr_that_moved_since_you_last_saw_it` | 每行都画点（`if is_new` → `if true`） | 「没新动静的 #12 也亮了蓝点」 |
+| 同上 | `Board::is_new` 恒 false | 「#13 那一行左缘没有落在 x=12 的蓝点：[]」 |
+| `clicking_a_board_row_remembers_it_and_asks_egui_to_open_the_pr` | `poll` 里不推 `OpenUrl` | 「交给 egui 的不是那一条的地址」 |
+| `the_board_reads_the_already_seen_marks_back_out_of_the_database` | `show_board` 不读库 | 「切走再回来，看过的那条又亮了蓝点」 |
+| 同上 | `open_pull_request` 不写库 | `expect` 那句「库里根本没有那个键」 |
+| `a_mangled_seen_record_falls_back_to_nothing_seen` | 坏记录那格退成「全都看过」 | 「读不懂的「看过」记录把蓝点钉死了」 |
+| `the_refresh_button_reissues_the_fetch` | 「刷新」只翻旗子、不重发 | 「栏上还挂着上一轮的旧错：这一轮根本没跑过」 |
+| `the_sidebar_filter_narrows_the_board_and_rows_keep_their_own_pr` | 筛选恒真 | 「滤掉的 #12 还挂在栏上」 |
+| 同上 | `enumerate()` 挪到 `filter()` 之后（行上带的是筛完的位置） | 「筛过之后点 #13 开的却是别的 PR」 |
+| `a_stale_board_reply_is_dropped_and_a_matching_one_lands` | 去掉 `seq != board_seq` 那道闸 | 「对不上号的旧回复被采纳了」 |
+| 同上 | 丢掉的回复也把 `fetching` 解了 | 「丢掉旧回复却把「在途」解了」 |
+| `a_failed_board_reply_clears_the_rows_and_shows_the_reason` | `Err` 分支不清 `prs`（旧列表留着装作没事） | 「取数失败却还画着上一轮的列表」 |
+| `the_hosting_page_gives_a_token_box_only_to_providers_that_can_pr` | 去掉能力过滤 | 「令牌格不是两格：[GitHub, Gitee, 阿里云 Codeup]」 |
+| 同上 | `prefs()` 里 `tokens: Vec::new()` | 「重开设置卡却写着「未绑定」」 |
+| 同上 | `save()` 往库里写空串 | 「没落库：下次启动又是「未绑定」」 |
+
+**这一批抓出的两条假绿**（都记下来，因为它们不会自己现形）：
+①「看板插在侧栏顶部」那件事**没撞红任何旧判据**——侧栏旧判据量的是相对行距
+（标签→远端→已贮藏），所以新画的东西必须由新判据钉住，「旧套件没红」不是证据。
+② `the_hosting_page...` 第一版断的是「卡上没有 `Codeup` 那一格」，可它的 `label()` 写的是
+「阿里云 Codeup」，`starts_with` 永远撞不上——把能力过滤删掉照样绿。改成**数总共有几格**
+（`== 2`）之后，同一次变异立刻红。名字前缀判据在自家 token 名字上翻车，这是第十五类假绿的
+一个新变体：**断「某样东西不在」时，先确认那个名字真的会对上**。
+
+
+**写判据时自己踩的两处**（这类错不会自己现形）：夹具 `shell()` 少填新字段是 E0063，编译期就红；
+`table` 里把 `""` / `"quarantined"` 这些**故意共用兜底句**的取值和 9 条具名状态混在一张表里断
+「两两不同」，是我的断言写错、不是代码错——拆成具名档 + 兜底循环两截才对。
+
+**四条门禁（整批跑一次）**
+
+`scripts/gates.sh` 全绿：核心层 143 例、无头壳 216 例（这批从 202 起 +14）、零警告构建、
+许可证与素材审计。
+
+第四条这一批**收紧了一次**，原因就在 `ureq` 身上：它拖进来的不是一条 MIT 依赖，而是一棵
+条款混杂的 TLS 子树——`rustls-webpki`、`untrusted` 是 ISC，`ring` 是 Apache-2.0 AND ISC，
+`subtle` 是 BSD-3-Clause，`rustls` 是 Apache-2.0 OR ISC OR MIT；`webpki-roots`（内置那份 CA
+根清单，我们不走系统钥匙串，所以它是唯一的信任根）是 **CDLA-Permissive-2.0**——那是**内容**
+开放条款，跟软件许可证不是一个体系。`ATTRIBUTION.md` 补了三行点名它们，脚本里原来那条只盯
+`rfd` 的检查随之换成**逐条扫 `Cargo.toml` 的直接依赖**：`[dependencies]` 块里的每一条、加上
+`[dependencies.epaint]` 那种拆开写的表头都认，`[dev-dependencies]` 不认；漏一条就红，
+报的话是「引进依赖=引进条款，就在这里补一行」。规则一跑就把本来就漏在表外的 `png` 0.18 揪了出来。
+反向变异：删掉 `ureq` 那一行 → `✗ 直接依赖 ureq 没在 ATTRIBUTION.md 里点名`，其余三条不动。
+
+**仍然没看到过的**
+
+- 真 HTTP **一条都没发过**：`net::execute` 只测了「非法请求头在开 socket 前拒绝」和错误体截断，
+  真取回一次 PR 列表、真看见 GitHub 那九档状态长什么样，**还没发生过**。
+  所以「看板在真账号真数据下能不能用」是空白，#25 那张黑屏截图也还没救回来。
+- 写半场四枚按钮没接；CI 那一档没接（要 `check-runs`）；Gitee 的 `mergeable_state` 只能退兜底句。
+- 「不克隆、纯远程」没做：看板仍挂在已打开的仓库上，账号 → 仓库列表那层入口不存在。
+- 看板**没有自动轮询**，也没有「多少秒前」的相对时间；栏头那个「几条 / 哪一本」只写了平台名，
+  没写 PR 计数。
+- 筛选框在看板档筛标题/#号/状态三样，**不筛作者**（Pingboard 那张表按作者分组是它的主用法）。
+- 英语（i18n）还没动：这一批新增的十来个词全走中文硬编码，接 `Lang` 时要一起进文案表，
+  判据也得改读常量——这是下一批的正题。
+
+
+## 英语落地 + 顶栏溢出收纳 + 分离 HEAD 那句实话（2026-10-29）
+
+上一批结尾那句「英语（i18n）还没动——这是下一批的正题」是这一批的正题。四件事一起落：
+**整份界面接上 `Lang`**、**§2 那条「窗口收窄时溢出收进 `»` 菜单」从「没实现」变成实现**、
+**分离 HEAD 那笔「chip 的字和实参不一致」的债结清**、**语言开关本身走一遍端到端**。
+最后一件红出来的那条死路（见第四节）是这一批唯一一处「功能写了、没接上」。
+
+### 一、i18n：一档偏好 + 377 处 `tr!`，档位是**线程局部**
+
+`src/lang.rs`（新，195 行）只有六个出口：`Lang{Zh,En}`、`set`、`tr!(中文, 英文)`、`spawn`、
+`scoped`、`has_han`。为什么是线程局部而不是进程级 `static`，`lang.rs` 顶上那段写了理由，
+抄一句到台账里，因为它决定了判据能怎么写：
+
+> 无头判据在一个进程里**并发**跑好几个外壳，一个把档位刷成英文，另一个的中文判据就莫名其妙红了。
+
+- `tr!` 只求**取用的那一支**，所以中文支里的 `format!` 在英文档根本不跑（不白烧分配）。
+- 主线程每帧开头 `shell()` 刷一次档位；后台线程**只能**从 `lang::spawn` 起——它把调用那一刻
+  的档位复制进新线程。忘了用 `spawn` 的线程退成中文，不会串成第三种语言。
+- 档位两处可见：外壳画字，和核心层替 git 编那句给人看的解释（`git.rs` 里 29 处）。
+- 默认中文，**没有「跟随系统」**：从 Finder 起来的 GUI 进程读不到可靠的 macOS 语言档。
+  这条落成 DESIGN 新增的 §3.6（不重编号，代码里几百处「DESIGN.md §N」锚点会集体失效）。
+
+判据三条，各管一种坏法：
+
+| 判据 | 问的是什么 |
+|---|---|
+| `the_english_shell_paints_no_chinese` | 把外壳**每一种状态**画一帧（`en_states` 30+ 帧、认出 800+ 段文字），扫每一段的每个码位。不对照文案表——400 多处 `tr!` 长在调用点旁边，表和调用点迟早对不上，而漏翻恰恰是「某一处没人记得改」 |
+| `the_english_copy_functions_say_no_chinese` | 帧扫不到的那批：**按下去、菜单打开、卡刚建好那一刻**才拼出来的句子，直接调现字的函数逐句问 |
+| `both_languages_paint_the_same_number_of_labels` | 两档画出的**文字段数**必须一样多。这条管的是「整格没画」——前两档只问「有没有中文」，英文版少摆一格照样全绿 |
+
+`EN_ALLOWED_HAN = ["中文"]`：语言选择器里那枚选项写的是它的母语名，翻成 "English" 反而让
+不会英文的人找不到切回去的那一格。**用整段相等而不是包含**——漏翻那句只要夹着别的字就照样红。
+夹具那一屏自己带中文数据（`PATCH` 的提交信息），所以扫描用的帧集是 `en_states()`（ASCII 数据），
+和中文判据共用的 `filled()` 分开：**「中文当数据」和「中文当漏翻」必须是两套夹具**，
+合成一套就是每条扫描判据永远自证为空。
+
+### 二、§2 顶栏溢出收进 `»`
+
+这条**本来就是这一批的入口**：`the_header_still_fits_in_english` 一直是红的（英文分支名长，
+11 枚按钮 + 6 枚 tab 在 860 地板上重叠），而 spec 早就写了收纳那一档、代码里没实现。
+上一批台账里那句「靠缩到 760 才撞顶着」说的就是它。
+
+收纳的规矩（拍板过的三条，DESIGN §2 那一格已补写）：
+
+1. **只收仓库 tab 那一串**——它是顶栏唯一无上限的一段（仓库想加多少有多少）。右侧那 11 枚
+   动作按钮有上限，实测在 860 装得下，所以不平铺收纳；「首页」和「＋ 添加仓库」是入口，
+   收进菜单等于把人关在外面。
+2. **收尾部连续一段**（前缀保序）。书签顺序是人的空间记忆，抽成 1、3、5 比少看几本更糟。
+3. **`»` 自己占一格预算**：`fit_header_tabs(widths, budget, more_w)` 先按预算贪心取前缀，
+   取不满就**再从 `budget − more_w − gap` 重取一遍**。写成「收纳不花钱」的话，`»` 会压住
+   右侧第一枚按钮——那正是这条判据要消灭的那个 bug。
+
+账在画之前算（纯函数），形状在帧里量（`band_texts` + `MIN_W` 下 10 枚长名字的夹具）。
+两条都要：纯函数钉不变量，帧钉「真的少画了、菜单里真的在那一本」。
+
+### 三、分离 HEAD 那枚 chip 说实话
+
+`scope_label_for(scope, detached)`：分离 + 「当前分支」这一档 → chip 写「分离 HEAD · 全部引用」
+（英文档「Detached HEAD · all refs」），**实参一个字节没动**（仍是 `--all`）。DESIGN §7 那行
+「代价没结清」随之改成结清。判据两头都钉：文案是那句、且筛选条那枚**真的走这个函数**
+（只测纯函数杀不掉「画的是另一份」）。
+
+### 四、语言开关端到端——第一次跑就抓出一条死路
+
+`the_language_segment_switches_the_whole_shell_and_persists`：真仓库 + 临时库，点设置卡里那格
+「English」，问五件事：档位变了 / 整屏换字（侧栏组标题、卡标题、那一格自己的标签）/
+**后台烤好的那句 hunk 头也跟着换成英文** / 库里落 `"en"` 且 `Prefs::load` 读回同一份 /
+点「中文」换得回去。
+
+它跑红在**第二件事**上，而红出来的是一条真 bug：`apply_prefs` 里那段「正开着的卡按新档重拼」
+读的是 `self.modal`，可卡在这一帧正被 `modal_layer` 开头的 `take()` 握在手里——那里永远是
+`None`，那段重拼**从没执行过**。症状正是用户最常撞的一屏：外壳全英文，只有那张设置卡的标题
+还写着「设置」两个汉字。修法是把重拼搬回**握着卡的那一层**（`apply_prefs` 返回「换过语言没有」，
+调用方按 `self.prefs()` 重拼一张、页签停在原页、然后 `return`，不再把旧 `m` 盖回去）。
+
+这件事记一句方法论：**「文案表有英文」和「开关拧得动」是两条判据**。前三条 i18n 判据全绿的同时，
+用户能用的那个入口是坏的；而它不是 i18n 那批的 bug（`tr!` 那批之前它就在那儿），是**没有一条判据
+从用户那条路走进去**。
+
+### 反向变异表（每条都真跑过，报的是它自己那一句）
+
+| 判据 | 变异 | 报的那句红 |
+|---|---|---|
+| `the_overflow_budget_is_spent_before_tabs_are_painted` | `fit_header_tabs` 恒 `(len, false)`（不收纳） | `left: (4, false)`；同时 `the_more_button_holds_the_repos_that_did_not_fit` 红在「地板宽 + 十枚长名字的仓库，顶栏却没画 `»`」 |
+| `nothing_overflows_while_everything_fits` | 恒 `(0, true)`（全都塞进菜单） | 三枚短名字的常态屏上出现了 `»` |
+| 纯函数那条 | 第二遍预算不扣 `»` 自己（收纳不花钱） | `left: (3, true) / right: (2, true)` |
+| `the_more_button_holds_the_repos_that_did_not_fit` | 菜单条目是死按钮（`hit = None`） | 「从 `»` 菜单点「repository-9-with-a-long-name」没把仓库换过去」 |
+| `the_more_button_is_not_a_tofu_box` | `MORE_GLYPH` → `✕`（U+2715，这份字体链里没有） | 「「✕」不在字体链里：顶栏那枚溢出按钮会画成豆腐块」 |
+| `the_scope_chip_says_what_a_detached_log_actually_queries` | `scope_label_for` 那个条件恒假 | `left: "当前分支"`——「分离时那一档查的是全部引用，chip 不许再写「当前分支」」 |
+| 同上 | 筛选条绕过 helper，直接 `scope_label(&self.scope)` | 「分离那一帧的筛选条没换成实话」（纯函数那半照绿，证明这两半是两条腿） |
+| `the_language_segment_switches_the_whole_shell_and_persists` | `modal_layer` 不重拼，把手里旧文案的 `m` 盖回去 | 「卡标题没跟着重拼」，那一帧末尾挂着 `"设置"` |
+| 同上 | 重拼了但**不提前 return**（被后面 `self.modal = Some(m)` 盖回） | 同一句红。这条值得单列：这条腿有**两处**会把旧文案盖回来，只测一处是半条判据 |
+| 同上 | `Prefs::save` 少写 `KEY_LANG` 那行 | 「档位没落库」 |
+| 同上 | `Prefs::load` 忽略 `KEY_LANG`（恒 `Zh`） | 「读回来的和屏上的不是同一份」`left: Prefs { … lang: Zh … }` |
+| 同上 | 单向：`apply_prefs` 收到 `Zh` 时不写回档位 | 「点了中文档位没回来」`left: En` |
+| 同上 | 换档**整段不重取**（`open()` + `request(target)` 一起摘掉） | 「差异区那句 hunk 头还是中文」，那一帧里 `"块 1： 行 1-1（新 1-2）"`、`"全部已暂存变更"`、`"今天 02:07"` 混在一屏英文里——这就是「半截翻译」本尊 |
+| `the_english_shell_paints_no_chinese` | 一处 `tr!` 的英文半支写回中文（侧栏组标题） | 报「English 档还画着中文（42 句）」并点名是哪几帧——一处漏翻会同时出现在多帧，这是**期望行为**，不是判据太钝 |
+
+**跑过但没杀掉的**（比杀掉更要紧，因为它划出这条判据的边界）：只摘掉 `open()`、留着
+`request(target)` —— 判据照绿。也就是说 hunk 头那一腿真正钉住的是**差异重取**，而「重取整份
+快照」那一腿（后台按语言写死的药丸「超前 N 个版本」）**没有判据钉**：临时仓库没有远端，
+那枚药丸在这套夹具里根本不出现。要钉它得给夹具加一条 origin + 两枚超前的提交，记在下面。
+
+### 四条门禁（整批跑一次）
+
+`scripts/gates.sh` 全绿：核心层 149 例、无头壳 226 例、零警告构建、许可证与素材审计。
+核心层这批新加的是 `src/lang.rs` 里那五条（`only_the_two_written_keys_are_english`、
+`the_other_thread_keeps_its_own_language`、`scoped_gives_the_slot_back_even_when_the_body_panics`、
+`han_means_chinese_copy_not_just_anything`、`tr_picks_the_branch_for_the_current_language`）——
+它们钉的是**机制**（档位是线程的、`scoped` 连 panic 也归还、`has_han` 认的是汉字不是「非 ASCII」），
+屏上那些字由无头壳那几条钉。屏外的文案条数：`tr!` 在非判据代码里 **377 处**（判据里还有 8 处），
+`lang.rs` 顶上写「400 多处」是连同判据、注释里的例子一起数的整数说法。
+
+**并行跑时见过一次红**：`a_discard_needs_two_clicks` 在一次全量并行里红，单独跑绿，之后连跑
+三次全量全绿。没查出原因就继续跑等于把它当噪声放过——记在这儿，下次再红就按 flake 立案查
+（怀疑是多个测试同时写同一台机器上的临时 git 目录，但**没有证据**）。
+
+### 仍然没看到过的
+
+- **重取整份快照那一腿没判据**（见上面那条「跑过但没杀掉」）。补法：夹具里给一条真 origin
+  加两枚超前提交，让「超前 2 个版本」那枚药丸在中文档出现、换档后必须变成英文。
+- 「跟随系统」没做（理由在 §3.6）。真做的话要回答「Finder 起来读不到语言档时退成哪一档」。
+- 英文档从没在**真 HTTP 取回来的数据**上扫过：`en_states()` 用的是 ASCII 夹具。看板那十档
+  状态的英文句（`PrStatus::label(lang)`）只由核心层那条 `status.label(En)` 判据钉着，
+  没在真 PR 列表上看过一眼——这和下面那条「真 HTTP 一条没发过」是同一个空白。
+- 真 HTTP 仍然**一条都没发过**（上一批就记着，这批没动 `net`/`provider`）。
+- 看板写半场（CI 那一档 + 四枚动作）没接；不克隆、纯远程的账号入口没做。
+- `»` 的菜单只列**仓库名**，不带路径：两本同名仓库放一起时，名单里那两行长得一样。
+  真撞了再补，现在猜要显示什么路径是没依据的。
+
+## 右键重置当前分支 + 侧栏远端点开第三级 + 关窗崩溃（2026-10-30）
+
+用户两条诉求（原文）：「git历史记录，增加右键reset到当前分支；左侧远端可以点开，查看里面的分支，
+点击就切换到当前分支最新的提交」，之后又报「关掉gitx有crash」并附完整 macOS 崩溃报告。
+
+### 决定与依据
+
+**重置走一张三档卡，卡本身就是那道闸。** AskUserQuestion 两轮没答，按公告过的默认档做：
+`git reset` 的三档差别只有一件事——「你的改动还在不在」，一句话的确认框装不下这一句，
+而它恰恰是用户按下去之前唯一想知道的。于是 `Action::Reset { oid, mode }` 不进 `needs_confirm`
+（`src/ui/widgets.rs:1351`），卡上那排 `seg_tabs` 就是选择器，主按钮「重置分支」直接发。
+默认档取**混合**而不是 SourceTree 的硬：git 自己的默认也是 `--mixed`，而这一档什么都不丢。
+
+**核心层改成吃枚举而不是字符串。** 旧的 `reset(repo, oid, mode: &str)` 里那个 `_ => "--mixed"`
+的兜底是静默数据丢失的形状：调用点写错一个词，界面上标的是「丢弃改动」、git 跑的是「取消暂存」。
+换成 `git::ResetMode { Soft, Mixed, Hard }` + 一处穷尽 `match`（`src/git.rs:1185`），
+页签文案和 argv 同源于 `ResetMode::ALL`，「一个值两条出口只验一半」那族假绿在这里杀得掉了。
+
+**远端那一行点开 = 看它的分支；点分支 = 切到同名本地分支。** 不走 git 的 DWIM：本机 git 2.54 实测
+`git checkout side` 在两个远端都有 `side` 时直接 `fatal: 'side' matched multiple (2) remote tracking
+branches`（退出码 128）——用户点的是**那一条具体的 ref**，不该因为别处有个重名就失败。
+`checkout_remote_branch`（`src/git.rs:1239`）先 `show-ref --verify refs/heads/<tail>` 问本地有没有，
+有就只切过去（不动它的位置），没有就 `checkout -b <tail> --track <remote_ref>`。
+`<tail>` 按**第一个** `/` 切：分支名可以带斜杠，`fork/feat/login` 从最后一个切会剩下 `login`，
+界面说的和检出的就不是同一条。
+
+**关窗崩溃是上游的，不是我们的代码。** 报告上的签名 `_NSTouchBarFinderObservation invalidate` →
+`removeObserver:forKeyPath:` on `WinitView`，走在 `NSDisplayCycleFlush` 里，机型 MacBookPro17,1
+（M1，带 Touch Bar）。上游记在 winit #4728（master）/ #4764（0.30 维护分支，eframe 还住在那儿），
+两条都还 open（用 `curl https://api.github.com/repos/rust-windowing/winit/issues/4728|4764` 直接核过，
+不是搜来的）。绕法：`impl eframe::App for Gitx` 里 macOS 档 `on_exit` 直接结束进程
+（`src/ui/app.rs:3759`）。依据是读过的 eframe 收尾顺序 `egui_ctx.on_exit()` → `save()` →
+`app.on_exit()` → 收拾 painter → **才** drop 窗口，所以走到这一位时该存的都存完了，而崩的那一步
+（drop 窗口 + 下一轮 flush）整个不走。数据没有可丢的：偏好、书签、上次那本仓库全是一改就当场落库。
+
+### 改了什么
+
+- `src/git.rs:1185` `ResetMode` + `flag()` + `reset()`；`src/git.rs:1218` `remote_ref_tail`；
+  `src/git.rs:1224` `local_branch_exists`；`src/git.rs:1239` `checkout_remote_branch`。
+- `src/ui/state.rs:181` `Action::Reset { oid, mode }`、`:118` `Action::CheckoutRemote(全名 ref)`、
+  `:263` `Form::Reset { oid, mode }`、`:617` `Modal::reset`、`rows()` 给重置记 3 行正文、
+  `primary()` = 「重置分支」。
+- `src/ui/widgets.rs:1546` `reset_words(mode)` 一处 `match` 出 `(页签, 那句「这一档怎么办」)`、
+  `:1567` `reset_shares()` 三档共同那句、`:1574` `commit_menu` 挂 `menu_card`、
+  `:1195` `side_sub_row`（第三级，`SIDE_TEXT_X + SIDE_SUB_X`）、`Intent` 收
+  `toggle_remote` / `toggle_remote_all`。
+- `src/ui/theme.rs:166` `SIDE_SUB_X 12`。
+- `src/ui/app.rs`：后台线程那条 `match` 加 `Action::Reset`；`modal_layer` 加 `Form::Reset` 那一支
+  （页签 + 两句说明）；`sidebar()` 的远端那组给 `on_children` 画分支行（默认前 3 条，
+  第 4 条起折成「还有 N 个分支」）、左键改成交开/收起、地址那格挪到右键；`land()` 接住两枚
+  toggle（此前那两格从加进来就没人接，点一下什么都不发生）；`impl eframe::App` 加 macOS 档 `on_exit`。
+- `docs/DESIGN.md` §7 补五行：第三级缩进 12（含「不再落在 8/16 网格」的代价）、第三级的名字
+  按第一个斜杠剥前缀、点开一条分支干什么、筛选只筛远端名这一档限制、重置那几档与默认档。
+
+### 判据 + 反向变异表
+
+新增 **10 条无头判据**（`cargo test --bin gitx` 226→236）+ 核心层 7 条（`cargo test --lib` 142→149）。每条都真跑过变异。
+
+| 判据 | 变异 | 报的那句红 |
+|---|---|---|
+| `resetting_from_a_log_row_opens_a_card_and_touches_nothing` | 把 `commit_menu` 那行 `menu_card` 换成 `menu_item`（点下去直接发 `Action::Reset`） | 「右键重置没端出卡」；同时 `a_hard_reset_from_the_card…` 红在 `card_now` 那句「这会儿没有打开的卡」 |
+| 同上 | 那一行整条删掉 | `menu_pick` 自己 panic：「「起点」的右键菜单里没有「把当前分支重置到这条提交…」这一项」 |
+| `the_reset_card_shows_the_target_and_three_modes_with_one_explanation` | `Modal::reset` 的默认档 `Mixed` → `Soft` | 「默认那档（混合）的说明没画出来」，**并且** `a_mixed_reset_from_the_card…` 也红（索引里还有东西）——一条默认值的改动同时打中两处，正是想要的耦合 |
+| 同上 | 卡脚主按钮文案改掉 | 「主按钮不是「重置分支」」 |
+| `switching_the_reset_mode_swaps_only_that_one_sentence` | `modal_layer` 里 `reset_words(*mode).1` 写死成 `ResetMode::Mixed`（说明行跟着页签走那半截没了） | 「换成硬，硬那句警告没跟上」。**另外三条重置判据照绿**——只有这一条认得出「页签和下面那行说的是两件事」 |
+| 同上 | 换档不落回 `Form::Reset { mode }` | 「点了「硬」页签，卡里那一档还是别的」 |
+| `the_reset_card_is_tall_enough_for_the_four_lines_it_paints` | `rows()` 给重置记的 `n += 3` 改成 `n += 2` | 「重置卡高不是「标题 42 + 四行 128 + 卡脚 52」那一档」。**这条是被抓出来的**：先跑这条变异时上面六条重置判据全绿（短掉的 32pt 正好被卡脚那 52 吃进去，`card_has` 那句「文字在不在卡矩形里」照样找得着），于是补了这条钉卡高字面数 + 最后一行不许压进卡脚带子 |
+| `a_mixed_reset_from_the_card_keeps_the_work_tree_dirty` | `ResetMode::Mixed.flag()` → `--hard` | 「混合档把工作区改动弄没了」；核心层 `a_mixed_reset_unstages_but_leaves_the_work_tree_dirty` 同红 |
+| `a_hard_reset_from_the_card_throws_away_the_work_tree` | `ResetMode::Hard.flag()` → `--mixed` | 「硬档没把覆盖做完」；核心层 `a_hard_reset_throws_away…` 同红。**两条各杀各的**——这正是「一个值两条出口只验一半」那族的解法 |
+| `the_reset_card_…` 与两条端到端 | `needs_confirm` 加上 `Action::Reset { .. }`（多叠一张确认卡） | 「按了主按钮还压着一张卡（重置该由卡自己确认，不再叠确认卡）」 |
+| `the_branch_rows_under_an_expanded_remote_indent_one_level_right` | `SIDE_SUB_X` 12 → 0（第三级和第二级齐平） | `left: 24.0 / right: 36.0`，「展开后的分支行是第三级，该比第二级再缩 12」 |
+| `clicking_a_remote_row_collapses_its_branches_without_running_anything` | 远端那行的左键闭包清空（点一下什么都不发） | 「点一下远端没收起」 |
+| 同上 | 把「远端」那组的 `items` 换成远端 + 远程分支**摊平**的一份 | 「展开时把分支也数进「远端」那一组的计数里」。**只有计数那一句红**，可见行那三句照绿——摊平这种实现偏偏在「看不看得见」上完全正确 |
+| `clicking_a_remote_branch_row_checks_out_a_local_branch_that_tracks_it` | 摘掉 `--track` | `git ["config", "branch.side.remote"]：` 那条命令退出码 1（键不存在）。**第一次跑这条变异时判据照绿**：本机 `branch.autoSetupMerge` 的默认值替 `--track` 把事做了，于是夹具里显式把它设成 `false`，旗子才从「机器默认」变成「代码里那句」 |
+| 同上 | `checkout -b …` 换成 `branch …`（建而不切） | 「HEAD 没站到新分支上」；核心层那条同红：「点的是 origin/side，落到的却是 main」 |
+| `checking_out_a_remote_ref_reuses_the_local_branch_of_that_name`（核心层） | 复用那一路加一句 `branch --set-upstream-to=<点的那条>`（顺手把上游也"修好"） | 「复用已有本地分支时把它原本的上游改写掉了（点一下切分支不该动追踪关系）」——夹具把本地 `side` 挂在第二个远端 `up` 上，并先断言 `side@{upstream} == up/side` 才认这条路 |
+| `quitting_exits_before_the_window_is_dropped` | `on_exit` 里摘掉 `std::process::exit(0)`（交回 eframe 收尾） | 「关窗没有提前结束进程，而是交回 eframe 去 drop 窗口——带 Touch Bar 的 Mac 上那一下会 SIGABRT」 |
+
+### 四条门禁（整批跑完统一跑一次）
+
+`./scripts/gates.sh` 全绿：核心层 **149** 例、无头壳 **236** 例、零警告构建、许可证与素材审计。
+
+### 仍然没看到过的
+
+- **崩溃的修法只能目视。** 那条判据钉的是「`on_exit` 那一格写着提前结束进程」这个结构，
+  不是「关窗不崩」——后者要真窗口 + 真显示周期 + 一台带 Touch Bar 的 Mac。请重新构建后
+  直接关窗口确认一次（debug 或 `scripts/bundle-macos.sh` 那版都算）。
+- **硬档之后 reflog 找得回来**那句是话，不是判据：没有任何一条测过「硬重置之后仍能恢复」。
+  卡上那句话是 git 语义的陈述（对象不会立刻消失），要钉它得在端到端里跟一步 `reset --hard`
+  之后再 `reset --hard <oid>` 回来。
+- 重置那两条端到端只覆盖**从日志行进来**那一路。状态栏「回到 main」那类补救入口和重置之间
+  没有判据连着。
+- 「远端展开后按筛选」只钉了限制被登记（DESIGN §7），没钉将来怎么解。筛到只命中分支名时
+  那一组整个消失，用户会以为分支没了。
+- `checkout -b <tail> --track <remote_ref>` 在**已存在的本地同名分支上游写的是另一个远端**时
+  只切过去、不修正上游（DESIGN §7 写的是「同名本地分支存在时切过去、不重置」）。这一档
+  行为有没有判据？核心层 `checking_out_a_remote_ref_reuses_the_local_branch_of_that_name` 只钉了
+  「不挪位置」，没钉「上游保持原样」。
+- winit #4728 / #4764 合了之后这段 `on_exit` 该删。删的判据得等上游，先记在这儿。
+
+## 看板那两格补取 + 状态两轴 + 蓝点换成签名（2026-11-01）
+
+用户给的参考是 `~/Downloads/Pingboard.html`（纯远程看板），要的是一句话的诉求：
+「每天打开看板只需要扫一眼状态列——哪些卡在 CI、哪些可以合、哪些等我 Review，
+自我上次看过之后有变化的还亮一枚蓝点」。参考同时给了启发（provider 换掉整栏、
+不克隆也能操作）和四枚**动作**按钮（Run CI / 更新分支并重跑 / 重跑失败任务 / 合并）。
+这一批只做读的那一半，动作仍不摆。
+
+### 决定与依据
+
+**列表端点不够，得逐行再问两次。** 2026-10-31 拿真 token 手跑 curl 记下的事实：
+GitHub `GET /pulls` 里**没有** `mergeable_state`，也没有评审结论；`GET /pulls/{号}` 才给
+（当时那一条是 `unstable`）；`GET /commits/{sha}/check-runs` 里同一个 job 名会出现好几次
+（`notify` 三回），`id` 单调，而被跳过的 run 的 `completed_at` **比 `started_at` 还早**。
+三条事实分别定下三处写法：状态由「列表 + 每行两格」拼；`parse_checks` 同名只留 `id` 最大的
+那条、**绝不按时间戳排序**（`src/provider/github.rs:147`）；不碰 legacy `statuses`，两本账会
+double-count。认不出的 conclusion 一律算「还在跑」而不是「过了」——把没把握的报成绿比报成黄坏得多。
+
+**状态那句由两轴拼，不由一格翻。** `provider::pr_status(pr, ctx)`（`src/provider/mod.rs:308`）
+把 CI 轴和平台的合并格分开走，`StatusContext` 只带两个**不属于 PR 本身**的事实：这一行还在飞、
+同一个 job 在别行也挂着。两条顺序不许换：冲突在 CI 之前（有冲突时检查全绿也合不了），
+`blocked` 在 CI 之后（`speaks_for_itself` 故意不收它，`src/provider/mod.rs:299`）——检查没落地
+就说「等待评审」，万一是检查挡着呢，这句把活派给了错的人。`clean` / `behind` / `unstable` /
+`has_warnings` 那几格自己就把话说完了，不必等第二次请求。
+
+**两处和参考图不一致的自拍**（没收到不同意见，按公告过的默认档做，逐条登记 DESIGN §7）：
+草稿**压过**冲突（草稿挡住评审和合并，冲突只挡住合并，同属作者的回合时取更上游那一档）；
+「N 个失败 · 在别的 PR 上也挂」这句只走**正向证据**——别行还没取到检查不等于它是绿的，
+沉默不是绿；第一次打开这一栏**整栏不点亮**。
+
+**补取只给画得进来的行，且并发写死。** 列表一次给 50 条，逐行补两次就是 100 个请求；
+这一栏的第一承诺是「快」，不是「把速率预算一次打爆」。可见性用行矩形 ∩ `ui.clip_rect()` 判
+（`src/ui/app.rs:2858`），一帧最多 `ENRICH_IN_FLIGHT 6` 笔在飞（`:39`），剩下的下一帧补；
+结果按 `(号, head sha)` 进缓存（`Board::facts`），落回的那一笔**号和 sha 都要对上**才涂，
+对不上就丢、且**丢掉的那一笔不许解自己那格在途**。
+
+**蓝点的判据从 `updated` 换成签名。** 同一次实测：检查跑完不动 `updated_at`。
+只看它就等于「CI 从在跑到全绿」这件用户亲眼看见的事永远不点亮。
+`PullRequest::signature()` = `state | head sha | CI 档 | mergeable_state`（`src/models.rs:134`）。
+口径换了 = 旧账本里每条都「对不上」= 整栏蓝点，所以键直接从 `pr_seen_` 改成 `pr_seen2_`
+（`src/ui/state.rs:885`）让旧账本一次性作废；写迁移函数会把两种口径混进同一本账，比作废更糟。
+
+**`unknown` 不当结论落地。** GitHub 那一格是后台算的，第一次打经常还是 `unknown`；
+当结论落地 = 那一行挂着一句「还没算出来」直到用户手动刷新，而那恰恰是它**已经能回答**之后的样子。
+于是排一次 4 秒后的重问（`DETAIL_RETRY_SECS`）并靠 `ctx.request_repaint_after` 上闹钟
+（静止的窗口不会自己看表），最多试 `DETAIL_RETRY_MAX 2` 次才认下来。两个数都是拍的。
+
+**无头门禁不许连网——这一批差点破了。** `sidebar()` 一开始调 `enrich_rows()`，
+旧的看板夹具里那位假令牌 `"tok"` 就变成「每帧真起线程打 api.github.com」。三处收口：
+夹具撤掉令牌（`src/geometry.rs` 的 `board_from`）、`enrich_rows` 没有令牌就**一行都不问**
+（`src/ui/app.rs:586`）、要观察逐行尝试的判据改用一枚假 provider `NoUrl`（声明两格、请求一律拼不出）。
+顺带定下一条：没令牌时**不许**把「拼不出请求」记成「这一行取过了」，否则用户回头绑上令牌、
+按下刷新，那些行永久 blank。
+
+### 改了什么
+
+- `src/provider/mod.rs`：`Capability` 补 `PullRequestDetail` / `CiStatus`（`:27`），`Host` 上
+  那两个方法**默认 `Err("… 没有接 …")`**（`:128`、`:136`）——没接的 capability 是隐形，不是死按钮；
+  `StatusContext`（`:201`）、`PrStatus` 十四档（`:221`）、`speaks_for_itself`（`:299`）、
+  `pr_status` 两轴 cascade（`:308`）、`aggregate_ci`（`:171`，在跑 / 挂了 / 全过 / 一个都没有 四件事各一句）。
+- `src/provider/github.rs`：`pull_request_detail_request`（`:88`）、`parse_pull_request_detail`（`:104`）、
+  `checks_request`（`:125`）、`parse_checks`（`:147`，同名留最大 `id`、`cancelled`/`stale` 算失败）；
+  `capabilities()` 声明三格。Gitee / Codeup 只声明 `PullRequests` / 空（详情端点**没实测**，不猜）。
+- `src/models.rs:134` `PullRequest::signature()`。
+- `src/ui/state.rs`：`RowFacts`（`:823`，`detail` / `checks` / `detail_tries` / `retry_at`）、
+  `Ask`（`:836`）、`Board` 补 `facts` / `asked` / `seeding`（`:867`、`:869`、`:875`）、
+  `seen_key` 换代号（`:885`）、`is_new`（`:897`）、`outstanding`（`:909`，并发上限和「首访建账走完没」
+  用的是同一个数，所以只写一处）、`seed_seen`（`:925`）、`row_fetching`（`:939`）、
+  `failing_elsewhere`（`:951`）、`apply_facts`（`:965`）、`Msg::PrDetail` / `PrChecks`（`:1011`、`:1013`）。
+- `src/ui/widgets.rs:1341` `Intent::enrich`（这一帧画在可见区里的行下标）。
+- `src/ui/app.rs`：`enrich_rows`（`:567`，可见性 → 没令牌早退 → 额度 → 按 capability 拼 → 起线程）、
+  `open_pull_request` / `persist_seen`（`:674`、`:695`，两处写同一本账所以那段只写一份）、
+  `poll` 里 `PrDetail` / `PrChecks` 两支（`:1665`、`:1716`）、`retry_unknown_details`（`:1799`）、
+  列表落地后 `apply_facts` + `seeding` 初值、`land()` 末尾接住 `intent.enrich`（`:2507`）与关栏时
+  结束 `seeding`（`:2489`）、`board_status_color` 覆盖十四档（`:92`）。
+- `docs/DESIGN.md` §2.2：蓝点那行改成签名口径、状态那两句按两轴 cascade 重写、状态色补「大概无关」
+  那一档、补一行「每行再问两次」、把 §2.2 末尾「CI 那一档没接」改成「读的一半接了」；
+  §7 补/改八行（列表不给 `mergeable_state` 的实测、Gitee 详情未实测故不声明、`check-runs` 三条解析依据、
+  草稿压冲突、首访不点亮、`pr_seen2_` 代号、`net::execute` 拿不到速率头/ETag、`HttpMethod` 没有 `Put`/`Patch`）。
+
+### 判据 + 反向变异表
+
+新增/改写 **12 条无头判据**（`cargo test --bin gitx` 236→248）+ 核心层 **5 条**
+（`cargo test --lib` 149→154）。每条都真跑过变异；下面每一行都是实际输出，不是设想。
+
+| 判据 | 变异 | 报的那句红 |
+|---|---|---|
+| `only_the_rows_inside_the_viewport_enter_the_extra_fetch` | 可见性判据写恒真（干脆不做可见性，整屏一起补） | 「进补取名单的不是「窗口里那十行」：头顶的行没被补 / 窗口外的行也起了请求」 |
+| 同上 | 恒假（一行都不补） | 同一句红（左边是空名单） |
+| `an_enrich_reply_paints_only_the_row_and_the_version_it_answers` | 摘掉 `PrDetail` 那道的 sha 闸 | 「sha 对不上的旧回复被涂上了：新提交会挂着上一版的「可以合并」」`left: clean / right: blocked` |
+| 同上 | 摘掉 `PrChecks` 的 sha 闸 | 「sha 对不上的检查汇总被涂上了：`Passed { total: 9 }`」 |
+| `a_stale_enrich_reply_is_dropped_without_ending_the_wait` | 摘掉 `PrDetail` 的 `seq` 闸 | 「旧号的回复被采纳了」 |
+| 同上 | 摘掉 `PrChecks` 的 `seq` 闸 | 「旧号的检查汇总被采纳了：`Passed { total: 3 }`」。**这条原来没有判据**——两支 `match` 里的闸是分开写的，只验一边等于另一边没闸 |
+| 同上 | 丢掉的那一笔顺手 `asked.remove`（提前解在途） | 「丢掉的那一笔把自己的在途解了：剩 1 笔」。**这条也是补的**：原先只有 `row_fetching`，它是一行两格的 OR，单格被解根本分不出来 |
+| `the_facts_cache_is_repainted_on_a_refresh_and_dropped_when_the_sha_moves` | `apply_facts` 只按号匹配（不看 sha） | 「sha 不同的那一行被同一本缓存串到了」`left: dirty / right: ""` |
+| `the_first_visit_seeds_the_ledger_instead_of_lighting_every_dot` | `is_new` 去掉 `seeding` 那一挡 | 「首访、结论还在飞的时候就把每条都标成「有新动静」」2 vs 0。**这条是被抓出来的**：旧判据里列表落地那一帧正好 `outstanding()==0` → 当场建账，删掉 `seeding` 照样全绿；补上「两格还在飞」那一格才杀得掉 |
+| 同上 | `Msg::PullRequests` 里不给 `seeding` 初值 | 同一句红（没人建账、也没人压旗） |
+| 同上 | 关掉 `poll` 末尾那段建账 | 「首次打开没把这两行进账（下次进来会整栏都亮）」 |
+| 同上 | 建账不看 `outstanding()==0`（列表一落地就签） | 「两格还在飞就建账：会把「还没结论」那一版签进账本」 |
+| `clicking_a_board_row_remembers_it_and_asks_egui_to_open_the_pr` | 存 `pr.updated` 而不是签名 | `left: Some("2026-10-20T01:00:00Z") / right: Some("open\|0000012\|-\|clean")`，「点过之后没记下「看到这儿了」」 |
+| `an_unknown_mergeable_state_is_asked_again_before_it_becomes_the_answer` | `unknown` 当结论落地 | 「`unknown` 被当成结论落地了：这一行再也不会被看一眼」 |
+| 同上 | 去掉 `exhausted`（试够也继续排） | 「试够两次之后要把 `unknown` 认下来…」`left: None / right: Some("unknown")` |
+| 同上 | `retry_unknown_details` 里 `detail_tries < DETAIL_RETRY_MAX` 那一挡去掉 | 「试够的那一笔又被记了一次」3 vs 2。**夹具是自己摆的**（`tries = MAX` 且 `retry_at = Some`），因为正常流程走不出这个组合——这一挡是防「上限日后被改动」的保险，保险也得能被杀掉 |
+| 同上 | 返回值那一路的同一挡去掉 | 「试够的那一笔还排着下一次重绘」`left: Some(7.0) / right: None`（两路各一条，「一个值两条出口只验一半」在这里杀掉了） |
+| 同上 | `retry_at = Some(now)`（不等就重发） | 「没排到点重问」——闹钟当场自解，等于每帧一次 |
+| `the_scheduled_reask_arms_a_wakeup`（新增） | 去掉那句 `ctx.request_repaint_after` | 「重问没上闹钟（看到的重绘延迟：`[0.0, 0.0, …]`）——静止的窗口不会自己醒来」 |
+| `without_a_token_not_a_single_row_is_asked` | 去掉 `enrich_rows` 的没令牌早退 | 「没令牌也把行进过补取账（绑上之后那些行永久 blank）」 |
+| `a_provider_that_cannot_build_the_request_says_not_computed_instead_of_waiting` | 去掉「拼不出请求 = 这一行永远不会有结果，记成已经回过了」那一段 | 「问过的行要留痕」（`facts` 里压根没这一格：下一帧又拼一次、每帧都失败一次） |
+| `the_extra_fetch_caps_how_many_rows_are_in_flight_at_once` | `ENRICH_IN_FLIGHT` → `usize::MAX` | 「额度还满着就继续补下一行：一次刷屏把并发打满」 |
+| `a_failure_sharing_its_job_name_with_another_row_says_so` | `failing_elsewhere` 只问「别行也红」、不比 job 名 | 「别行挂的是另一个 job，名字都对不上就算成了旁证」。**这条是被抓出来的**：删掉名字比对，原来的三条断言全绿——「没有旁证」那一半摆的是 `Ci::NotFetched`，它杀的是「沉默算证据」而不是「同名才算」 |
+| 同上 | `board_status_color(CiFailedShared)` → `WARN_FG` | 「「大概与本次改动无关」那句还在报警」`#9A6700` vs `#8B949E` |
+| `the_quiet_statuses_are_all_secondary_grey` + 核心层 `every_status_has_its_own_one_line_sentence` | `speaks_for_itself` 把 `blocked` 也算「自己说得完」 | 「侧栏里没有「正在看它卡在哪」」；核心层 `left: AwaitingReview / right: Fetching` |
+| 核心层 `the_detail_endpoint_is_where_mergeable_state_actually_lives` | 详情那枚 URL 去掉 `/{}` 与 `number`（等于又问一次列表） | `left: ".../repos/acme/app/pulls" / right: ".../repos/acme/app/pulls/64900"` — 拼错这一格，界面上那句「可以合并」永远回不来，而请求照样 200 |
+| 核心层 `keeps_the_newest_run_per_name_and_refuses_to_guess_conclusions` | 去掉「同名按 `id` 取最新那版」的归约 | `("notify", Fail)` 顶掉了 `Pass`：旧那版（`id` 20）挂了、新那版（30）跳过算过，赢的却是旧的 |
+| 同上 | 认不出的 `conclusion` 兜底成 `Pass` | `("lint", Pass)`：那条夹具的 conclusion 是 `skipped`，谁也没说过它是绿的 |
+| 同上 | Fail 那一支摘掉 `"cancelled" \| "stale"` | `cleanup` / `deploy` 双双退回 `Pending`：「人取消了」被画成「还在跑」，那一行会一直等一个不会来的结论 |
+| 核心层 `aggregates_checks_without_losing_the_three_distinct_cases` | 空列表 → `Ci::Unknown`（而不是 `NoChecks`） | `left: Unknown / right: NoChecks`：「一个 job 都没配」和「还没取到」是两句话 |
+| 同上 | `pending` 那一支挪到 `failed` 之后 | `Failed { failed: ["a"] }` 顶掉了 `Running { … }`：跑完一个红的、别的还在跑，那行该说「正在跑」 |
+| 同上 | 去掉 `failed.sort()` | `["zeta", "alpha"]`：同一版提交每帧回来的顺序可能不同，那句文案会跳字 |
+
+### 四条门禁（整批跑完统一跑一次）
+
+`./scripts/gates.sh` 全绿（2026-11-01）：
+核心层 **154** 例、无头壳 **248** 例、零警告构建、许可证与素材审计全绿。
+无头门禁全程不碰网络：看板的夹具要么没有令牌，要么用 `NoUrl` 那枚假 provider。
+
+### 仍然没看到过的
+
+- **真网络一次都没打。** 所有看板判据要么没有令牌、要么用 `NoUrl` 那枚假 provider。
+  `/pulls/{号}` 与 `/commits/{sha}/check-runs` 的响应形状靠 2026-10-31 手跑 curl 的记录，
+  判据用的夹具是我照着那次记录写的——平台改了字段名，红的是解析而不是「有人告诉我」。
+- **等 4 秒真的自己醒来**没有目视确认过。判据钉的是那枚闹钟（observer 看到的延时是 4 秒），
+  不是「窗口在没人碰的时候重绘了一次」。请在真窗口里对着一条 `unknown` 的 PR 等一次。
+- **速率预算没量过。** `net::execute` 只回正文，拿不到 `X-RateLimit-*`，所以「一屏十行两次请求
+  × 每 4 秒一次重问会不会打爆 5000/小时」是算术，不是观测。
+- `updated_at` 在检查跑完时不动，那句是实测的话、不是判据：没有任何一条能量住平台不改口径。
+  真改了，代价只是蓝点多亮一次。
+- **Gitee / Codeup 永远停在「状态还没算出来」**，这是故意的（没实测就不声明 capability）。
+  只有 GitHub 的 `capabilities()` 有判据（`declares_its_capabilities_and_web_url`）；
+  哪天给 Gitee 接上详情，得先把真响应贴回这一节。
+- **滚动一次的请求数没钉。** 「滚出可见区再滚回来不该重问」靠 `(号, sha)` 缓存这条路径成立，
+  但没有判据在滚动这一路上数请求。
+- 四枚动作按钮（Run CI / 更新分支并重跑 / 重跑失败任务 / 合并）没接，`HttpMethod` 也还没有
+  `Put` / `Patch`；不克隆仓库的纯远程入口（账号 → 仓库列表）同样没做。

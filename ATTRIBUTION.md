@@ -27,6 +27,10 @@ MIT/Apache 授权范围内（条款在 `NOTICE` 里）：分叉出去请改名�
 | `eframe` / `egui` / `epaint` 0.37 | Emil Ernerfeldh 与贡献者 | MIT OR Apache-2.0 | 界面层本体，彩色 emoji 走 `color_fonts` feature |
 | `serde` / `serde_json` / `thiserror` / `chrono` / `tempfile` | 各自作者 | MIT OR Apache-2.0 | 序列化、错误类型、时间戳、测试临时目录 |
 | `rusqlite` 0.31 | Ryan Olson | MIT | 本地状态存储 |
+| `png` 0.18 | The image-rs Developers | MIT OR Apache-2.0 | 只解打包进二进制的那一张 `assets/icon.png`；它本来就在 `epaint` 的依赖树里，加一条直接依赖不多下一个包 |
+| `ureq` 2.12 | Alan Pearce 与贡献者 | MIT OR Apache-2.0 | 阻塞式 HTTP，无 async 运行时。`src/net.rs` 是全仓库唯一一条联网通路，只在后台线程里调 |
+| `ureq` 的 TLS 子树：`rustls`、`rustls-pki-types`、`rustls-webpki`、`ring`、`untrusted`、`subtle`、`zeroize`、`getrandom`、`base64` | 各自作者 | 多数是 MIT OR Apache-2.0，**但不是全部**：`rustls-webpki`、`untrusted` 是 ISC，`ring` 是 Apache-2.0 AND ISC，`subtle` 是 BSD-3-Clause，`rustls` 是 Apache-2.0 OR ISC OR MIT | 编进二进制，不单独打包 |
+| `webpki-roots`（那份内置 CA 根证书清单） | 由 `rustls-community` 从各 CA 的公开证书整理 | **CDLA-Permissive-2.0** —— 这是内容开放条款，不是软件许可证，跟上面几条不是一个体系 | 只作数据用；条款要求说明清单的来源，故单列一行。不用系统钥匙串，所以它是我们唯一的信任根 |
 | `rfd` 0.17.2（原生存盘/选目录面板） | 8pt Labs 与贡献者 | **MIT**（单许可，不是双许可） | 只在 `src/ui/` 里用，核心层不许碰；它的面板是**嵌套事件循环**，只能在 `eframe::App::ui` 里、egui 那一帧之外跑（见 `state::Dialog`） |
 | SQLite（`rusqlite` 的 `bundled` feature 编进来的 C 源码） | SQLite 团队 | **公有领域** | 不需要署名，也不设限制 |
 

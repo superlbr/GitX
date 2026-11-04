@@ -28,6 +28,25 @@ audit "要在 ATTRIBUTION 里说清「本机对照图不入库」" ATTRIBUTION.m
 audit "包要声明双许可" Cargo.toml 'license = "MIT OR Apache-2.0"'
 audit "新增的原生面板依赖要在 ATTRIBUTION 里点名" ATTRIBUTION.md "rfd\` 0.17.2"
 
+# 每一条直接依赖都要在 ATTRIBUTION 的那张表里有一行。为什么钉这一条而不是靠人记：
+# `ureq` 那一批同时拖进一棵 TLS 子树，里面有 ISC、BSD-3-Clause、CDLA-Permissive-2.0 三种
+# 条款，全都不是本仓库的 MIT/Apache——漏标一次就是替别人做了一个我们没资格做的承诺。
+# 读 `[dependencies]`（含 `[dependencies.epaint]` 那种拆开写的），不去读 Cargo.lock：
+# 子树由上面那行点名，逐条钉会把门禁变成锁死的清单，升级一次版本就得改一次脚本。
+deps=$(awk '
+  /^[[]dependencies[]]$/            {f=1; next}   # 只有这一行标题：块里的 `name = "1"` 才是依赖
+  /^[[]dependencies\.[a-z0-9_-]+[]]$/ {sub(/^\[dependencies\./, ""); sub(/\].*/, ""); print; f=0; next}
+  /^[[]/                             {f=0}          # 其它任何表（含 dev-dependencies）都不算
+  f && /^[A-Za-z0-9_-]+[ \t]*=/      {sub(/[ \t]*=.*/, ""); print}
+' Cargo.toml | sort -u)
+for dep in $deps; do
+  # 按「反引号 + 名字」找，认的就是那张表里的写法（`ureq` 2.12），也顺手挡住注释里顺口提到。
+  if ! grep -qF -- "\`$dep" ATTRIBUTION.md; then
+    printf '\033[31m✗ 直接依赖 %s 没在 ATTRIBUTION.md 里点名（引进依赖=引进条款，就在这里补一行）\033[0m\n' "$dep"
+    failed=1
+  fi
+done
+
 # `rfd` 的原生面板是**嵌套事件循环**，只在界面层的 `eframe::App::ui` 里跑。核心层一旦碰它，
 # 就等于让「跑一次 git」附带弹一个系统窗口——无头判据也立刻测不到那一层了。
 if grep -rl "rfd::" src/ 2>/dev/null | grep -v "^src/ui/" | grep -q .; then
