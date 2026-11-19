@@ -108,9 +108,9 @@ node gen-icon.mjs                 # 重新生成 assets/icon.png
 版本号只有一处来源：`Cargo.toml` 的 `version`。改完版本号，打一个同名标签推上去即可：
 
 ```bash
-# Cargo.toml: version = "0.0.2"
-git commit -am "bump version to 0.0.2"
-git tag v0.0.2 && git push origin main --tags
+# Cargo.toml: version = "0.0.3"
+git commit -am "bump version to 0.0.3"
+git tag v0.0.3 && git push origin main --tags
 ```
 
 `release.yml` 会先核对标签与 `Cargo.toml`（不一致直接停），再在 macOS runner 上
