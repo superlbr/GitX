@@ -3449,3 +3449,34 @@ GBK 路径名那档留着是为了「整本仓库读得动」。三个调用点 
 - **一次回滚之后差异区不会自己刷新到工作区。** 用户还在看那条提交的旧补丁——这是故意的
   （回滚的语义是「把这一块拿回工作区」，不是「切走」），但「回滚完再点一次文件行会发生什么」
   这条路径没有判据，也没人目视过。
+
+
+## 发布 0.0.3 撞上 `macos-14` 退役（2026-11-19）
+
+推完 `v0.0.3` 标签，发布流水线五秒内就 `cancelled` 了：`check-version` 那条 ubuntu job 绿，
+两个 macOS job **一步都没走**（`steps` 是空的、`runner_name` 是空的），`release` 那条 skipped。
+同一次 push 触发的门禁流水线里，ubuntu 的许可证审计绿，Rust 那条 macOS job 同样是「零步取消」。
+
+查 job 的 annotation 拿到原话：**`The configuration 'macos-14-arm64-us-default' is not supported`**。
+不是账单、不是并发组（`发布` 这条根本没有 `concurrency`），是 `runs-on: macos-14` 这个标签在
+2026-11 已经不被接受——job 在分配 runner 之前就被判死。v0.0.2 那次 `发布` 也是失败的
+（macOS job 只走到「打包 .app 与 zip」就红了，发布从来没成过），所以这一版之前没有任何一个 tag
+真正产出过分发包。
+
+**决定**：两个工作流（`gates.yml` 的 Rust job、`release.yml` 的 macos job）都从 `macos-14` 换成
+`macos-latest`——不钉一个会退役的版本号，交给 GitHub 维护「当前那一档」。矩阵仍是
+`aarch64-apple-darwin` / `x86_64-apple-darwin` 两个 target，在同一台 arm64 上交叉编译
+（Xcode SDK 自带双架构）。本地先按 CI 的同一条命令跑了一遍：
+`./scripts/bundle-macos.sh aarch64-apple-darwin` 全绿（release 编译 4m44s、`dist/GitX-0.0.3-aarch64.zip`
+8.3 MB、`codesign` ad-hoc 过了），所以「打包这一步本身」是可复现的，CI 那条只要 runner 能起来就能走完。
+
+标签要重指到带这条修复的提交：workflow 用的是**被打标签那个提交**里的文件，修在 main 上、
+标签还指着旧提交，等于没修。所以 `git tag -f v0.0.3` 再 force push 那一条。
+
+### 仍然没看到过的
+
+- **`macos-latest` 到底是哪一版没查。** 它现在是 macOS 15 还是 26、`sips`/`iconutil` 还在不在，
+  只有流水线真跑完才知道；本地那一遍跑的是这台机器的 macOS。
+- **x86_64 那条交叉编译没在本地验过。** 本地只打了 arm64；Intel 那一半在 CI 上是第一次真跑。
+- **v0.0.2 的失败原因没有日志。** 仓库是 public，但 Actions 的 job 日志要 admin 权限，没拿到原文；
+  这次只按「零步取消 + annotation」定因，`macos-14` 之前那次「打包 .app 与 zip」为什么红仍是空白。

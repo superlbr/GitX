@@ -33,7 +33,9 @@ jobs:
   macos:
     name: macOS（${{ matrix.target }}）
     needs: check-version
-    runs-on: macos-14
+    # 见 gates.yml 里同一条注释：`macos-14` 已退役（v0.0.3 那次 job 在分配机器前被取消），
+    # 改吃 `macos-latest`；两个架构都在这台 arm64 上交叉编译（Xcode SDK 自带双架构）。
+    runs-on: macos-latest
     timeout-minutes: 40
     strategy:
       fail-fast: false

@@ -38,7 +38,10 @@ jobs:
     # 而这个应用目前只在 macOS 上跑，所以整条门禁放在 mac runner 上，
     # 和本机 `./scripts/gates.sh` 判的东西一致。
     name: Rust（核心层 + egui 无头门禁）
-    runs-on: macos-14
+    # `macos-14` 已被 GitHub 停用：2026-11-19 打 v0.0.3 标签时，两个 macOS job 在分配
+    # 机器之前就被取消，注释写着「The configuration 'macos-14-arm64-us-default' is not
+    # supported」。用 `macos-latest`（GitHub 自己维护的那一档），不再钉死某个已退役的版本。
+    runs-on: macos-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
