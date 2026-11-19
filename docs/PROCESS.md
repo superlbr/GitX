@@ -3026,3 +3026,426 @@ double-count。认不出的 conclusion 一律算「还在跑」而不是「过�
   但没有判据在滚动这一路上数请求。
 - 四枚动作按钮（Run CI / 更新分支并重跑 / 重跑失败任务 / 合并）没接，`HttpMethod` 也还没有
   `Put` / `Patch`；不克隆仓库的纯远程入口（账号 → 仓库列表）同样没做。
+
+## 冲突合并看不见 + 线条断裂 + 两列能拖宽（2026-11-17）
+
+用户三条原话：「当前gitx，不能处理冲突合并，历史记录列表就显示不出来；ui里的图表，线条不连贯，
+需要改为连贯；图表、提交号列表，不能拖拽改变宽度」。第一条追问到更准的一句：撞冲突的场合是
+「**在 gitx 里点「合并」后冲突**」，而缺的是「**看不到冲突的提交**」。第三条问要拖哪条边界，
+拍的是「**图列 + 提交号列都能拖宽**」。
+
+### 决定与依据
+
+**冲突时少的是「那边的提交」，不是列表坏了。** 实测：`git merge` 撞出冲突之后，`git log`（只走 HEAD）里
+一条被合进来的提交都没有——那几条**只从 `MERGE_HEAD` 可达**，而 `MERGE_HEAD` 是 HEAD 的兄弟、不是它的祖先。
+所以缺的那一格不是渲染也不是取数时机，是 **argv 里多一条 rev**。于是 `Op` 补 `rev`（`src/models.rs:55`），
+读的是哨兵文件自己的第一行（`head_rev`，`src/git.rs:579`）；`RepoStatus` 投影成 `op_rev`（`src/models.rs:311`）；
+`commits_page` 多收一个 `pending`（`src/git.rs:924`）。读文件不 `git rev-parse`：后者又一次 fork，
+而 `op_at` 在同一次 `status` 里已经摸过这批文件了。`status()` 里「进行中」与「卡在哪条提交」这两格
+由**同一次** `op_at` 读出、两处投影（`src/git.rs:426` 那段）：分两次读 sentinel，中间那次操作正好结束，
+界面就会拿到「状态栏说没在合并、历史列表还带着那条 rev」。
+
+**`Scope::Current` 那一档必须补写 `HEAD`。** 平时它什么都不写、让 git 自己落到 HEAD；一旦外面多了第二条 rev，
+那个空位就没人补了，`git log <sha>` 变成「只看这条的祖先」——**加进那边、丢掉这边**，比原来更糟。
+这一挡不是想出来的，是「把 `log_args` 里 `match scope` 整块摘掉」那个变异抓出来的（见下面变异表）。
+
+**形状那一挡不许省。** `op_rev` 下一帧就进 argv：垃圾串回来一句 `unknown revision`，界面从
+「看不见冲突的提交」变成「历史列表整个空掉」。`head_rev` 只认第一行、要 ≥40 位纯十六进制
+（64 位 sha256 顺带装得下），其余一律 `None` = 按「没有进行中的操作」处理。
+
+**冲突那句解释在 stdout 上。** 实测 `git merge` 撞冲突时 `CONFLICT (content): …` / `Automatic merge failed; …`
+走的是 **stdout，stderr 反而是空的** —— 只读 stderr 的话，用户点「合并」撞出冲突，弹出来的是
+`git command failed: ` 后面一个字都没有，而那正是 `GIT_HINTS` 里「merge conflict」那一格该说话的时候。
+收成 `git_failure(stderr, stdout, code)`（`src/git.rs:18`）：先 stderr，空了读 stdout，两条都空报退出码
+（连退出码都没有时不许编一个数）。原文进了解释，所以用户拿它搜得到东西。
+
+**断线断在「并回」那一截，不是没连上。** 同一个提交被排在几条道上（日期序把分支交错 = 菱形）时，
+本行只认第一条道，其余那些道**当场释放**（`lanes[k] = None`）。释放本身是对的（旧 React 版从不释放车道，
+几百次合并后列宽爆了），漏的是**那条从上面走进本行的线**：上面还有线、这一行一个字都没有、下面也没东西接住，
+画出来就是「线条不连贯」。于是 `Seg` 补 `Join { from, to }`（`src/ui/graph.rs:25`），`layout_graph` 在腾道的
+同时记下哪几条道并回来了（`:64`、`:82`），排在 `Through` 之后、`Tail` 之前。
+
+**颜色跟着「还悬着的那一头」。** `Arm`（从本行圆点甩出去接别的道）按**落点**道上色，`Join`
+（从别的道一路走进本行圆点）按**来路**道上色；判据是「行的边界上不许换色」——线接得上却换了色，
+看着仍然是一截断的。这一条是**补出来的**：`Seg::Join` 落地后把两枚取色写反，旧判据一条都不红，
+说明原来那批只钉了「有没有这条线」，没钉「这条线是谁的」。
+
+**拖宽买的是车道和位数，不是把图放大。** `LANE0_X 12` / `LANE_W 10` 钉死：道距若跟着列宽缩放，
+同一本仓库在两个窗口宽度下会画出两张不同的图，那比越界更糟。固定道距顺带把「八爪合并 >4 道画出 48pt 列」
+那条老边界交给用户（拖到 96pt 装 8 道）。提交号列同理，拖宽是**多看几位哈希**，由 `revision_text`
+（`src/ui/theme.rs:193`）按列宽算位数；两个常数（`SHA_CHAR_W 6.6`、`SHA_PAD 8.0`）全部从 §2 已有的那一档
+「66 = 12 内缩 + 7 位 + 8 余量」反推，不新拍第三组数。规则两条：窄时**一位都不减**（短号的位数是
+「认得出这条提交最少要几位」，切一位就可能撞号——那不是列变窄，那是认错提交），宽时只从**完整号**往后补
+（补出一个 git 没给过的号更糟）。
+
+**落库只挂在松手那一帧，且 `done` 不能折进 `dx`。** 一次拖拽几十帧，写几十遍同一格没有意义，而中途的值还没夹稳。
+`ColDrag.done` 单独立一枚而不是判 `dx == 0`：最后一帧的增量本来就可能是 0，而 `drag_stopped()` 那一帧
+`drag_delta` 已经不再可靠——所以松开那帧只报「拖完了」、宽度留给前面那些 `dragged` 帧累加。
+
+**各列的上下限挡不住两列合谋。** 窗口地板 860 那档带宽只有 `860 − 188 = 672`，
+而 `图 320 + 提交号 240 + 作者 96 + 日期 78 = 734` 早就超了 —— 弹性那一格（提交信息）会被挤没。
+所以拖拽那一层还有第二道闸 `col_room`（`src/ui/theme.rs:179`）吃**带宽**，且**新拖的那一列说了算、另一列不动**：
+拖不动就是它到头了，而不是「我拖了它却不理我」。这一挡只能在壳里算，widget 那一层不知道带宽是多少。
+
+**两列宽度传一个 `ColW` 结构而不是两个 `f32`。** 这两格在每一处调用点都是成对读的（表头、数据行、拖拽回写），
+散着传早晚有一处传反。默认档就是 §2 的 48 / 66，所以没拖过的人排版和以前逐像素一样 —— 这不是说法是实测：
+改完之后旧的 248 例里**只有两条断言动过**（`a_rejoin_frees_the_lane_it_had_borrowed` 与
+`the_graph_never_escapes_its_column`，都是「`Seg::Join` 本来就该多出一截线」），其余 246 例 ——
+含 `every_log_column_starts_at_its_own_header` 里 248/314/888/984 那四枚字面量 —— **一字未改、全绿**
+= 拖拽是纯 opt-in 的。
+
+**命中条只压在表头那一行的高里。** 压在整带上就会吃掉行的点击，而选提交比拖列宽常用得多。
+6pt（`COL_SPLIT_W`）居中压在 §2 那条 1pt 竖线上，是「不用瞄准」的最低档；后两条边界（提交信息 | 作者、
+作者 | 日期）不归这里管 —— 那两格钉死，弹性只有提交信息那一格。
+
+### 改了什么
+
+- `src/git.rs`：`git_failure`（`:18`）+ `run_git` / `run_git_env` 两支接过去（`:43`、`:62`）；
+  `status()` 改走 `op_at` 一次读取、投影出 `repo_state` 与 `op_rev` 两格（`:429`、`:430`，
+  `state_at` 与它同源于此，哨兵读法全仓库只剩 `op_at` 一处）；`op_at` 三哨兵各带 `rev`（`:534`）、
+  `op_kind`（`:571`）、`head_rev`（`:579`）；`commits_page` 多收 `pending`（`:924`）；
+  `log_args` 那段 pending rev 排在 `--` 之前、并在 `Scope::Current` 时补写 `HEAD`（`:1060`）。
+- `src/models.rs`：`Op.rev`（`:55`）、`RepoStatus.op_rev`（`:311`），两处文档都写明
+  「这是历史列表能不能看见这场冲突的唯一依据」+「`None` 不许把垃圾串塞进位置参数」。
+- `src/ui/data.rs:97`：取列表时把 `status.op_rev` 递进 `commits_page`。
+- `src/ui/graph.rs`：`Seg::Join`（`:25`）、`layout_graph` 收集 `joins` 并排出（`:64`、`:82`）、
+  弯线抽成共用的 `bezier`（`:116`）、`graph_cell` 那两支的取色各带一句「悬着的那头是哪一个」（`:142`、`:147`）。
+- `src/ui/theme.rs`：`ColW` + `Default`（`:133`、`:139`）、四枚上下限（`:151`–`:154`）、`COL_SPLIT_W`（`:157`）、
+  `ColW::clamped`（`:161`）、`MSG_W_MIN`（`:173`）、`col_room`（`:179`）、`SHA_CHAR_W` / `SHA_PAD`（`:184`、`:186`）、
+  `revision_text`（`:193`）。
+- `src/ui/state.rs`：`impl ColW`（`:554`）—— 两枚键 `gitx_col_graph_w` / `gitx_col_sha_w`（`:555`、`:556`）、
+  `load`（`:560`，没库/没存过/存的不是数 → §2 默认档，再夹一遍防旧档越界）、`save`（`:572`，一次写两格）；
+  `Gitx.log_cols`（`:1106`）。没并进 `Prefs`：那一格是「偏好卡上真接得通的开关」，列宽不在卡上。
+- `src/ui/widgets.rs`：`ColEdge`（`:967`）、`ColDrag`（`:976`）、`header_row` 收 `cols` 并交回
+  `Option<ColDrag>`（`:985`，边界从 `rect.min.x + cols.graph` 量，命中条那段排在所有绘制之后 ——
+  `ui.painter()` 借 `&ui` 而 `allocate_rect` 要 `&mut ui`）、`log_row` 收 `cols`（`:203`），
+  提交号与提交信息两格从 `cols.graph` / `cols.sha` 起笔（`:245`、`:272`）。
+- `src/ui/app.rs`：起来时 `ColW::load`（`:150`、`:177`）、面板闭包里接住 `header_row` 交回的拖拽（`:3796`）、
+  两处 `revision_text`（`:3845`、`:3886`）、每帧回写 + 松手落库那段（`:3940`）。
+- `docs/DESIGN.md`：§2 LOG 那一行改成「图 48（可拖 48…320）| 提交号 66（可拖 48…240）… 6pt 命中条、
+  松手那一帧才落库、拖图列买车道 / 拖提交号买位数」；§3.3 补车道色取模与「一截线的颜色跟着还悬着的那一头走」；
+  §7 补七行（四枚档位 + `col_room`、`MSG_W_MIN 120`、`COL_SPLIT_W 6`、拖宽换来什么 ×2、
+  冲突报告在 stdout、`Op.rev` 与形状那一挡）。
+
+### 判据 + 反向变异表
+
+新增 **10 条无头壳判据**（`cargo test --bin gitx` 248→**258**）+ 核心层 **4 条**
+（`cargo test --lib` 154→**158**），另有**两条旧判据改写**（`a_rejoin_frees_the_lane_it_had_borrowed`、
+`the_graph_never_escapes_its_column` —— `Seg::Join` 让并回那一行本来就多出一截线，旧断言写的是修复前的形状）。
+下表 20 行 = **19 次变异**（每一次都是临时把源码改坏再还原、跑完贴回红字），
+其中两行是同一次变异红到的两条判据。「报的那句红」是**实际输出**（引号里的数字和字符串从终端抄的），不是设想。
+
+| 判据 | 变异 | 报的那句红 |
+|---|---|---|
+| `dragging_the_graph_boundary_widens_only_the_graph_column` | 回写里 `ColEdge::Graph` 那一支写成改 `sha`（拖错列） | 「拖了 40pt，图列宽从 48.0 只走到 48.0」，同时红三邻居：`column_widths_are_clamped…`「图列没夹在上限上 `left: 48.0 / right: 320.0`」、`dragging_a_column_boundary_persists…`「中途就没跟上手：图列 48.0」、`widening_the_graph_column…`「图列没拖到 96pt（48.0），下面判的是旧列宽」 |
+| 同上 | `header_row` 那条边界从 `rect.min.x + cols.graph` 退回写死 `COL_GRAPH` | 「提交号列的左缘没跟着往右走 40：248.0 → 248.0」；同一变异还红「顶到上限后提交号的左缘不在列边界上：248.0（应 520.0）」「命中条还留在旧边界 x=[236.0 95.0]，列宽已经到 96.0」——**边界、命中条、上下限三处各红一次** |
+| 同上（数据行那半） | 表头跟了、`log_row` 里那一格还钉在旧常量 | 「表头拖到 88.0 了，数据行的提交号还钉在旧列宽上（x=248）」。**这一族最容易漏的就是这种半截实现**，只有量画出来的字才抓得住 |
+| `column_widths_are_clamped_to_the_two_bounds` | 摘掉回写末尾那层 `.clamped()` | 「图列可以拖到比 §2 那 48pt 还窄：车道要被挤出列去 `left: -52.0 / right: 48.0`」（负宽 = 一路拖到屏幕外，`drag_delta` 是不封顶的） |
+| 同上 + `dragging_the_revision_boundary_widens_only_that_column_and_shows_more_hash` | 命中条只挂图列那一条边界（`ColEdge::Sha` 那条没挂） | 「提交号可以拖到装不下 git 默认那 7 位 `left: 66.0 / right: 48.0`」「拖了 60pt，提交号宽从 66.0 只走到 66.0」 |
+| `two_columns_together_cannot_squeeze_out_the_message_column` | 图列那一档的 `col_room(…)` → `GRAPH_W_MAX`（只留各列自己的上限） | 「图列在 860 的窗里没停在「提交信息还剩 120」那一档：拖到 320.0，该停在 312」。**这条判据是补的**：另外六条拖拽判据写完、变异跑过一遍之后，才想起问「两列一起顶到顶呢」——那一问抓出一个真 bug |
+| `dragging_a_column_boundary_persists_only_on_release` | `save` 从 `if d.done` 里挪出来、每帧都写 | 「「gitx_col_graph_w」在松手之前就落库了 `left: Some("72") / right: None`」 |
+| `the_revision_cell_never_cuts_the_short_id_and_extends_only_from_the_full_id` | 摘掉「短号本身 ≥ 位数就原样返回」那一挡 | `left: "abc123" / right: "abc1234"`：git 给的 7 位在 66pt 那一档被切成 6 位 —— 那一列本来就是给人认号用的 |
+| `widening_the_graph_column_buys_lane_capacity_for_an_octopus_merge` | 与上面「`header_row` 那条边界退回写死 `COL_GRAPH`」是**同一次变异**，这里是它红到的第三条判据 | 「命中条还留在旧边界 x=[236.0 95.0]，列宽已经到 96.0」：拖宽的**用处**（第 5 道以后不再越列）只有这一条端到端判据看得见 |
+| `every_line_that_enters_a_row_leaves_it_again` + `a_rejoin_frees_the_lane_it_had_borrowed` + `the_graph_never_escapes_its_column` | 腾道时**不记** `joins`（只留 `lanes[k] = None`） | 「菱形 + 两次合并：第 4 行行底是 `[0, 1, 2]`，第 5 行行顶却接住 `[0]`」「两次合并 + 两截并回，该有四条弯线 `left: 2 / right: 4`」「并回那一行要么还占着别的道，要么把它上面那两截线丢了」 |
+| 同上三条 | `joins` 收了、`Seg::Join` **不画**（`let _ = joins;`）= 用户报的那个 bug 本身 | 同一族红 —— 这一行就是「修复前长什么样」的直接复现，也是这三条判据的存在理由 |
+| `a_curve_is_coloured_by_the_end_that_is_still_hanging` | `Join` 那支取色 `stroke(*from)` → `stroke(*to)` | 「弯线悬着的那头在第 1 道（[210.0 276.0]），上的却是 `#09_69_DA_FF` 的色——行的边界上会换色，看着就是断了一截 `left: #09_69_DA_FF / right: #1A_7F_37_FF`」 |
+| 同上 | `Arm` 那支换成 `stroke(*from)`（两向对称，各杀一次） | 同一句红、坐标换成 [210.0 164.0]。**这条判据里还有一道 `assert!(down > 0 && up > 0)`**：上面两行「不记 joins / 不画 Join」时它先红「这一帧只出现了一种弯线（往下 2 条、往上 0 条），两种颜色的走法只验了一半」——没有这道闸门，「只验了一边」会伪装成全绿 |
+| 核心层 `a_conflicted_merge_puts_the_incoming_commits_in_the_history` | `status()` 里改成 `st.op_rev = None`（不投影） | 「MERGE_HEAD 在场时 op_rev 就该有值」；同一次壳层端到端也红「冲突的历史列表里没有正被合进来的提交：["这边的提交", "起点"]」 |
+| 同上 + `the_pending_rev_is_a_second_walked_rev_not_a_pathspec` | `log_args` 的 pending 那一块恒传 `None` | 「带 pending 的历史里没有「theirs」：["mine", "init"]」「当前分支那档没写明 HEAD：`["log", "--max-count=10", …, "--", "src/a.rs", …]`」——**argv 那层是唯一看得见「参数位置」的判据** |
+| 同上两条 + 壳层端到端 | `log_args` 里 `match scope` 整块摘掉（`let _ = scope;`） | 「带 pending 的历史里没有「mine」：["theirs", "init"]」＋「当前分支那档没写明 HEAD」＋「HEAD 那一侧少了「这边的提交」：["那边的提交", "起点"]」。**「加进那边、丢掉这边」就是 `Scope::Current` 那一挡的代价，这条红字是它唯一的证据** |
+| 壳层 `a_conflicted_merge_in_gitx_shows_the_incoming_commits_in_the_history` | `src/ui/data.rs` 取列表时不传 `op_rev`（直接 `None`） | 只有这一条红。**这一行是「两层都得有判据」的实证**：核心层 158 例全绿而界面照样看不见——那一格的价只在被接进 argv 的那一层结 |
+| 核心层 `a_malformed_sentinel_is_not_a_commit` | `head_rev` 去掉形状检查、直接 `Some(line)` | 「形状不对的一行（`"   \n"`）当成了提交号：下一帧它就进 argv，回来一句 unknown revision，界面上是历史列表整个空掉——比不显示更糟」 |
+| 核心层 `a_conflicted_merge_says_why_it_failed_instead_of_nothing` | `git_failure` 里 stderr 空时不读 stdout（`("", _) => ""`） | 「stdout 上那份冲突报告没进解释：git command failed: 」——后面一个字都没有，正是用户报第一条时看到的界面 |
+| 同上 | 三条 `git_failure` 口径（stderr 优先 / stdout 兜底 / 退出码）里，`("", "")` 那支的 `None` 分支偷偷 `format!("git 退出码 1")` | 「连退出码都没有时不许编一个数出来」（那条判据另外还钉了 `both = git_failure(b"real error", b"noise on stdout", 1)` = **两条都有时读 stderr**，顺序不许换） |
+
+方法论补两条：① **「颜色/归属」和「有没有」是两条判据**——`Seg::Join` 刚落地时，把 `graph_cell` 里那两枚
+`stroke` 换错方向谁都不红，这就是 `a_curve_is_coloured_by_the_end_that_is_still_hanging` 补进来的理由；
+② **一层绿不等于修好了**——`src/ui/data.rs` 那个变异只红壳层（核心层 158 例全绿），
+这一族「核心层 + 取数层 + 绘制层」的接线，每一层都得各留一条端到端。
+
+### 四条门禁（整批跑完统一跑一次）
+
+`./scripts/gates.sh` 全绿（2026-11-17）：核心层 **158** 例、无头壳 **258** 例、零警告构建、
+许可证与素材审计全绿。核心层那几条走的是真 `git` 二进制 + `tempfile` 里的真仓库（含真 `git merge` 撞冲突）；
+无头壳全程不碰网络。
+
+### 仍然没看到过的
+
+- **真窗口里没人用手拖过一次。** 判据钉的是事件序列（移到边界 → 按下 → 四帧移动 → 松开）之后的列宽、
+  表头竖线、落库那两格。两件事观察不到：① `CursorIcon::ResizeEast` 只在 `hovered()` 时设，
+  无头 `FullOutput` 里没有光标这一说；② 拖动过程中「跟不跟手、会不会闪」只有眼睛说了算。
+  一次真拖的账还欠着。
+- **没在真窗口里点过一次「合并」。** 冲突那三条走的是真 `git merge`（真二进制、真 `MERGE_HEAD`），
+  但界面那一步只到「取回来的历史列表里有那几条提交」，没人对着弹窗走完「点合并 → 撞冲突 → 列表里看到那边」。
+  `gitx_home` 那批截图实验做完之后就没再拍过。
+- **变基与遴选只走了合并那一路。** `op_at` 三写同构，`REBASE_HEAD` / `CHERRY_PICK_HEAD` 的 `rev`
+  由同一枚 `head_rev` 读出，但**真仓库里停在冲突上的变基只判了 `kind`/`step`/`total`**
+  （`op_reports_rebase_progress_and_leaves_merge_blank` 没问 `rev`），历史列表那一路端到端只验过合并。
+- **`SHA_CHAR_W 6.6` 是反推的、不是量的。** 它来自 §2 那一档「66 = 12 + 7 位 + 8」；字体换了或等宽
+  fallback 生效时位数会整体偏一格。判据钉的是 `revision_text` 的函数口径，钉不住字形宽度。
+- **两档上限是算出来的容量**：`GRAPH_W_MAX 320` = 第 0 道中心 12 + 30 道，`SHA_W_MAX 240` = 33 位；
+  没有任何真仓库在这两档下被打开过，`MSG_W_MIN 120`（列位，扣完内缩约 100pt 文字）更是自拍档。
+- **窗口拉宽之后不会自动回补。** `col_room` 夹的是**这一帧的带宽**：860 上被挤停在 312 的那一列，
+  把窗口拉到 1600 之后仍是 312，用户得再拖一次。没写「按带宽重夹一遍」是故意的——那会让列宽跟着窗口尺寸漂，
+  比钉住更难预测；但这个取舍对不对，只有真用一段时间才知道。
+- **形状那一挡在真仓库里大概走不到。** `status()` 第一步就是 `git status --porcelain=v2`，
+  真把 `MERGE_HEAD` 写成乱码，git 自己先报错，轮不到我们把垃圾串送进 `git log`。所以 `head_rev`
+  那一挡是**防御性**的（判据也只能合成一个临时 git-dir 来打它），不是「实测到会发生的形状」。
+- **`ColW::load` 的越界旧档没有判据。** 代码里那句「再夹一遍，免得旧版本存下的越界值把排版钉住」
+  是靠 `clamped()` 兜的，但没有一条判据拿「库里存着 999」走过一遍 load。`dragging_a_column_boundary_persists_only_on_release`
+  只验了「写进去的值夹稳」。
+- **`--all` 那一档撞冲突时把两边都带进来，顺序是 git 给的。** 判据只问「那几条在不在列表里」，
+  没钉「那边那几条排在哪个位置」；八爪合并 >4 道现在可以拖宽解决，但 >30 道（列宽顶格）仍是没人管的边界。
+
+
+## 内存这一批：先量，再砍，砍完各留一道结构闸（2026-11-17）
+
+用户的话只有一句：「另外，内存占用也要优化」。没有指定哪一块、没有目标数，所以这一批的第一步
+不是改代码，是**把「占大头的到底是谁」量出来**——量完的结论是「大头不在我们数据里」，
+于是这一批只动两处真付得起的地方，其余按证据登记成「知道、这批改不动」。
+
+### 决定与依据
+
+**先量，且量的是三个口径，不是一个。** `ps -o rss` 把共享的 `__TEXT` 也算进来（我们的二进制自己就几十 MB），
+`footprint` 报的 `phys_footprint` 才是 jetsam 拿来杀人的那一格，`vmmap --summary` 才看得到**是谁**占的
+（CG Image / Malloc Tiny / Malloc Small / Malloc Large + 活动分配数）。三个口径讲的是三件事，
+只报一个就会把「框架的账」当成「我们的账」去砍。静止态实测：常驻 RSS ~155 MB、`phys_footprint` 73…88.8 MB，
+而我们自己的堆静止时只有 ~8 MB——那 8 MB 里绝大部分是内嵌的 Noto CJK（8.3 MB 字体字节）。
+**结论先说清楚：这一批省下来的不是「155 MB 里我们的数据太多」，是两处能指名道姓的重复付费。**
+
+**第一刀砍图标，因为它在 mac 上换来的是零。** winit 0.30.13 在 macOS 的 `set_window_icon` 是**空函数**
+（`winit-0.30.13/src/platform_impl/macos/window_delegate.rs:1541`，注释写明「macOS doesn't have window icons」），
+Dock 上那张另有来源（`.app` 里的 `.icns`，`scripts/bundle-macos.sh` 拿同一张 PNG 切）。
+我们付的却是：解一次 1024×1024 的 PNG（4 MB RGBA）+ 把它常驻在 `ViewportBuilder` 的属性里。
+实测这一项占 `CG Image` **32.0M → 8.2M**。于是 `with_icon` 挂到 `#[cfg(not(target_os = "macos"))]` 后面
+（`src/main.rs:41`），`src/ui/icon.rs` 的 `PNG` / `app_icon` / `decode` / 那条 `use eframe::egui` 四处
+跟着同一条件走（`:9`、`:15`、`:20`、`:25`）——macOS 的产品构建里连那 8 MB PNG 字节都不必嵌进二进制。
+**这条是控制组量出来的**（见下表第三行）：只把图标挂回去、正文改造原样不动，`phys_footprint` 立刻从 55 回到 85 MB、
+`CG Image` 回到 32.0M，而活动分配数几乎没动（33 146 → 33 186）= 这一档涨的不是分配数造成的，是那张图。
+
+**第二刀砍分配次数，不是字节数。** 30 002 行的工作区差异，正文一共 1.43 MB，一行一个 `String` 听着只该付 1.4 MB；
+实测那一档 `vmmap` 的活动分配数从 38 400 跳到 **68 688**、`phys_footprint` 跟着 **+15.8 MB**（73 → 88.8）。
+也就是说 1.4 MB 的正文付出的是**十几 MB 量级的脏页**——最顺的解释是 mac 的 malloc 把小块按 64 字节取整、
+摸过的页不再还给系统。**这句是比例推的，不是证明了的机制**，而且改造之后只收回 3.8 MB、跟它不吻合
+（两个数都记在下面「仍然没看到过的」里）。真正站得住的是「账写在次数上」这一句。
+所以这一刀的目标写在「次数」那一栏上：`DiffText` 把整份补丁收进**一块** `Arc<str>`，每行只记
+`[start, end)` 两个 `u32`（`src/ui/diffmodel.rs:28`），`layout` 收 `impl Into<Arc<str>>`
+（`:131`）让 git 回来那一整份补丁**直接移进来**、一行都不再复制。分配次数 30 001 → 2。
+块头那句「块 1： 行 569-575」和文件头那条路径不是补丁原文，仍各占一小块（`:160`、`:194` 附近）——
+每个块/每个文件才一次，量级差几千倍，不参与那本账。
+
+**第三刀砍 stdout 上那次白付的复制。** `decode(&[u8])` 写的是 `from_utf8_lossy(..).into_owned()`：
+合法 UTF-8 也照样**整份复制**，于是峰值里同时握住字节缓冲和复制出来的 `String`（1.4 MB 的补丁 = 两份）。
+换成 `decode_owned(Vec<u8>)`（`src/git.rs:79`）：合法那一档 `String::from_utf8` **直接接管那块缓冲**
+（`into_raw_parts` → `String::from_raw_parts`，指针都不换），非法那一档才转码——**内容口径一个字都不许变**，
+GBK 路径名那档留着是为了「整本仓库读得动」。三个调用点 `:49`、`:68`、`:1759`。
+
+**游标为什么不写成 `zip(lines(), offsets)`。** `str::lines()` 只把 `\n` 与 `\r\n` 当终止符，**单独的 `\r` 留在正文里**
+（三条实测：`"a\rb\n"` → `["a\rb"]`、`"a\r"` → `["a\r"]`、`"\r\n"` → `[""]`）。`layout` 里那个游标按字节走
+（`src/ui/diffmodel.rs:140`），所以这一条必须在产品代码里就写对、并在判据里逐行对齐：Windows 上
+`core.autocrlf` 的仓库回来的是 CRLF 补丁，跨错一格就是每行尾巴多带一个 `\r`——画出来在行的末尾，
+搜索时是「明明在这儿却搜不到」，复制出去是个坏文件。`layout` 里那句 `debug_assert_eq!` 是第一道闸，
+`a_crlf_patch_lays_out_the_same_lines_as_an_lf_one` 是第二道（两次变异各红一次，见下表）。
+
+**三处「量到了但这批不动」，按证据登记：**
+- 内嵌字体 8.3 MB：静止态我们那 ~8 MB 堆里它就是全部。要省只能 subsetting，而**用户 diff 里的汉字没人能预告**——
+  砍出豆腐块是「看不见改动内容」，比多占 8 MB 严重得多。不动。
+- `blame` 每行五个 `String`：实测 `git blame --porcelain` 在 gitx 自己的 `src/ui/app.rs`（4 200 行）上是
+  **53 626 行 / 1 813 108 字节**，落到 `models::BlameLine` 约 1.2 MB 常驻。要省得改核心层的公开形状（五个字段换一块 arena），
+  那一档改动比这一批大，而且它不在「用户说卡」的那条路上。这批改不动。
+- `Snapshot` 派生列的 `append_page` 是 O(n²) 重建：1643 条提交时约 0.25 MB——那是 **CPU** 的账不是内存的账，
+  为它改翻页时机不值。
+- 顺手记一笔边界：`rev_file_text` 和 `untracked_patch` 各有 2 MiB 上限，`working_patch` / `commit_patch` / `stash_patch`
+  **没有上限**。这批没动它，因为截断一份 28 875 行的真实 diff 是功能损失（这批的起点恰恰是那样一份 diff），
+  不是优化。
+
+**这一批的账（同一台机器，屏幕上摆 30 002 行工作区差异）：**
+
+| 档 | RSS | phys_footprint | `vmmap` 里的 CG Image | 活动分配数 |
+|---|---|---|---|---|
+| 改造前 | 155.1 MB | 88.8 MB | 32.0M | 68 688 |
+| 改造后 | 124.4 MB | 55 MB | 8.2M | 33 146 |
+| 控制组：只把图标挂回 macOS | — | 85 MB | 32.0M | 33 186 |
+
+`Malloc Large` 的脏页同时 15.2 → 10.0 MB。核心层那把尺（无头、只量 `layout` 那一段，临时挂一个统计用的
+`GlobalAlloc`）：常驻 3.49 → 2.06 MB、分配次数 30 001 → 2、峰值 4.99 → 3.54 MB。
+**第三行才是这一批的因果链**：前两行的差是两刀合起来的，控制组把图标那一刀单独加回去，
+其余不动——涨回来的只有 `CG Image` 和 footprint，分配数几乎不动 = 图标那一档与正文那一档各结各的账。
+量完用的临时探针（统计分配的 `GlobalAlloc`、`src/memprobe.rs`、`stats_alloc` 那一模块）已全部删掉，
+它们的结论就是上面这张表。
+
+### 改了什么
+
+- `src/ui/diffmodel.rs`：`DiffText`（`:28`，`arena: Arc<str>` + `start`/`end` 两个 `u32`）、
+  `span`（`:36`）/ `owned`（`:41`）/ `as_str`（`:46`），判据专用的 `shares_arena`（`:54`）与
+  `arena_len`（`:62`）都标 `#[cfg(test)]`——产品代码一行都不读它们，而零警告门禁不放死代码过去；
+  `Deref`/`Display`/`Debug`/`PartialEq<str>`/`PartialEq<&str>`/`From<&str>` 六条 impl（`:67`–`:102`）
+  让 8 处 `RichText::new(&line.text)` 的调用点只改类型不改语义；`DiffLine.text`（`:110`）换类型；`layout` 收 `impl Into<Arc<str>>`（`:131`）、按字节走游标（`:140`）、
+  正文行 `DiffText::span(&patch, start, end)`（`:222`）、块头与文件头走 `owned`。
+  `Kind` 补 `Debug`（`:7`）——CRLF 那条判据要逐行 `assert_eq!(x.kind, y.kind)`。
+- `src/git.rs`：`decode(&[u8])` 删掉，换 `decode_owned(Vec<u8>)`（`:79`），三个调用点 `:49`、`:68`、`:1759`。
+- `src/main.rs`：`viewport()` 里那条 `with_icon` 挪进 `#[cfg(not(target_os = "macos"))]`（`:41`），
+  注释写明 winit 那个空函数和实测代价。
+- `src/ui/icon.rs`：`PNG`（`:15`）、`app_icon`（`:20`）、`decode`（`:26`）、`use eframe::egui`（`:9`）
+  四处条件——最后那条是零警告门禁逼出来的：macOS 的产品构建里整个模块不参与编译，导入留着就是一条 unused import。
+- `src/ui/app.rs:479`、`src/ui/data.rs:183`：`layout(&p, …)` → `layout(p, …)`（补丁移进 arena，不再借）。
+- `src/ui/app.rs:3489`、`:3492`、`:3493`、`:3494` 与 `src/ui/widgets.rs:1903`、`:1905`、`:1906`、`:1907`：
+  `RichText::new(&line.text)` → `RichText::new(line.text.as_str())`（八处，`&DiffText` 不是 `&str`）。
+- `docs/DESIGN.md` §7 补三行（图标只挂在读它的那一档、差异正文一块、stdout 接管不复制）。
+
+### 判据 + 反向变异表
+
+新增无头壳判据 **3 条**（`cargo test --bin gitx` 258→**261**）+ 核心层 **1 条**（`--lib` 158→**159**）。
+三条壳判据钉的全是**结构**、没有一条钉字节数——占多少由分配器和机器说了算，改得动的只有
+「正文是不是一块、图标挂在不挂、stdout 有没有被复制」。下表每一句红都是**实际输出**（终端抄的）。
+
+| 判据 | 变异 | 报的那句红 |
+|---|---|---|
+| `the_diff_body_shares_one_text_block` | `layout` 正文那一行退回逐行复制：`DiffText::span(&patch, start, end)` → `DiffText::owned(line.to_owned())` | 「第 0 条正文行和下一条不在同一块文本里：差异正文又被逐行复制了」（`src/geometry.rs:10774`）。**这一次变异同时还冒一条警告**：「associated function `span` is never used」——`span` 只被正文那一行读，正文不走它就成死代码，零警告门禁那一步也会把它拦下来 |
+| 同上 | 游标那一行 `pos = end + …` 改成 `pos = end`（不跨终止符） | 红在产品代码自己那句 `debug_assert_eq!`（「游标和 `lines()` 对不上了」），判据拿到的是**第二道**闸。这一行登记成事实：arena 那两条断言挡不住「游标写错」，能挡的是下面那条 CRLF 判据 |
+| `a_crlf_patch_lays_out_the_same_lines_as_an_lf_one` | `\r\n` 那一档多带一个字节：`span(&patch, start, end)` → `end + if patch[end..].starts_with("\r\n") { 1 } else { 0 }` | 「第 2 行在 \r\n 那一档里多带/少带了什么 `left: "-老的一行" / right: "-老的一行\r"`」（`src/geometry.rs:10816`），**同一次变异里 `the_diff_body_shares_one_text_block` 全绿** = LF 档没受影响，红的那一句精确属于 CRLF |
+| `the_window_icon_is_only_paid_for_where_the_os_reads_it` | 摘掉 `src/main.rs:41` 那条 `#[cfg]` | 「macOS 的窗口图标根本不被读，却把一张 1024² 的 RGBA 常驻在 viewport 属性里」（`src/geometry.rs:10844`）。**这条变异必须连 `src/ui/icon.rs` 那四条 `#[cfg]` 一起摘**，否则 `app_icon` 在 mac 档根本不存在、编译不过——这个「两处一起改才凑得出那一档」本身就是这条边界的形状 |
+| 核心层 `git_stdout_is_taken_over_rather_than_copied` | `decode_owned` 那一行退回 `String::from_utf8_lossy(&out).into_owned()` | 「合法 UTF-8 的 stdout 又被复制了一份 `left: 4317163216 / right: 4317166800`」（`src/git.rs:5417`，量的是**指针**） |
+| 同上 | 非法那一档的兜底改成 `unwrap_or_default()` | 「合法前缀没留着：""」（`src/git.rs:5421`）——坏字节把前面读对的中文一起丢了。GBK 那档存在的理由就是「整本仓库读得动」，这一红说明判据连兜底的**内容口径**都钉住了 |
+
+方法论补一条（这一批真正学到的）：**「分配次数」和「字节数」是两本账，判据只能钉形状。**
+正文那一刀在核心层那把尺上是 **1.4 MB**（常驻 3.49 → 2.06），在进程那本账上是 **3.8 MB**（88.8 → 控制组那行 85）；
+图标那一刀一个字节都没动我们的堆，却在进程账上换回 **30 MB**（85 → 55）。两刀各结各的账，
+所以谁都不许被写成「省了 XX MB」的单一归因。`shares_arena` + `arena_len` 钉的只有形状——
+具体省多少由分配器和机器说了算，写进判据里，换一台机器就会红，而代码没错。
+
+### 四条门禁（整批跑完统一跑一次）
+
+`./scripts/gates.sh` 全绿（2026-11-17）：核心层 **159** 例、无头壳 **261** 例、零警告构建、
+许可证与素材审计全绿。图标那三条判据走的是打包进二进制的真 PNG；内存那两条不碰网络也不碰真仓库。
+
+### 仍然没看到过的
+
+- **没在真窗口里看过这份 30 002 行的 diff。** 全部 A/B 数是命令行起进程、`footprint`/`vmmap` 采的，
+  界面里到底画没画、滚动卡不卡，这批改完之后一次都没用眼睛确认过。图标那一刀尤其：
+  mac 上「窗口本来就没有图标」是照 winit 源码和实测数字推的，**没有人对着真 Dock 看过「改之前有那张图、改之后还是那张图」**。
+- **`phys_footprint` 是 jetsam 口径，不是用户感知的口径。** 55 MB 与 88.8 MB 那两格是同一台机器、同一份夹具、
+  同一次启动量的，但**没做过多次取中位数**——mac 的回收时机受别的进程影响，重复五次的散布没量过。
+- **12 MB 脏页那一档只有 `vmmap` 的观察，没有机制证明。** 「每块按 64 字节取整 + 摸过的页不还」是按
+  活动分配数 68 688 与 footprint +15.8 MB 这两个数**推**出来的（比例吻合），
+  没有拿 `malloc_history` 逐块看过。**而且这两个数没完全对上**：改造之后进程账只收回 **3.8 MB**
+  （88.8 → 控制组那行 85），离那 12 MB 差着一截；同一份 `vmmap` 里唯一对得上的是 `Malloc Large`
+  的脏页 15.2 → 10.0 MB（5.2 MB）。分配数确实从 68 688 回到 33 146、方向对，
+  但「1.4 MB 正文付 12 MB 脏页」这句仍是**推断**，不是这一批证明了的机制。
+- **非 mac 那一档的图标只过了判据，没过眼睛。** `#[cfg(not(target_os = "macos"))]` 之后 Linux/Windows
+  仍要那张图，但这一台机器上编译不到那一档、也没跑过，只有 `the_window_icon_is_only_paid_for_where_the_os_reads_it`
+  里那条 `icon.width >= 128` 在 macOS 测试目标上走了 `if` 的**另一支**。
+- **CRLF 那条判据用的是手拼的夹具补丁，不是真 git 出来的 CRLF diff。** 真仓库要 `core.autocrlf` +
+  CRLF 工作区，这台 mac 上没摆过那样一本；`"\r\n"` 的形状是照 `str::lines()` 的实测行为（三条边界情况）拼的。
+- **`layout` 的 arena 只在「一次 `layout` 一份补丁」这一档成立。** 如果哪天同一屏同时摆工作区 diff 和
+  某条提交的 diff，那是**两块** arena、各自内部共享——判据钉的是「一块补丁之内」，跨补丁共享本来就没打算做，
+  但也没人写过「两屏同时在时活动分配数会怎么动」。
+- **提交号列、日志行那几族仍是一行一个 `String`。** `Commit` 168 字节 + 约 6 条 `String`（493 B/条），
+  1643 条提交约 0.8 MB——比 diff 那一档小两个量级，所以这批改了 diff 没改它。没量过「日志那一族
+  在活动分配数那一栏上占多少」。
+- **这批里犯过一次 `cargo fmt`，值得留名。** 这个仓库**不是** rustfmt 格式的（没有 rustfmt.toml，
+  门禁与 CI 里也没有 `fmt` 那一步），一次 `cargo fmt` 重排了 26 个文件、`src/geometry.rs` 单个文件报出 23 796 行改动，
+  其中 11 个文件这批根本没碰过。恢复的做法记下来复用：`git worktree add` 一份 HEAD、在那份里 `cargo fmt`，
+  再逐个文件比「格式化后的 HEAD」与「工作区」——差异为零的那个文件就是纯被重排的，`git checkout --` 安全；
+  有差异的文件从 Qoder 的 file-history 快照按「格式化快照 == 工作区」逐条验回手写格式。
+  全批恢复后 159/261 与门禁全绿，`git diff --stat` 从 18 972 插入回到 1 549 插入。
+
+
+## 差异区回滚：把已经写好、还没接上的那半截接完（2026-11-19）
+
+接手这一批时的第一件事是 review 工作区，不是写代码。结论分两半：
+
+- 工作区里躺着**两批已经写完、已经过门禁、但还没提交**的改动（2026-11-17 的冲突合并/列宽拖拽、
+  同日的内存优化），各自的 PROCESS 段都写完了；
+- 另有一批**只写了一半**的：核心层 `revert_hunk`（`src/git.rs:1886`）与 `revert_line`
+  （`src/git.rs:1910`）连同 9 条真 git 仓库的判据都在，而界面层一个动作都没发出去——
+  `Action::RevertHunk` / `Action::RevertLine`（`src/ui/state.rs:187`、`:191`）从没被构造过，
+  `diff_menu_line`（`:1201`）从没被读过，`Msg::Note` 从没被发过。**抓到它的是第四道门禁**：
+  `cargo build` 报「variants `RevertHunk` and `RevertLine` are never constructed」「variant `Note` is never
+  constructed」「field `diff_menu_line` is never read」。所以这一批的全部工作就是把这条线接完，
+  让那三枚死符号各就各位。
+
+### 决定与依据
+
+**「回滚区块」只挂提交那一格，不挂贮藏。** 工作区那两格已经有「暂存区块 / 放弃区块」管同一处改动，
+再来一枚同名不同义的只会让人点错；贮藏那一格更远一层：`revert_hunk` 打的是 `commit_patch`，
+而贮藏是 `stash_patch`，把一份贮藏的补丁反打回工作区等于替用户把改动丢掉，那不叫「回滚历史」。
+所以 `revert_ops`（`src/ui/app.rs:3761`）只认 `Target::Commit`，三档各有各的按钮组，由
+`the_buttons_follow_which_pane_the_diff_is` 逐档钉死。
+
+**行级的文件名从「它自己那条文件头」取。** 一条提交的整份补丁里，每一行只记「第几个文件」
+（`DiffLine::file`），不记路径；单文件差异的路径写在 `target` 上，整条补丁的路径只能往回扫到
+**同一 `file` 号**的那条 `Kind::File` 头带（`src/ui/app.rs:3773`）。拿第一份文件头去顶是最容易写出的
+错法，`the_line_menu_picks_the_file_that_line_belongs_to` 用两个文件各加一行的真提交把它挡住了。
+
+**正文必须去掉行首那一个 `+`/`-`。** `layout` 存的是补丁原文；`git::revert_line` 要的是「这一行本来
+是什么」，拿它去和工作区第 `no` 行逐字比对。带着前缀去比会在「已经不一样了」那一档被 core 拒掉，
+表现是「点了没反应、文件一个字没动」——这条不是推的，是变异表第一行实测出来的。
+
+**右键哪一行要 latch，不能在菜单里现问指针。** 菜单一开，指针就移到菜单上了；`container_context_menu`
+又是整块差异一个容器（不是每行一个 `context_menu`），所以「指针底下是哪一行」在菜单开着的时候问不到。
+右键那一帧把 `diff` 的下标记进 `diff_menu_line`（`src/ui/app.rs:3458` 起、`:3644` 之后），
+菜单关掉（`container_context_menu` 回 `None`）那一帧清掉；换差异时在 `request()` 里清
+（`src/ui/app.rs:473`）——不清的话，下一份补丁里同一个下标指的是另一行。
+为什么不给每行挂 `context_menu`：那会和标签选区抢 hover，用户 2026-10-26 报的「选中内容右击就没了」
+就是那么来的（容器那条注释里记着）。
+
+**这一档不叠确认卡。** 回滚的落点只有工作区，历史与索引都不动；真正危险的「放弃区块 / 放弃文件」
+各有各的闸。撞上后来改过的行时 core 会拒、文件一个字节不动，这一条由核心层
+`a_hunk_that_no_longer_matches_is_refused_and_the_file_is_untouched` 与
+`a_line_that_drifted_or_is_out_of_range_is_refused` 钉着。反过来说，若在这儿加一张卡，
+就等于告诉用户「第一下已经落了」。
+
+**成功也要说一句。** 回滚之后界面停在那条提交的差异上，那一格一个字都不会变；不说一句就是
+「点了没反应」。所以成功那一路补发 `Msg::Note`（`src/ui/app.rs:967` 起），文案带上块号或
+「这一行」，并写明「历史没动」。`Msg::Note` 落地就是 toast，8 秒后自己关。
+
+### 改了什么
+
+- `src/ui/app.rs:3452`：`revert` 与 `right_row` 两个局部；hunk 头那一段改成
+  「工作区两枚 / 提交一枚」二选一（`:3558`–`:3623`）；右键菜单加一条「回滚这一行」并按
+  `container_context_menu` 的返回值收拾 latch（`:3644`–`:3690`）。
+- `src/ui/app.rs:967`：成功那一路为 `RevertHunk` / `RevertLine` 发 `Msg::Note`。
+- `src/ui/app.rs:3761`：`revert_ops()`；`:3773`：`revert_line_action()`（增/删行、行号、路径、去前缀）。
+- `src/ui/app.rs:473`：`request()` 里清 `diff_menu_line`。
+- `docs/DESIGN.md` §2 STAGING 那一行补「hunk 头按钮跟着这一格是什么走」；§7 补三行
+  （回滚的两条落点、右键 latch 的形状、成功提示）。
+- 判据：改写 `the_buttons_follow_which_pane_the_diff_is`（提交那一格从「两枚都不许出现」改成
+  「只许回滚区块」），新增 4 条壳判据（`src/geometry.rs:4106` 起）：回滚区块端到端、回滚一行的
+  端到端、跨文件取路径、工作区不出现这一项。
+
+### 判据 + 反向变异表
+
+新增无头壳判据 **4 条**（`cargo test --bin gitx` 264→**268**）+ 核心层 0 条（**170**，那 9 条
+核心判据在接手时就已经在）。下表 5 行是 5 次变异，每句红都是**实际输出**（终端抄的）。
+
+| 判据 | 变异 | 报的那句红 |
+|---|---|---|
+| `the_line_menu_reverts_only_that_line_into_the_working_tree` | 正文不去前缀：`strip_prefix('+')` 那一挡摘掉，直接把 `line.text` 交给 core | 「600 帧还没等到。note = Some("a.txt 第 2 行已经和这条提交里那一行不一样了（后来改过），按行回滚会删错地方，文件一个字没动。")」——正是「点了没反应」那一档 |
+| `the_line_menu_picks_the_file_that_line_belongs_to` | 路径不认 `l.file == file`，取整份补丁的**第一条**文件头 | 同一句 600 帧超时，note 里是 a.txt 的拒绝：回滚打到了别的文件上 |
+| `the_line_menu_reverts_only_that_line_into_the_working_tree` | 每一帧都把 `diff_menu_line` 覆写成 `right_row`（菜单开着的那几帧就清掉了） | 「「+第二行」的右键菜单里没有「回滚这一行」这一项」（`src/geometry.rs:6139`）——菜单项在菜单开着的时候自己消失 |
+| 同上 | 成功那一路不补 `Msg::Note`（`Action::RevertLine { .. } => {}`） | 「600 帧还没等到。note = None」——文件已经改对了，界面上一句话都没有 |
+| `the_buttons_follow_which_pane_the_diff_is` | `revert_ops` 对工作区也返回 `Some`（多挂一枚「回滚区块」） | 「整份差异（没有单一文件）里冒出了区块按钮：["回滚区块"]」（`src/geometry.rs:1870`） |
+
+方法论补一条：**「核心层已经写好」不等于「功能已经有了」。** 这一批的 9 条核心判据一条能红的地方
+（真 `git apply -R`、真零上下文补丁、真 CRLF）都不在界面层，而界面层四个符号死在那儿——
+接没接上只有 `cargo build` 的警告和一条端到端判据同时看得见。零警告门禁这次不是洁癖，是探针。
+
+### 四条门禁（整批跑完统一跑一次）
+
+`./scripts/gates.sh` 全绿（2026-11-19）：核心层 **170** 例、无头壳 **268** 例、零警告构建、
+许可证与素材审计全绿。新增那 4 条走真仓库 + 真 `git show` / `git apply -R`，全程不碰网络。
+
+### 仍然没看到过的
+
+- **真窗口里没人点过这两枚。** 判据钉的是「画出来的那块字 → 点它 → 文件真变了 → 历史没变」，
+  钉不住 hover 的手感、菜单弹出来的位置、以及 30 002 行差异里点第 100 行时 latch 对不对得上。
+- **贮藏那一格没被真打开过。** `revert_ops` 只认提交，判据只问了「按钮不出现」，没在真贮藏差异上
+  看过一眼——不过那一格本来就不该有这枚按钮。
+- **行级回滚撞 CRLF 只验过核心层。** 界面这一层会把 `text` 原样递下去，core 自己拒；
+  「拒了之后 toast 那句话在真窗口里长什么样」没有人看过。
+- **右键菜单里「回滚这一行」和「复制」挨着放，没量过间距。** 菜单本身是 egui 默认样式，
+  只验了「这一项在 / 不在」。
+- **一次回滚之后差异区不会自己刷新到工作区。** 用户还在看那条提交的旧补丁——这是故意的
+  （回滚的语义是「把这一块拿回工作区」，不是「切走」），但「回滚完再点一次文件行会发生什么」
+  这条路径没有判据，也没人目视过。

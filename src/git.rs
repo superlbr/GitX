@@ -9,6 +9,28 @@ use crate::tr;
 /// which is what makes SourceTree unusable for Chinese file names.
 const CONFIG_ARGS: [&str; 2] = ["-c", "core.quotepath=false"];
 
+/// 失败时给人看的那句话。git 把**冲突**报告写在 stdout 上（`CONFLICT (content): …`、
+/// `Automatic merge failed; …`），stderr 反而是空的 —— 只读 stderr 的话，用户点了
+/// 「合并」撞出冲突，弹出来的是 `git command failed: ` 后面一个字都没有，
+/// 而那恰恰是 `GIT_HINTS` 里「merge conflict」那一格该说话的时候。
+/// 两条流都在手上时先读 stderr，空了才读 stdout；两条都空就报退出码，
+/// 至少那句不是「什么也没发生」。
+fn git_failure(stderr: &[u8], stdout: &[u8], code: Option<i32>) -> String {
+    let err = String::from_utf8_lossy(stderr);
+    let out = String::from_utf8_lossy(stdout);
+    let text = match (err.trim(), out.trim()) {
+        ("", "") => {
+            return match code {
+                Some(c) => tr!(format!("git 退出码 {c}"), format!("git exited with code {c}")),
+                None => String::new(),
+            }
+        }
+        ("", o) => o,
+        (e, _) => e,
+    };
+    explain_git_error(text)
+}
+
 /// Run a git command in the given repository and return stdout.
 fn run_git(repo: &str, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
@@ -18,11 +40,13 @@ fn run_git(repo: &str, args: &[&str]) -> Result<String> {
         .args(args)
         .output()?;
     if !output.status.success() {
-        return Err(GitxError::Git(explain_git_error(&String::from_utf8_lossy(
+        return Err(GitxError::Git(git_failure(
             &output.stderr,
-        ))));
+            &output.stdout,
+            output.status.code(),
+        )));
     }
-    Ok(decode(&output.stdout))
+    Ok(decode_owned(output.stdout))
 }
 
 /// Like `run_git`, but with extra environment variables (e.g. GIT_SEQUENCE_EDITOR).
@@ -35,18 +59,25 @@ fn run_git_env(repo: &str, args: &[&str], envs: &[(&str, &str)]) -> Result<Strin
         .envs(envs.iter().map(|(k, v)| (*k, *v)))
         .output()?;
     if !output.status.success() {
-        return Err(GitxError::Git(explain_git_error(&String::from_utf8_lossy(
+        return Err(GitxError::Git(git_failure(
             &output.stderr,
-        ))));
+            &output.stdout,
+            output.status.code(),
+        )));
     }
-    Ok(decode(&output.stdout))
+    Ok(decode_owned(output.stdout))
 }
 
 /// git prints paths and messages in the repository's own bytes, which for a
 /// legacy Chinese Windows repo are GBK — invalid UTF-8. Failing on that would
 /// make the whole repo unreadable, so bad bytes become U+FFFD instead.
-fn decode(out: &[u8]) -> String {
-    String::from_utf8_lossy(out).into_owned()
+///
+/// 收 `Vec<u8>` 而不是 `&[u8]`：git 的 stdout 本来就躺在这块缓冲里，合法 UTF-8 时
+/// `String::from_utf8` **直接接管这块内存**（一次都不复制）。先前写 `decode(&out.stdout)`
+/// 走 `from_utf8_lossy(..).into_owned()`，等于在峰值里同时握住字节缓冲和复制出来的
+/// `String`——一份 30 002 行的 `git diff` 就是白付 1.4 MB。非法那一档才转码，结果不变。
+fn decode_owned(out: Vec<u8>) -> String {
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 /// git's own wording is English and unhelpful to most domestic users, but the
@@ -57,7 +88,7 @@ fn decode(out: &[u8]) -> String {
 /// 而是这条错误在英文档下长出一个中文字——那条由判据 `every_git_hint_speaks_both_languages`
 /// 兜住，而不是靠人记得填。表摆在模块级而不是留在函数里，也正是为了让那条判据能**逐条**过：
 /// 留在函数里，判据只能挑几条样本，而漏的那几条恰恰是样本照不到的地方。
-const GIT_HINTS: [(&str, &str, &str); 30] = [
+const GIT_HINTS: [(&str, &str, &str); 34] = [
         ("not a git repository", "这里不是一个 git 仓库（没有 .git），请先在侧栏添加正确的目录。", "This is not a git repository (no .git). Add the right folder in the sidebar first."),
         ("has no upstream branch", "当前分支没有关联远程分支，首次推送请用「推送」里的设置上游（git push -u origin 分支名）。", "This branch has no upstream. For the first push, use Push and set the upstream (git push -u origin <branch>)."),
         ("no such branch", "找不到这个分支，名字可能写错了或已被删除。", "Branch not found — the name may be misspelled, or the branch was deleted."),
@@ -82,6 +113,15 @@ const GIT_HINTS: [(&str, &str, &str); 30] = [
         ("working tree not clean", "工作区还有未提交的改动，git 不肯继续。请先提交或贮藏。", "The working tree still has uncommitted changes and git will not continue. Commit or stash them first."),
         ("would be overwritten by merge", "本地改动会被覆盖：请先提交或贮藏这些改动再继续。", "Local changes would be overwritten: commit or stash them before continuing."),
         ("merge conflict", "存在合并冲突，请先在「冲突」列表里逐个解决。", "There are merge conflicts. Resolve them one by one in the Conflicts list first."),
+        // 回滚 / 遴选停在半路上：这两句是**操作级别**的解释（接下来有「继续」和「中止」两枚按钮），
+        // 而 git 自己那两句只有 oid，看不出还能不能收拾。
+        ("could not revert", "这条提交和当前历史撞上了冲突，回滚停在半路上。解决冲突后用「继续回滚」收尾，或用「中止回滚」放回原样。", "This commit conflicts with the current history, so the revert stopped half-way. Resolve the conflicts and use \"Continue revert\", or \"Abort revert\" to put everything back."),
+        ("could not apply", "这块改动落下来的时候和当前内容撞上了冲突，操作停在半路上。解决冲突后用「继续」收尾，或用「中止」放回原样。", "These changes conflict with what is there now, so the operation stopped half-way. Resolve the conflicts and use \"Continue\", or \"Abort\" to put everything back."),
+        // 「回滚这一块 / 这一行」失败时说话的那一句：`git apply -R` 只认这一句。
+        // 它是**拒绝**而不是「回滚到一半」——补丁没落，文件一个字没动。
+        ("does not apply", "这一处改动和文件现在的内容对不上（后来的改动动过同一处），git 拒绝了这次回滚，文件一个字没动。", "This change no longer matches the file — later edits touched the same lines. git refused the revert and left the file untouched."),
+        // 回滚一块时那个文件已经不在了（提交之后被删掉/改名）：git 只报一句英文路径错。
+        ("no such file or directory", "工作区里找不到这个文件：它可能已被删除或改名，这一块回滚不到哪儿去。", "This file is not in the working tree — it may have been deleted or renamed, so there is nowhere to revert this hunk into."),
         ("author identity unknown", "还没配置 git 用户身份，请在「设置」或运行 git config user.name / user.email。", "No git identity is configured. Set it in Preferences, or run git config user.name / user.email."),
         ("empty message", "提交信息不能为空。", "The commit message cannot be empty."),
         ("unmerged files", "还有未解决的合并冲突文件，先解决再提交。", "Unresolved merge conflicts remain — resolve them before committing."),
@@ -92,7 +132,16 @@ const GIT_HINTS: [(&str, &str, &str); 30] = [
 
 fn explain_git_error(stderr: &str) -> String {
     let trimmed = stderr.trim();
-    let lower = trimmed.to_lowercase();
+    // 找解释时**先去掉 git 的建议块**（`hint:` 起头那些行）。那是操作指南，措辞里全是
+    // 关键词表里的词，却说的不是这次的错：冲突的回滚就因为那句
+    // `hint: "git add/rm <pathspec>"` 被认成过「路径没匹配上」。
+    // 原文里这些行**照旧留着**——它们是「下一步怎么办」唯一写在屏幕上的一份。
+    let lower = trimmed
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("hint:"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase();
     let hint = GIT_HINTS
     .iter()
     .find(|(needle, _, _)| lower.contains(needle))
@@ -397,7 +446,11 @@ pub fn status(repo: &str) -> Result<RepoStatus> {
     // 同一把 `.git` 读完两处：这一次 fork 之外的信息全在文件系统里。
     let gd = git_dir(repo)?;
     st.stash_count = stash_count(&gd);
-    st.repo_state = state_at(&gd);
+    // 「进行中」和「卡在哪条提交」是同一次读出来的两格，不能查两遍 sentinel：
+    // 分两次读的话，中间那次操作正好结束，界面会拿到「状态没了、历史列表还带着那条 rev」。
+    let op = op_at(&gd);
+    st.repo_state = op_kind(&op);
+    st.op_rev = op.and_then(|o| o.rev);
     Ok(st)
 }
 
@@ -444,9 +497,7 @@ fn repo_state(repo: &str) -> Result<String> {
 /// 目录，不是被打开的那个仓库。`git_dir` 给的两种形态都落在仓库自己的路径下。
 /// `state_at` 只是 `op_at` 的一层投影：sentinel 的读法全仓库只有一处。
 fn state_at(gd: &std::path::Path) -> String {
-    op_at(gd)
-        .map(|op| op.kind)
-        .unwrap_or_else(|| "none".into())
+    op_kind(&op_at(gd))
 }
 
 /// 贮藏条数，读 reflog 的行数，不再 fork `git stash list`。
@@ -500,16 +551,38 @@ pub fn identities(repo: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// git-dir 里那份「进行中的操作」，含变基的第几步。`state_at` 是它的一层投影，
-/// 两处共用同一次读取 —— 两套机制各查一遍 sentinel 时，改坏一套另一套还绿。
+/// git-dir 里那份「进行中的操作」，含变基的第几步、以及正卡住的那条提交。
+/// `state_at` 是它的一层投影，两处共用同一次读取 —— 两套机制各查一遍 sentinel 时，
+/// 改坏一套另一套还绿。
 fn op_at(gd: &std::path::Path) -> Option<Op> {
-    // 顺序沿用改造前的 `state_at`：merge → cherry-pick → rebase。实测变基停在冲突上时
+    // 顺序沿用改造前的 `state_at`：merge → cherry-pick → revert → rebase。实测变基停在冲突上时
     // git-dir 根目录只有 `REBASE_HEAD`，没有 `CHERRY_PICK_HEAD` 也没有 `MERGE_HEAD`，
-    // 所以这个顺序不会把「变基到第 3 步」报成「正在遴选」。
+    // 所以这个顺序不会把「变基到第 3 步」报成「正在遴选」。回滚那档同理：停在冲突上的
+    // revert 只有 `REVERT_HEAD`，四种哨兵互不重叠。
     if gd.join("MERGE_HEAD").exists() {
-        Some(Op { kind: "merge".into(), step: None, total: None })
+        Some(Op {
+            kind: "merge".into(),
+            step: None,
+            total: None,
+            rev: head_rev(gd, "MERGE_HEAD"),
+        })
     } else if gd.join("CHERRY_PICK_HEAD").exists() {
-        Some(Op { kind: "cherry-pick".into(), step: None, total: None })
+        Some(Op {
+            kind: "cherry-pick".into(),
+            step: None,
+            total: None,
+            rev: head_rev(gd, "CHERRY_PICK_HEAD"),
+        })
+    } else if gd.join("REVERT_HEAD").exists() {
+        // 实测 git 2.54：回滚停在冲突上时 git-dir 里有 `REVERT_HEAD` 和 `MERGE_MSG`，
+        // **没有** `MERGE_HEAD`，所以这一条不会被上面那档抢走；`--abort` / `--continue`
+        // 之后 `REVERT_HEAD` 都会消失（两条都在判据里走了一遍）。
+        Some(Op {
+            kind: "revert".into(),
+            step: None,
+            total: None,
+            rev: head_rev(gd, "REVERT_HEAD"),
+        })
     } else {
         // 两种后端各留一份目录：`-m/--i` 走 rebase-merge，`git am` 走 rebase-apply。
         for dir in ["rebase-merge", "rebase-apply"] {
@@ -519,11 +592,33 @@ fn op_at(gd: &std::path::Path) -> Option<Op> {
                     kind: "rebase".into(),
                     step: read_count(&d.join("msgnum")),
                     total: read_count(&d.join("end")),
+                    // 变基停下来时 `REBASE_HEAD` 就是「正在重放的那条」，实测两种后端都给。
+                    rev: head_rev(gd, "REBASE_HEAD"),
                 });
             }
         }
         None
     }
+}
+
+/// `Op` 的 kind 那一格，`state_at` 只在外面套一层「没有 = none」。
+fn op_kind(op: &Option<Op>) -> String {
+    op.as_ref().map(|o| o.kind.clone()).unwrap_or_else(|| "none".into())
+}
+
+/// 哨兵文件的第一行就是一条完整号。读文件而不是 `git rev-parse`：后者又是一次 fork，
+/// 而 `op_at` 已经在同一次 `status` 里摸过这批文件了。
+/// 形状那一挡不能省：文件被截断或写歪时，那串垃圾会直接落进 `git log` 的位置参数，
+/// 回来一句 `unknown revision`，界面上是「历史列表整个空掉」——比不显示更糟。
+fn head_rev(gd: &std::path::Path, name: &str) -> Option<String> {
+    let line = std::fs::read_to_string(gd.join(name))
+        .ok()?
+        .lines()
+        .next()?
+        .trim()
+        .to_string();
+    // `git rev-parse` 出来的完整号是 40 位；将来 sha256 仓库给 64 位，这一挡不用改。
+    (line.len() >= 40 && line.bytes().all(|b| b.is_ascii_hexdigit())).then_some(line)
 }
 
 /// 文件里的一个计数。读不到或不是数字就回 `None` —— 界面上那是「进行中」，
@@ -806,6 +901,7 @@ fn parse_status(out: &str) -> RepoStatus {
         files,
         stash_count: 0,
         repo_state: "none".into(),
+        op_rev: None,
     }
 }
 
@@ -835,7 +931,7 @@ pub fn commits(
     author: Option<&str>,
     path: Option<&str>,
 ) -> Result<Vec<Commit>> {
-    log_commits(repo, max, author, path, false, 0, &Scope::Current, None)
+    log_commits(repo, max, author, path, false, 0, &Scope::Current, None, None)
 }
 
 /// The same list in topological order — SourceTree's 「层级顺序」 switch: a branch's
@@ -847,7 +943,7 @@ pub fn commits_topo(
     author: Option<&str>,
     path: Option<&str>,
 ) -> Result<Vec<Commit>> {
-    log_commits(repo, max, author, path, true, 0, &Scope::Current, None)
+    log_commits(repo, max, author, path, true, 0, &Scope::Current, None, None)
 }
 
 /// The next page of the log: `max` commits starting `skip` commits past the head.
@@ -855,15 +951,26 @@ pub fn commits_topo(
 /// continuous list — until someone commits, which shifts the boundary by one. That is
 /// the same trade every paginated history makes; refetching the whole log to be safe
 /// costs a full walk per page.
-pub fn commits_page(repo: &str, skip: u32, max: u32, topo: bool, scope: &Scope) -> Result<Vec<Commit>> {
-    log_commits(repo, max, None, None, topo, skip, scope, None)
+///
+/// `pending` 是进行中那次操作卡住的那条提交（`RepoStatus::op_rev`）。被合进来的那批
+/// 只从 `MERGE_HEAD` 可达，不补上这一条 rev，冲突时的历史列表里就没有正被合并的那些
+/// 提交 —— 而那恰恰是用户点了「合并」之后要点开看的东西。
+pub fn commits_page(
+    repo: &str,
+    skip: u32,
+    max: u32,
+    topo: bool,
+    scope: &Scope,
+    pending: Option<&str>,
+) -> Result<Vec<Commit>> {
+    log_commits(repo, max, None, None, topo, skip, scope, None, pending)
 }
 
 /// The history **of one revision** — a branch picked out of the log bar's scope popup.
 /// `git log <rev>` walks that rev's ancestors, so commits only other branches reached
 /// drop out; that is the whole point of picking a branch there.
 pub fn commits_on(repo: &str, rev: &str, max: u32, topo: bool) -> Result<Vec<Commit>> {
-    log_commits(repo, max, None, None, topo, 0, &Scope::Rev(rev.to_owned()), None)
+    log_commits(repo, max, None, None, topo, 0, &Scope::Rev(rev.to_owned()), None, None)
 }
 
 /// 一次历史页搜索在 git 那一侧分几路打。
@@ -896,7 +1003,7 @@ pub fn search_commits(repo: &str, query: &str, scope: &Scope, max: u32) -> Resul
             SearchField::Subject => (None, None, Some(q)),
             SearchField::Path => (None, Some(q), None),
         };
-        for c in log_commits(repo, max, author, path, false, 0, scope, grep)? {
+        for c in log_commits(repo, max, author, path, false, 0, scope, grep, None)? {
             if seen.insert(c.id.clone()) {
                 hits.push(c);
             }
@@ -933,6 +1040,7 @@ fn log_args(
     skip: u32,
     scope: &Scope,
     grep: Option<&str>,
+    pending: Option<&str>,
 ) -> Vec<String> {
     let fmt = LOG_FMT;
     let mut args: Vec<String> = vec![
@@ -977,6 +1085,17 @@ fn log_args(
                 args.push(t.to_string());
             }
         }
+    }
+    // 进行中那次操作卡住的那条提交**只从那个哨兵可达**：`git log` 只走 HEAD 时，
+    // 「正在被合进来」的那一批在冲突的历史列表里一条都不出现。
+    // 位置同理排在 `--` 之前。还有一条容易漏的：`Scope::Current` 平时什么都不写，
+    // 是让 git 自己落到 HEAD；一旦外面多了第二条 rev，那个空位就没人补了，
+    // `git log <sha>` 变成「只看这条的祖先」——HEAD 那侧反而整批消失。
+    if let Some(p) = pending.map(str::trim).filter(|p| !p.is_empty()) {
+        if matches!(scope, Scope::Current) {
+            args.push("HEAD".into());
+        }
+        args.push(p.to_string());
     }
     if let Some(p) = path {
         let q = p.trim();
@@ -1027,10 +1146,11 @@ fn log_commits(
     skip: u32,
     scope: &Scope,
     grep: Option<&str>,
+    pending: Option<&str>,
 ) -> Result<Vec<Commit>> {
     let out = match run_git(
         repo,
-        &str_slice(&log_args(max, author, path, topo, skip, scope, grep)),
+        &str_slice(&log_args(max, author, path, topo, skip, scope, grep, pending)),
     ) {
         Ok(out) => out,
         // 刚 `git init` 出来的仓库有分支、还没有一条提交：`git log` 在这种仓库上退出 128，
@@ -1174,6 +1294,42 @@ pub fn archive(repo: &str, oid: &str, dest: &str) -> Result<()> {
 pub fn cherry_pick(repo: &str, oid: &str) -> Result<()> {
     run_git(repo, &["cherry-pick", "--no-edit", oid])?;
     Ok(())
+}
+
+/// 回滚一条提交 = 在它上面再落一条**反向**的提交，历史不改写。
+///
+/// 交给 git 而不是自己拼反向补丁，是为了拿到 `REVERT_HEAD` 那套现成的语义：冲突时它停在
+/// 半路上、信息默认是 `Revert "原主题"`，继续/中止都由 git 说话。自己 apply 的话
+/// 「冲突了怎么继续」这一整条路得复刻一遍，而复刻的那份没人给它判据。
+///
+/// 合并提交必须带 `-m`：实测不带直接退回来一句
+/// `commit 150d07c… is a merge but no -m option was given`，GUI 里没人会去补这一档。
+/// `--mainline 1` 取**第一父亲**，也就是「撤掉这次合并带进来的那一路」——
+/// gitk 和 GitHub 上点 Revert 都是这个默认。
+pub fn revert(repo: &str, oid: &str) -> Result<()> {
+    let mut args: Vec<&str> = vec!["revert", "--no-edit"];
+    if parent_count(repo, oid)? > 1 {
+        args.extend(["--mainline", "1"]);
+    }
+    args.push(oid);
+    run_git(repo, &args)?;
+    Ok(())
+}
+
+/// 这条提交有几个父亲。`rev-list --parents -n 1` 那一行是 `<自身> <父1> <父2> …`，
+/// 所以父亲数 = 词数 − 1。用它而不是 `cat-file`：不用解析头字段，也不用第二次 fork。
+/// 一条根提交只印自己（一个词）→ 父亲数 0，那是**合法**的，不是读不出来。
+/// 真的读不出来时 `rev-list` 非零退出，上面那个 `?` 已经把 git 那句交出去了；
+/// 只剩「退出 0 却一个字没印」这种对不上形状的输出，宁可不回滚也不猜。
+fn parent_count(repo: &str, oid: &str) -> Result<usize> {
+    let out = run_git(repo, &["rev-list", "--parents", "-n", "1", oid])?;
+    let n = out.split_whitespace().count();
+    if n == 0 {
+        return Err(GitxError::Other(
+            tr!(format!("读不出这条提交：{oid}"), format!("Cannot read this commit: {oid}")).into(),
+        ));
+    }
+    Ok(n - 1)
 }
 
 /// The three ways `git reset` moves HEAD, and the only three the menu offers.
@@ -1322,6 +1478,9 @@ pub fn continue_op(repo: &str) -> Result<()> {
         "cherry-pick" => {
             run_git(repo, &["-c", "core.editor=true", "cherry-pick", "--continue"])?;
         }
+        "revert" => {
+            run_git(repo, &["-c", "core.editor=true", "revert", "--continue"])?;
+        }
         "rebase" => {
             run_git(repo, &["-c", "core.editor=true", "rebase", "--continue"])?;
         }
@@ -1337,6 +1496,9 @@ pub fn abort_op(repo: &str) -> Result<()> {
         }
         "cherry-pick" => {
             run_git(repo, &["cherry-pick", "--abort"])?;
+        }
+        "revert" => {
+            run_git(repo, &["revert", "--abort"])?;
         }
         "rebase" => {
             run_git(repo, &["rebase", "--abort"])?;
@@ -1665,7 +1827,7 @@ fn run_git_stdin(repo: &str, args: &[&str], input: &str) -> Result<String> {
             &out.stderr,
         ))));
     }
-    Ok(decode(&out.stdout))
+    Ok(decode_owned(out.stdout))
 }
 
 /// 只把某一块改动放进暂存区（SourceTree 的「暂存区块」）。
@@ -1713,6 +1875,102 @@ pub fn discard_hunk(repo: &str, path: &str, index: usize) -> Result<()> {
     })?;
     // 不带 `--cached`：反打的落点就是工作区那个文件。
     run_git_stdin(repo, &["apply", "-R", "--whitespace=nowarn", "-"], &one)?;
+    Ok(())
+}
+
+/// 把某条提交里的**一块**改动反着打回工作区（差异区 hunk 头右端那枚「回滚区块」）。
+/// 和 `discard_hunk` 是同一条 `git apply -R`，只是补丁来自 `git show` 而不是 `git diff`：
+/// 落点是工作区那个文件，HEAD 与历史一条都不动（实测：反打一块之后 `rev-parse HEAD` 不变，
+/// 另一块原样留在文件里）。`path` 给 `None` 时打的是整条提交的补丁，`hunk_patch` 会带上
+/// 那一块自己所属文件的头——多文件差异里第 N 块可能落在第 2 个文件上。
+pub fn revert_hunk(repo: &str, oid: &str, path: Option<&str>, index: usize) -> Result<()> {
+    let patch = commit_patch(repo, oid, path)?;
+    let one = hunk_patch(&patch, index).ok_or_else(|| {
+        GitxError::Other(tr!(
+            format!("这条提交里没有第 {index} 块改动，可能列表刚刷新过"),
+            format!("this commit has no hunk number {index} — the list may have just refreshed")
+        ))
+    })?;
+    run_git_stdin(repo, &["apply", "-R", "--whitespace=nowarn", "-"], &one)?;
+    Ok(())
+}
+
+/// 只回滚某条提交里的**一行**：那条提交新增的行从工作区删掉，它删掉的行插回来。
+///
+/// 补丁是现造的**零上下文**单行补丁，所以必须带 `--unidiff-zero`（实测不带它 git 直接拒：
+/// `patch failed`）。零上下文等于把校验全交给我们自己——git 不再核对前后文，行号对不上
+/// 就会删错行。所以动手之前先读工作区那个文件，按行号核对三件事：
+/// - 新增行：第 `no` 行必须**还是**这一行，否则拒（文件后来改过，删下去就是删错行）；
+/// - 删除行：第 `no` 行不能**已经是**这一行，否则拒。实测 git 对这一档一声不响再插一遍，
+///   文件里长出两条一样的行——这是零上下文唯一一处 git 自己不把关的地方；
+/// - 行号够不到（文件比那一行短）也拒。
+/// CRLF 的文件同样拒：实测 git 不接这份补丁，而它报的是「对不上」，其实内容对得上、
+/// 差的是行尾——那句话在这儿是误导，所以自己先说清楚。
+/// 只读到第 `no` 行为止、只留最后一行：大文件不必整份进内存（同 `DiffText` 那本账）。
+pub fn revert_line(repo: &str, path: &str, added: bool, no: u32, text: &str) -> Result<()> {
+    use std::io::BufRead;
+    let full = std::path::Path::new(repo).join(path);
+    let file = match std::fs::File::open(&full) {
+        Ok(f) => f,
+        // 文件没了要说人话：`io::Error` 自己那句只有「No such file or directory」，
+        // 连是哪个文件都不写，用户看不出该去哪儿找。
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(GitxError::Other(tr!(
+                format!("工作区里已经没有 {path} 这个文件了（被删掉或改名），这一行回滚不到哪儿去。"),
+                format!("{path} is no longer in the working tree (deleted or renamed), so there is nowhere to revert this line into.")
+            )));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let want = no as usize;
+    // `split(b'\n')` 而不是 `lines()`：行尾那个 `\r` 要留着才认得出 CRLF。
+    let (mut count, mut last, mut crlf) = (0usize, Vec::new(), false);
+    for raw in std::io::BufReader::new(file).split(b'\n').take(want) {
+        let raw = raw?;
+        crlf |= raw.ends_with(b"\r");
+        last = raw;
+        count += 1;
+    }
+    let refuse = |zh: String, en: String| GitxError::Other(tr!(zh, en));
+    if crlf {
+        return Err(refuse(
+            format!("{path} 用的是 CRLF 换行，按行回滚会改坏行尾，git 不接这份补丁，文件一个字没动。"),
+            format!("{path} uses CRLF line endings; a line-level revert would corrupt them, so git refuses this patch and the file is untouched."),
+        ));
+    }
+    // 新增行要删的是第 `no` 行本身；删除行是插在第 `no` 行之前，所以文件只要有 `no - 1` 行就够。
+    let need = if added { want } else { want.saturating_sub(1) };
+    if count < need {
+        return Err(refuse(
+            format!("{path} 现在只有 {count} 行，够不到第 {no} 行，文件一个字没动。"),
+            format!("{path} now has only {count} lines, which does not reach line {no}; the file is untouched."),
+        ));
+    }
+    let same = last.strip_suffix(b"\r").unwrap_or(&last) == text.as_bytes();
+    if added && !same {
+        return Err(refuse(
+            format!("{path} 第 {no} 行已经和这条提交里那一行不一样了（后来改过），按行回滚会删错地方，文件一个字没动。"),
+            format!("line {no} of {path} no longer matches the line in this commit (it was edited since); reverting it would delete the wrong line, so the file is untouched."),
+        ));
+    }
+    if !added && same {
+        return Err(refuse(
+            format!("{path} 第 {no} 行已经是这一行了，再回滚一次会多插一条同样的，文件一个字没动。"),
+            format!("line {no} of {path} is already this line; reverting again would insert a duplicate, so the file is untouched."),
+        ));
+    }
+    let prev = no.saturating_sub(1);
+    let hunk = if added {
+        format!("@@ -{prev},0 +{no},1 @@\n+{text}\n")
+    } else {
+        format!("@@ -{no},1 +{prev},0 @@\n-{text}\n")
+    };
+    let patch = format!("diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n{hunk}");
+    run_git_stdin(
+        repo,
+        &["apply", "-R", "--unidiff-zero", "--whitespace=nowarn", "-"],
+        &patch,
+    )?;
     Ok(())
 }
 
@@ -3455,7 +3713,7 @@ mod tests {
         assert_eq!(commits.len(), 2);
         assert_eq!(commits[0].subject, "add b");
         // 翻页：`--skip=1` 就是第二页，接在第一页后面、不重叠。
-        let second = commits_page(&p, 1, 10, false, &Scope::Current).unwrap();
+        let second = commits_page(&p, 1, 10, false, &Scope::Current, None).unwrap();
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].id, commits[1].id);
     }
@@ -3590,6 +3848,177 @@ mod tests {
         assert!(err.contains("7"), "错误里没带上块号：{err}");
     }
 
+    // ------------------------------------------------- 回滚一条提交里的一块 / 一行（#C-3）
+    //
+    // 落点是**工作区**，不是历史：这两条和 `revert`（补一条反向提交）不是一回事，
+    // 所以每条判据都要顺手钉住 HEAD 与提交条数没动。行那一档的补丁是现造的零上下文补丁，
+    // git 不再核对前后文，把关的全是我们自己那几句拒绝——所以拒绝那几条必须逐条验，
+    // 而且验的是「文件一个字节都没变」，不是「返回了 Err」。
+
+    /// 三十行的文件，一条提交里改第 2 行和第 20 行（隔得够远，git 切成两块）。
+    fn two_hunk_commit() -> (tempfile::TempDir, String, String, String) {
+        let (dir, p) = init_repo();
+        let body: String = (1..=30).map(|i| format!("line {i}\n")).collect();
+        fs::write(format!("{}/a.txt", p), &body).unwrap();
+        git(&p, &["add", "a.txt"]);
+        git(&p, &["commit", "-q", "-m", "三十行"]);
+        let edited: String = (1..=30)
+            .map(|i| match i {
+                2 => "TWO\n".to_owned(),
+                20 => "TWENTY\n".to_owned(),
+                _ => format!("line {i}\n"),
+            })
+            .collect();
+        fs::write(format!("{}/a.txt", p), &edited).unwrap();
+        git(&p, &["commit", "-q", "-am", "两处"]);
+        let oid = run_git(&p, &["rev-parse", "HEAD"]).unwrap().trim().to_owned();
+        assert_eq!(hunks(&commit_patch(&p, &oid, Some("a.txt")).unwrap()), 2, "夹具没造出两块");
+        (dir, p, oid, edited)
+    }
+
+    /// 回滚第 2 块：只有那一块回到上一版，第 1 块原样留着，历史一条没动，索引也没被碰。
+    #[test]
+    fn reverting_one_hunk_of_a_commit_lands_in_the_work_tree_only() {
+        let (_d, p, oid, edited) = two_hunk_commit();
+        let head = run_git(&p, &["rev-parse", "HEAD"]).unwrap().trim().to_owned();
+        revert_hunk(&p, &oid, Some("a.txt"), 2).unwrap();
+        let want = edited.replace("TWENTY\n", "line 20\n");
+        assert_eq!(fs::read_to_string(format!("{}/a.txt", p)).unwrap(), want, "回滚的不是第 2 块");
+        assert!(want.contains("TWO"), "夹具自己就没留下第 1 块");
+        assert_eq!(run_git(&p, &["rev-parse", "HEAD"]).unwrap().trim(), head, "回滚一块动了 HEAD");
+        assert_eq!(run_git(&p, &["rev-list", "--count", "HEAD"]).unwrap().trim(), "3", "回滚一块改写了历史");
+        assert_eq!(hunks(&working_patch(&p, true, Some("a.txt")).unwrap()), 0, "回滚一块把东西放进了索引");
+        let st = status(&p).unwrap();
+        assert_eq!(st.files.len(), 1, "工作区该正好剩这一个改动：{:?}", st.files);
+        assert!(!st.files[0].staged, "回滚一块该落在未暂存那一栏");
+        // 同一块再回滚一次：文件里已经没有 TWENTY 了，git 必须拒，而不是悄悄再改一遍。
+        let before = fs::read_to_string(format!("{}/a.txt", p)).unwrap();
+        let err = revert_hunk(&p, &oid, Some("a.txt"), 2).unwrap_err().to_string();
+        assert!(err.contains("一个字没动"), "重复回滚没落到「拒绝」那一档解释：{err}");
+        assert_eq!(fs::read_to_string(format!("{}/a.txt", p)).unwrap(), before, "被拒的那一次动了文件");
+    }
+
+    /// 后来的改动动过同一处 → git 拒，文件一个字节都不许变。这就是用户说的
+    /// 「改动太多不能回滚也要提示」：提示要有，手不能伸进去。
+    #[test]
+    fn a_hunk_that_no_longer_matches_is_refused_and_the_file_is_untouched() {
+        let (_d, p, oid, _edited) = two_hunk_commit();
+        let drifted = fs::read_to_string(format!("{}/a.txt", p)).unwrap().replace("TWENTY\n", "又改过了\n");
+        fs::write(format!("{}/a.txt", p), &drifted).unwrap();
+        let err = revert_hunk(&p, &oid, Some("a.txt"), 2).unwrap_err().to_string();
+        assert!(err.contains("does not apply"), "git 那句拒绝没交回来：{err}");
+        assert!(err.contains("一个字没动"), "没解释成「拒绝了、文件没动」：{err}");
+        assert_eq!(fs::read_to_string(format!("{}/a.txt", p)).unwrap(), drifted, "被拒的回滚动了文件");
+        assert_eq!(run_git(&p, &["rev-parse", "HEAD"]).unwrap().trim(), oid, "被拒的回滚动了 HEAD");
+    }
+
+    /// 整条提交的补丁（没选单一文件）里第 2 块落在**第二个**文件上：头必须跟着换过去。
+    #[test]
+    fn reverting_a_hunk_of_the_whole_commit_patch_picks_the_right_file() {
+        let (_d, p) = init_repo();
+        let body: String = (1..=30).map(|i| format!("line {i}\n")).collect();
+        fs::write(format!("{}/a.txt", p), &body).unwrap();
+        fs::write(format!("{}/b.txt", p), &body).unwrap();
+        git(&p, &["add", "."]);
+        git(&p, &["commit", "-q", "-m", "两个文件"]);
+        for f in ["a.txt", "b.txt"] {
+            fs::write(format!("{}/{f}", p), body.replace("line 2\n", "TWO\n")).unwrap();
+        }
+        git(&p, &["commit", "-q", "-am", "各改一处"]);
+        let oid = run_git(&p, &["rev-parse", "HEAD"]).unwrap().trim().to_owned();
+        assert_eq!(hunks(&commit_patch(&p, &oid, None).unwrap()), 2, "夹具没造出两块");
+
+        revert_hunk(&p, &oid, None, 2).unwrap();
+        assert_eq!(fs::read_to_string(format!("{}/b.txt", p)).unwrap(), body, "第 2 块该把 b.txt 还原");
+        assert!(
+            fs::read_to_string(format!("{}/a.txt", p)).unwrap().contains("TWO"),
+            "把第 1 块（a.txt）也一起回滚了"
+        );
+    }
+
+    /// 五行的小文件，`change` 那一步造出要回滚的那一行。返回 (目录, 路径, 提交号)。
+    fn five_lines(change: impl FnOnce(&str) -> String, msg: &str) -> (tempfile::TempDir, String, String) {
+        let (dir, p) = init_repo();
+        let body: String = (1..=5).map(|i| format!("l{i}\n")).collect();
+        fs::write(format!("{}/a.txt", p), &body).unwrap();
+        git(&p, &["add", "a.txt"]);
+        git(&p, &["commit", "-q", "-m", "五行"]);
+        fs::write(format!("{}/a.txt", p), change(&body)).unwrap();
+        git(&p, &["commit", "-q", "-am", msg]);
+        let oid = run_git(&p, &["rev-parse", "HEAD"]).unwrap().trim().to_owned();
+        (dir, p, oid)
+    }
+
+    /// 右键「回滚这一行」新增的那一档：只删掉那一行，工作区别处没提交的改动留着，历史不动。
+    #[test]
+    fn reverting_one_added_line_removes_only_that_line() {
+        let (_d, p, oid) = five_lines(|b| b.replace("l3\n", "NEW\nl3\n"), "加一行");
+        // 别处再改一笔（不提交）：回滚这一行不该把它一起带走。
+        let dirty = format!("{}uncommitted\n", fs::read_to_string(format!("{}/a.txt", p)).unwrap());
+        fs::write(format!("{}/a.txt", p), &dirty).unwrap();
+        revert_line(&p, "a.txt", true, 3, "NEW").unwrap();
+        assert_eq!(
+            fs::read_to_string(format!("{}/a.txt", p)).unwrap(),
+            "l1\nl2\nl3\nl4\nl5\nuncommitted\n",
+            "回滚这一行删错了地方，或者把别处的改动一起带走了"
+        );
+        assert_eq!(run_git(&p, &["rev-parse", "HEAD"]).unwrap().trim(), oid, "回滚一行动了 HEAD");
+        assert_eq!(hunks(&working_patch(&p, true, Some("a.txt")).unwrap()), 0, "回滚一行把东西放进了索引");
+    }
+
+    /// 删除的那一档：行插回来一次；**再点一次必须拒**——实测 git 对零上下文的反向插入
+    /// 一声不响再来一遍，文件里长出两条一样的行。这一条钉的就是我们自己加的那道闸。
+    #[test]
+    fn a_deleted_line_comes_back_once_and_a_second_try_is_refused() {
+        let (_d, p, _oid) = five_lines(|b| b.replace("l3\n", ""), "删一行");
+        assert_eq!(fs::read_to_string(format!("{}/a.txt", p)).unwrap(), "l1\nl2\nl4\nl5\n");
+        revert_line(&p, "a.txt", false, 3, "l3").unwrap();
+        let once = "l1\nl2\nl3\nl4\nl5\n";
+        assert_eq!(fs::read_to_string(format!("{}/a.txt", p)).unwrap(), once, "删掉的那行没插回原位");
+        let err = revert_line(&p, "a.txt", false, 3, "l3").unwrap_err().to_string();
+        assert!(err.contains("已经是这一行"), "第二次没被我们自己拦下来：{err}");
+        assert_eq!(fs::read_to_string(format!("{}/a.txt", p)).unwrap(), once, "第二次插出了重复行");
+    }
+
+    /// 三档拒绝，每档都验「文件一个字节没变」：行号对不上（后来改过）、行号够不到、文件没了。
+    #[test]
+    fn a_line_that_drifted_or_is_out_of_range_is_refused() {
+        let (_d, p, _oid) = five_lines(|b| b.replace("l3\n", "NEW\nl3\n"), "加一行");
+        let drifted = "l1\nl2\nEDITED\nl3\nl4\nl5\n";
+        fs::write(format!("{}/a.txt", p), drifted).unwrap();
+        let err = revert_line(&p, "a.txt", true, 3, "NEW").unwrap_err().to_string();
+        assert!(err.contains("不一样了"), "行内容对不上时没说清原因：{err}");
+        assert_eq!(fs::read_to_string(format!("{}/a.txt", p)).unwrap(), drifted);
+
+        let err = revert_line(&p, "a.txt", true, 99, "NEW").unwrap_err().to_string();
+        assert!(err.contains("够不到"), "行号越过文件末尾时没说清原因：{err}");
+        assert_eq!(fs::read_to_string(format!("{}/a.txt", p)).unwrap(), drifted);
+        // 删除那一档越过末尾同样拒（插不进去）。
+        let err = revert_line(&p, "a.txt", false, 99, "l3").unwrap_err().to_string();
+        assert!(err.contains("够不到"), "删除行越过末尾时没说清原因：{err}");
+
+        fs::remove_file(format!("{}/a.txt", p)).unwrap();
+        let err = revert_line(&p, "a.txt", true, 3, "NEW").unwrap_err().to_string();
+        assert!(err.contains("已经没有"), "文件没了时报的不是人话：{err}");
+        assert!(err.contains("a.txt"), "文件没了时没带上是哪个文件：{err}");
+    }
+
+    /// CRLF 的文件：git 实测不接这份零上下文补丁，而它报的是「对不上」——内容其实对得上，
+    /// 差的是行尾。所以我们自己先拒，并把真正的原因说出来；文件一个字节都不许变。
+    #[test]
+    fn a_crlf_file_refuses_a_line_revert_without_touching_a_byte() {
+        let (dir, p) = init_repo();
+        fs::write(dir.path().join("a.txt"), b"l1\r\nl2\r\nl3\r\n").unwrap();
+        git(&p, &["add", "a.txt"]);
+        git(&p, &["commit", "-q", "-m", "crlf"]);
+        fs::write(dir.path().join("a.txt"), b"l1\r\nl2\r\nNEW\r\nl3\r\n").unwrap();
+        git(&p, &["commit", "-q", "-am", "crlf 加一行"]);
+        let before = fs::read(dir.path().join("a.txt")).unwrap();
+        let err = revert_line(&p, "a.txt", true, 3, "NEW").unwrap_err().to_string();
+        assert!(err.contains("CRLF"), "CRLF 那一档没说出真正的原因：{err}");
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), before, "被拒的那一次改了行尾");
+    }
+
     /// 「归档」导的是**右键那一条**，不是 HEAD。两条都要钉：只验「导出成了」的话，
     /// 实现写成永远 `git archive HEAD` 照样绿——那正是用户点到旧提交、拿回最新代码的那种错。
     /// zip 里文件名是明文存的（只有内容压了），所以「含 `a.txt`、不含 `b.txt`」能直接问字节。
@@ -3673,8 +4102,8 @@ mod tests {
     /// 否则切一次排序，用户看到的提交集合会静默变掉。
     #[test]
     fn topo_switch_only_adds_the_order_flag() {
-        let plain = log_args(10, Some("nobody"), Some("src/a.rs"), false, 0, &Scope::Current, None);
-        let topo = log_args(10, Some("nobody"), Some("src/a.rs"), true, 0, &Scope::Current, None);
+        let plain = log_args(10, Some("nobody"), Some("src/a.rs"), false, 0, &Scope::Current, None, None);
+        let topo = log_args(10, Some("nobody"), Some("src/a.rs"), true, 0, &Scope::Current, None, None);
         assert!(!plain.iter().any(|a| a == "--topo-order"), "日期序里冒出 topo 参数");
         assert_eq!(topo.iter().filter(|a| *a == "--topo-order").count(), 1);
         let without = |v: Vec<String>| {
@@ -3689,8 +4118,8 @@ mod tests {
     /// `git log --skip=0` 合法但白拼一个参数，也让「有没有下一页」的判断少了对照。
     #[test]
     fn the_page_offset_only_adds_skip() {
-        let first = log_args(3, None, None, false, 0, &Scope::Current, None);
-        let second = log_args(3, None, None, false, 3, &Scope::Current, None);
+        let first = log_args(3, None, None, false, 0, &Scope::Current, None, None);
+        let second = log_args(3, None, None, false, 3, &Scope::Current, None, None);
         assert!(!first.iter().any(|a| a.starts_with("--skip")), "第一页发了 --skip");
         assert_eq!(second.iter().filter(|a| a.starts_with("--skip")).count(), 1);
         assert!(second.contains(&"--skip=3".to_owned()));
@@ -3703,8 +4132,8 @@ mod tests {
     /// 和 `topo_switch_only_adds_the_order_flag` 同一个理由：换筛选条件不许顺带改别的参数。
     #[test]
     fn the_rev_argument_only_adds_the_rev_before_the_pathspec() {
-        let all = log_args(10, Some("nobody"), Some("src/a.rs"), false, 0, &Scope::Current, None);
-        let one = log_args(10, Some("nobody"), Some("src/a.rs"), false, 0, &Scope::Rev("side".into()), None);
+        let all = log_args(10, Some("nobody"), Some("src/a.rs"), false, 0, &Scope::Current, None, None);
+        let one = log_args(10, Some("nobody"), Some("src/a.rs"), false, 0, &Scope::Rev("side".into()), None, None);
         assert_eq!(one.len(), all.len() + 1, "多出来的不止那一个参数：{one:?}");
         let without: Vec<String> = one.iter().filter(|a| **a != "side").cloned().collect();
         assert_eq!(without, all, "选分支顺带改了别的参数：{all:?}");
@@ -3713,8 +4142,8 @@ mod tests {
         assert!(at < dash, "rev 落在 `--` 后面就被当成路径了：{one:?}");
         // 空白的那一位等于没选：不给 git 传一个空参数（它会报 ambiguous argument）。
         assert_eq!(
-            log_args(10, None, None, false, 0, &Scope::Rev("  ".into()), None),
-            log_args(10, None, None, false, 0, &Scope::Current, None)
+            log_args(10, None, None, false, 0, &Scope::Rev("  ".into()), None, None),
+            log_args(10, None, None, false, 0, &Scope::Current, None, None)
         );
     }
 
@@ -3724,8 +4153,8 @@ mod tests {
     /// `--all` 同样必须在 `--` 前面——落到后面 git 当它是路径，列表安静地回空。
     #[test]
     fn the_all_scope_adds_only_dash_all_in_the_rev_slot() {
-        let cur = log_args(10, Some("nobody"), Some("src/a.rs"), false, 0, &Scope::Current, None);
-        let all = log_args(10, Some("nobody"), Some("src/a.rs"), false, 0, &Scope::All, None);
+        let cur = log_args(10, Some("nobody"), Some("src/a.rs"), false, 0, &Scope::Current, None, None);
+        let all = log_args(10, Some("nobody"), Some("src/a.rs"), false, 0, &Scope::All, None, None);
         assert_eq!(all.len(), cur.len() + 1, "多出来的不止 --all：{all:?}");
         assert_eq!(all.iter().filter(|a| *a == "--all").count(), 1, "--all 发了不止一次");
         let without: Vec<String> = all.iter().filter(|a| *a != "--all").cloned().collect();
@@ -3742,8 +4171,8 @@ mod tests {
     /// 否则一次搜索会连带改掉用户看到的范围/排序。
     #[test]
     fn the_subject_search_adds_only_fixed_strings_grep() {
-        let plain = log_args(10, None, None, false, 0, &Scope::Current, None);
-        let one = log_args(10, None, None, false, 0, &Scope::Current, Some("README(1)"));
+        let plain = log_args(10, None, None, false, 0, &Scope::Current, None, None);
+        let one = log_args(10, None, None, false, 0, &Scope::Current, Some("README(1)"), None);
         // 三位各自先问一遍，再问长度：长度那条会把「少了谁」糊成一团（M19/M20 实测都只报
         // 「多出来的不止那三位」，看不出掉的是 `-F` 还是 `-i`）。
         assert_eq!(one.iter().filter(|a| **a == "-F").count(), 1, "-F 没发或发了多次");
@@ -3758,7 +4187,7 @@ mod tests {
         assert_eq!(without, plain, "搜说明顺带改了别的参数：{plain:?}");
         // 空白那一位等于没搜：不给 git 发一条 `--grep=`（那会命中每一条提交）。
         assert_eq!(
-            log_args(10, None, None, false, 0, &Scope::Current, Some("  ")),
+            log_args(10, None, None, false, 0, &Scope::Current, Some("  "), None),
             plain,
             "空搜索串发了 --grep"
         );
@@ -3883,8 +4312,8 @@ mod tests {
         git(&p, &["commit", "-q", "-m", "只在主线"]);
 
         let subjects = |l: Vec<Commit>| -> Vec<String> { l.iter().map(|c| c.subject.clone()).collect() };
-        let cur = subjects(commits_page(&p, 0, 50, false, &Scope::Current).unwrap());
-        let all = subjects(commits_page(&p, 0, 50, false, &Scope::All).unwrap());
+        let cur = subjects(commits_page(&p, 0, 50, false, &Scope::Current, None).unwrap());
+        let all = subjects(commits_page(&p, 0, 50, false, &Scope::All, None).unwrap());
         assert!(cur.contains(&"只在主线".to_owned()) && !cur.contains(&"只在支线".to_owned()), "当前分支那档串了：{cur:?}");
         for want in ["只在主线", "只在支线"] {
             assert!(all.contains(&want.to_owned()), "所有分支那档没有「{want}」：{all:?}");
@@ -3892,6 +4321,111 @@ mod tests {
         // 对照：仓库里可走得到的提交总数（所有 ref），`--all` 就该给出这些。
         let want = run_git(&p, &["rev-list", "--all", "--count"]).unwrap().trim().to_string();
         assert_eq!(all.len().to_string(), want, "--all 的条数和仓库里的对不上：{all:?}");
+    }
+
+    /// 冲突合并时，历史列表要看得见**正被合进来**的那几条提交。
+    ///
+    /// 那几条只从 `MERGE_HEAD` 可达，而 `git log` 不带位置参数时只走 HEAD —— 于是界面
+    /// 报了「未解决的合并」、列出了冲突文件，列表里却找不到该点开的那几条提交。
+    /// 用户在 gitx 里点「合并」撞出冲突后说的就是这一句：看不到冲突的提交。
+    #[test]
+    fn a_conflicted_merge_puts_the_incoming_commits_in_the_history() {
+        let (_d, p) = merge_conflict();
+        let st = status(&p).unwrap();
+        assert_eq!(st.repo_state, "merge");
+        let pending = st.op_rev.clone().expect("MERGE_HEAD 在场时 op_rev 就该有值");
+        assert_eq!(
+            pending,
+            run_git(&p, &["rev-parse", "MERGE_HEAD"]).unwrap().trim().to_string(),
+            "op_rev 读的是那个哨兵本身，不是 HEAD 或别的什么"
+        );
+
+        let subjects = |l: Vec<Commit>| -> Vec<String> {
+            l.iter().map(|c| c.subject.clone()).collect()
+        };
+        // 对照：这就是改造前那条 argv ——同一个仓库、同一次冲突，`theirs` 那条不在。
+        let bare = subjects(commits_page(&p, 0, 50, false, &Scope::Current, None).unwrap());
+        assert!(!bare.contains(&"theirs".to_owned()), "对照失效：只走 HEAD 也看见了 theirs");
+        assert!(bare.contains(&"mine".to_owned()));
+
+        let with = subjects(commits_page(&p, 0, 50, false, &Scope::Current, Some(&pending)).unwrap());
+        for want in ["theirs", "mine", "init"] {
+            assert!(with.contains(&want.to_owned()), "带 pending 的历史里没有「{want}」：{with:?}");
+        }
+        // 补第二条 rev **不能把 HEAD 那侧挤掉**：`git log <sha>` 单独一条就是
+        // 「只看这条的祖先」，界面会变成「一进合并，我的提交全没了」。
+        // 翻页同一趟走范围：`--skip` 数的是这一次遍历的顺序。
+        let page2 = subjects(commits_page(&p, 2, 1, false, &Scope::Current, Some(&pending)).unwrap());
+        assert_eq!(page2, vec![with[2].clone()], "第 3 条按 skip 接不上：{page2:?} vs {with:?}");
+    }
+
+    /// `Scope::Current` 那一档平时**什么都不写**，靠 git 自己落到 HEAD。一旦外面多了
+    /// 第二条 rev，那个空位就没人补了，得**明写 HEAD**。
+    /// 位置同理排在 `--` 之前：`--` 之后 git 读成 pathspec，回来一句 unknown revision
+    /// 或一份空日志。空串/全空格不算 rev，一条都不该加。
+    #[test]
+    fn the_pending_rev_is_a_second_walked_rev_not_a_pathspec() {
+        // 带上 pathspec，`--` 才真的在 argv 里 —— 那道闸要钉的是「pending 落在它之前」。
+        let cur = log_args(10, None, Some("src/a.rs"), false, 0, &Scope::Current, None, Some("deadbeef"));
+        let at = cur.iter().position(|a| a == "--").unwrap();
+        assert!(cur[..at].contains(&"HEAD".to_string()), "当前分支那档没写明 HEAD：{cur:?}");
+        assert!(cur[..at].contains(&"deadbeef".to_string()), "pending 落在了 `--` 之后：{cur:?}");
+        // 顺序：HEAD 在前、pending 在后，两者都紧邻范围那一个槽位。
+        let i = cur.iter().position(|a| a == "deadbeef").unwrap();
+        assert_eq!(cur[i - 1], "HEAD");
+
+        for blank in ["", "   "] {
+            assert_eq!(
+                log_args(10, None, None, false, 0, &Scope::Current, None, Some(blank)),
+                log_args(10, None, None, false, 0, &Scope::Current, None, None),
+                "空白 rev 不该改 argv"
+            );
+        }
+        // 没有 pending 时 argv **逐字节不变**：所有已钉的范围/翻页/筛选判据都不该被这次改动碰到。
+        assert_eq!(
+            log_args(3, None, None, true, 4, &Scope::Rev("side".into()), Some("g"), None),
+            vec![
+                "log".to_string(),
+                "--max-count=3".into(),
+                "--pretty=format:%H%x1f%h%x1f%an%x1f%ae%x1f%aI%x1f%s%x1f%P".into(),
+                "--skip=4".into(),
+                "--topo-order".into(),
+                "-F".into(),
+                "-i".into(),
+                "--grep=g".into(),
+                "side".into(),
+            ]
+        );
+    }
+
+    /// `head_rev` 那一挡形状检查判的是「垃圾串别一路走进 `git log` 的位置参数」。
+    /// 不走真仓库：真仓库里把 `MERGE_HEAD` 改成乱码，git 自己的 `status` 先报错，
+    /// 那条路根本到不了我们要判的这一格。
+    #[test]
+    fn a_malformed_sentinel_is_not_a_commit() {
+        let d = tempfile::tempdir().unwrap();
+        let gd = d.path();
+        let sha40 = "0".repeat(40);
+        for bad in ["", "   \n", "not-a-sha\n", &"0".repeat(39), &"g".repeat(40)] {
+            fs::write(gd.join("MERGE_HEAD"), bad).unwrap();
+            assert_eq!(
+                head_rev(gd, "MERGE_HEAD"),
+                None,
+                "形状不对的一行（{bad:?}）当成了提交号：下一帧它就进 argv，回来一句 unknown revision，\
+                 界面上是历史列表整个空掉——比不显示更糟"
+            );
+        }
+        // 只认第一行，后面还有内容照读（git 自己就在 MERGE_HEAD 之后写别的吗不重要，读法要定死）。
+        fs::write(gd.join("MERGE_HEAD"), format!("{sha40}\nrefs/heads/side\n")).unwrap();
+        assert_eq!(head_rev(gd, "MERGE_HEAD").as_deref(), Some(sha40.as_str()));
+        // 大小写都算十六进制。
+        let mixed = "AbCdEf0123456789AbCdEf0123456789AbCdEf0123456789";
+        fs::write(gd.join("MERGE_HEAD"), format!("{mixed}\n")).unwrap();
+        assert_eq!(head_rev(gd, "MERGE_HEAD").as_deref(), Some(mixed));
+        // sha256 仓库给 64 位，这一挡不许把它当垃圾丢掉。
+        let sha64 = "a".repeat(64);
+        fs::write(gd.join("MERGE_HEAD"), format!("{sha64}\n")).unwrap();
+        assert_eq!(head_rev(gd, "MERGE_HEAD").as_deref(), Some(sha64.as_str()));
     }
 
     /// 图序列是一行一行往下排的，靠的是 git 那条保证：**父提交一定排在子提交下面**。
@@ -4586,6 +5120,36 @@ mod tests {
         assert!(st.files.iter().any(|f| f.path == "a.txt" && f.staged));
     }
 
+    /// 冲突合并弹的那句话不能说空话。git 把冲突报告写在 **stdout**、stderr 留空，
+    /// 只读 stderr 的话用户点了「合并」撞出冲突，收到的是 `git command failed: `
+    /// —— 后面一个字都没有，而那恰恰是最该告诉他「去解决冲突」的一下。
+    #[test]
+    fn a_conflicted_merge_says_why_it_failed_instead_of_nothing() {
+        let (_d, p) = init_repo();
+        let base = status(&p).unwrap().branch;
+        git(&p, &["checkout", "-q", "-b", "side"]);
+        fs::write(format!("{}/a.txt", p), "theirs\n").unwrap();
+        git(&p, &["commit", "-q", "-am", "theirs"]);
+        git(&p, &["checkout", "-q", base.as_str()]);
+        fs::write(format!("{}/a.txt", p), "mine\n").unwrap();
+        git(&p, &["commit", "-q", "-am", "mine"]);
+
+        let e = merge_branch(&p, "side").err().expect("这次合并本该冲突").to_string();
+        assert!(!e.trim().is_empty(), "冲突的合并报了一句空话：{e:?}");
+        // git 原文跟着解释走（用户拿它搜得到东西），而那句原文只在 stdout 上。
+        assert!(e.contains("CONFLICT"), "stdout 上那份冲突报告没进解释：{e}");
+        // 解释本身两档语言都有，所以按「说了话」而不是按字面钉。
+        assert_ne!(e, explain_git_error(""), "解释那一格被空串带跑了");
+
+        // stderr 有字时**不许**改用 stdout：那是「真错误」，换成 stdout 等于把
+        // 已经解释对了的那一档挤掉。
+        let both = git_failure(b"real error\n", b"noise on stdout\n", Some(1));
+        assert!(both.contains("real error") && !both.contains("noise"), "两条流同时有字时读错了：{both}");
+        // 两条都空才报退出码 —— 至少不是「什么也没发生」。
+        assert!(git_failure(b"", b"", Some(128)).contains("128"));
+        assert!(git_failure(b"", b"", None).is_empty(), "连退出码都没有时不许编一个数出来");
+    }
+
     #[test]
     fn resolving_with_theirs_stages_that_side_and_continue_finishes_the_merge() {
         let (_d, p) = merge_conflict();
@@ -4830,7 +5394,7 @@ mod tests {
     /// 每一条解释在**两个档位**都要说人话：英文档不许夹进一个汉字，中文档不许退回英文。
     ///
     /// 逐条过，而不是挑几条样本：判据读的就是 `GIT_HINTS` 这一张表本身，所以「某一行
-    /// 忘了填英文半支」这种漏法当场就红——不需要有人记得这张表里一共有哪 30 条。
+    /// 忘了填英文半支」这种漏法当场就红——不需要有人记得这张表里一共有哪几条（现在 33 条）。
     #[test]
     fn every_git_hint_speaks_both_languages() {
         for (needle, zh, en) in GIT_HINTS {
@@ -4870,6 +5434,20 @@ mod tests {
                 "fatal: The current branch main has no upstream branch.\nTo push the current branch and set the remote as upstream, use"
             )
             .contains("当前分支没有关联远程分支")
+        );
+
+        // git 的建议块（`hint:` 起头那几行）**不参与**找解释：那是「下一步怎么办」，
+        // 不是这次的错。回滚冲突就在这儿被那句 `git add/rm <pathspec>` 带跑过 ——
+        // 真仓库里那条见 `a_conflicted_revert_...`，这一条钉的是匹配这一层本身。
+        let reverted = "error: could not revert 91d02ab... add a\n\
+                        hint: After resolving the conflicts, mark them with\n\
+                        hint: \"git add/rm <pathspec>\", then run\n\
+                        hint: \"git revert --continue\".";
+        let out = explain_git_error(reverted);
+        assert!(out.starts_with("这条提交和当前历史撞上了冲突"), "{out}");
+        assert!(
+            out.contains("git add/rm <pathspec>"),
+            "原文里那几句「下一步怎么办」不许被删掉：{out}"
         );
 
         // Unrecognised output must pass through untouched — inventing an
@@ -5043,6 +5621,183 @@ mod tests {
         assert!(status(&p).unwrap().files.is_empty(), "硬重置之后状态里不该还剩东西");
     }
 
+    // ---------------------------------------------------------------- revert
+    //
+    // Three paths, three fixtures: a plain commit, a merge (git refuses it without `-m`),
+    // and a revert that stops on a conflict (which leaves `REVERT_HEAD` behind). The card
+    // and the banner only ever call `revert` / `continue_op` / `abort_op`, so everything the
+    // UI promises about 回滚 has to be decided here, on a real repository.
+
+    /// `init` → `second`, where `second` adds `b.txt`. That file is the whole question a
+    /// plain revert answers, and `init` is what has to survive it.
+    fn revert_fixture() -> (tempfile::TempDir, String, String) {
+        let (dir, p) = init_repo();
+        fs::write(format!("{}/b.txt", p), "b\n").unwrap();
+        git(&p, &["add", "b.txt"]);
+        git(&p, &["commit", "-q", "-m", "second"]);
+        let second = run_git(&p, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        (dir, p, second)
+    }
+
+    #[test]
+    fn reverting_a_commit_lands_an_inverse_commit_and_keeps_the_history() {
+        let (_d, p, second) = revert_fixture();
+        let before = run_git(&p, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        revert(&p, &second).unwrap();
+        assert!(
+            !std::path::Path::new(&format!("{}/b.txt", p)).exists(),
+            "回滚没有撤掉那条提交加上的文件"
+        );
+        let subject = run_git(&p, &["log", "-1", "--format=%s"]).unwrap().trim().to_owned();
+        assert_eq!(subject, "Revert \"second\"", "顶上那条不是 git 自己拟的那句：{subject}");
+        // 这是 `revert` 存在的全部理由，也是它和 `reset --hard` 唯一的区别：历史没被改写。
+        assert_eq!(
+            run_git(&p, &["rev-list", "--count", "HEAD"]).unwrap().trim(),
+            "3",
+            "回滚多落一条提交，但不该少任何一条"
+        );
+        assert!(
+            run_git(&p, &["cat-file", "-e", &format!("{before}^{{commit}}")]).is_ok(),
+            "被回滚的那条提交本身被删掉了"
+        );
+        assert!(status(&p).unwrap().files.is_empty(), "回滚之后状态里不该还剩东西");
+    }
+
+    /// Reverting a merge needs a mainline, and the **raw** call is what proves we added it:
+    /// without the negative control, a `revert` that never passes `--mainline` would stay
+    /// green as long as git somehow picked a parent.
+    #[test]
+    fn reverting_a_merge_undoes_the_side_that_came_in_and_keeps_the_mainline() {
+        let (_d, p) = init_repo();
+        git(&p, &["checkout", "-q", "-b", "side"]);
+        fs::write(format!("{}/side.txt", p), "s\n").unwrap();
+        git(&p, &["add", "side.txt"]);
+        git(&p, &["commit", "-q", "-m", "side work"]);
+        git(&p, &["checkout", "-q", "HEAD^"]);
+        fs::write(format!("{}/a.txt", p), "main\n").unwrap();
+        git(&p, &["commit", "-q", "-am", "main work"]);
+        git(&p, &["merge", "--no-ff", "--no-edit", "-q", "side"]);
+        let merge = run_git(&p, &["rev-parse", "HEAD"]).unwrap().trim().to_owned();
+        let parents = run_git(&p, &["rev-list", "--parents", "-n", "1", &merge]).unwrap();
+        assert_eq!(parents.split_whitespace().count(), 3, "夹具没造出合并提交：{parents}");
+
+        let e = run_git(&p, &["revert", "--no-edit", &merge])
+            .err()
+            .expect("git 本该拒绝回滚一条不带 -m 的合并提交")
+            .to_string();
+        assert!(
+            e.contains("is a merge but no -m option was given"),
+            "git 那句拒绝的话不是这一句，下面那条「我们补了 --mainline」就白验了：{e}"
+        );
+
+        revert(&p, &merge).unwrap();
+        assert!(
+            !std::path::Path::new(&format!("{}/side.txt", p)).exists(),
+            "--mainline 1 该撤掉「合并带进来的那一路」，side 那一侧的文件还在"
+        );
+        assert_eq!(fs::read_to_string(format!("{}/a.txt", p)).unwrap(), "main\n", "第一父亲那一侧的改动不该跟着没");
+        let subject = run_git(&p, &["log", "-1", "--format=%s"]).unwrap().trim().to_owned();
+        assert!(subject.starts_with("Revert "), "顶上那条不是回滚提交：{subject}");
+    }
+
+    /// A revert that conflicts stops the repository on `REVERT_HEAD`. Measured on git 2.54:
+    /// that sentinel is the **only** one there — no `MERGE_HEAD`, no `CHERRY_PICK_HEAD` —
+    /// so `op_at` needs its own arm, and both ways out (finish, undo) clear it.
+    /// The two exits run in two repositories: `--continue` lands a commit, `--abort` moves
+    /// HEAD back, so one fixture cannot show both after-states.
+    #[test]
+    fn a_conflicted_revert_stops_as_a_revert_state_that_finish_and_undo_both_clear() {
+        for finish in ["继续", "中止"] {
+            let (dir, p) = init_repo();
+            fs::write(format!("{}/a.txt", p), "base\n").unwrap();
+            git(&p, &["commit", "-q", "-am", "one"]);
+            let target = run_git(&p, &["rev-parse", "HEAD"]).unwrap().trim().to_owned();
+            fs::write(format!("{}/a.txt", p), "changed\n").unwrap();
+            git(&p, &["commit", "-q", "-am", "two"]);
+            fs::write(format!("{}/a.txt", p), "diverged\n").unwrap();
+            git(&p, &["commit", "-q", "-am", "three"]);
+            let head = run_git(&p, &["rev-parse", "HEAD"]).unwrap().trim().to_owned();
+
+            let e = revert(&p, &target)
+                .err()
+                .expect(format!("{finish} 之前，回滚一条被后来覆盖过的提交本该冲突").as_str())
+                .to_string();
+            // 钉 stderr 上那一句而不是 stdout 上的 `CONFLICT`：两条流同时有字时读的是 stderr
+            // （那是「真错误」），而冲突的那份报告在 revert 这一路只出现在 stderr。
+            assert!(e.contains("could not revert"), "冲突的回滚没把 git 那句拒绝交回来：{e}");
+            assert!(e.contains("停在半路上"), "解释没落到「还能继续 / 还能中止」这一档：{e}");
+            let st = status(&p).unwrap();
+            assert_eq!(st.repo_state, "revert", "停在冲突上的回滚没被认成一种进行中的操作");
+            assert!(
+                st.files.iter().any(|f| f.path == "a.txt" && f.index_status == ChangeStatus::Unmerged),
+                "冲突的那一个文件没出现在待处理里：{:?}",
+                st.files.iter().map(|f| (&f.path, &f.index_status)).collect::<Vec<_>>()
+            );
+            // 「看不到冲突的提交」那一族的老边界：横幅与历史都要这条号，revert 也一样得给。
+            assert_eq!(
+                st.op_rev.as_deref(),
+                Some(target.as_str()),
+                "revert 的进行中操作没带上正卡住的那条提交"
+            );
+
+            if finish == "继续" {
+                fs::write(format!("{}/a.txt", p), "手工合好的\n").unwrap();
+                mark_resolved(&p, "a.txt").unwrap();
+                continue_op(&p).unwrap();
+                let after = status(&p).unwrap();
+                assert_eq!(after.repo_state, "none", "继续完了还报着进行中的回滚");
+                assert_eq!(fs::read_to_string(format!("{}/a.txt", p)).unwrap(), "手工合好的\n");
+                assert_eq!(
+                    run_git(&p, &["rev-list", "--count", "HEAD"]).unwrap().trim(),
+                    "5",
+                    "继续该在 HEAD 上落一条回滚提交"
+                );
+            } else {
+                abort_op(&p).unwrap();
+                let after = status(&p).unwrap();
+                assert_eq!(after.repo_state, "none", "中止了还报着进行中的回滚");
+                assert_eq!(run_git(&p, &["rev-parse", "HEAD"]).unwrap().trim(), head, "中止没把 HEAD 放回去");
+                assert_eq!(fs::read_to_string(format!("{}/a.txt", p)).unwrap(), "diverged\n", "中止把冲突标记留在了工作区");
+                assert!(
+                    !dir.path().join(".git").join("REVERT_HEAD").exists(),
+                    "中止之后 REVERT_HEAD 还在"
+                );
+            }
+        }
+    }
+
+    /// A revision git cannot resolve must not become a `git revert` with a guessed parent
+    /// count — and a root commit (one token, no parents) is **not** that case. These two
+    /// halves are the boundary `parent_count` sits on: `n < 2` looked reasonable and would
+    /// have refused every initial commit.
+    #[test]
+    fn a_bad_revision_reports_but_the_initial_commit_is_revertable() {
+        let (_d, p, _) = revert_fixture();
+        let e = revert(&p, "0000000000000000000000000000000000000000")
+            .err()
+            .expect("回滚一条不存在的提交不该假装成功")
+            .to_string();
+        assert!(!e.trim().is_empty(), "坏号回来一句空话，界面上看不出来是谁的锅");
+        assert_eq!(
+            run_git(&p, &["rev-list", "--count", "HEAD"]).unwrap().trim(),
+            "2",
+            "读父亲数失败时不该顺手改仓库"
+        );
+
+        // 那条「回滚到什么都没有」的提交：`init` 是根提交，`rev-list --parents` 只印它自己。
+        let root = run_git(&p, &["rev-parse", "HEAD~1"]).unwrap().trim().to_owned();
+        assert_eq!(
+            run_git(&p, &["rev-list", "--parents", "-n", "1", &root]).unwrap().split_whitespace().count(),
+            1,
+            "夹具失效：{root} 不是根提交，下面那条「根提交回滚得动」是空判"
+        );
+        revert(&p, &root).unwrap();
+        assert!(
+            !std::path::Path::new(&format!("{}/a.txt", p)).exists(),
+            "回滚根提交该把它加的文件撤掉"
+        );
+    }
+
     /// `origin/feature/x` belongs to `origin` and is called `feature/x` — cutting at the
     /// **last** `/` would call it `x` and create a branch that tracks the right ref under
     /// the wrong name.
@@ -5173,5 +5928,26 @@ mod tests {
             "second/side",
             "点的是 second/side，上游却记到别处去了"
         );
+    }
+    /// git 的 stdout 本来就躺在那块 `Vec<u8>` 里，合法 UTF-8 时 `String::from_utf8`
+    /// **直接接管那块内存**（`into_raw_parts` → `String::from_raw_parts`，指针都不换）。
+    /// 改造前那一版写的是 `decode(&out.stdout)`，也就是 `from_utf8_lossy(..).into_owned()`：
+    /// 每取一次补丁就多复制一份正文——30 002 行的 `git diff` 是 1.4 MB，峰值里两份同时在，
+    /// 而这一批的起点正是那 1.4 MB 的重复（记录见 docs/PROCESS.md 内存那一批）。
+    ///
+    /// 反向变异两条：① 把这一行退回 `from_utf8_lossy(&bytes).into_owned()` → 第一句红
+    /// （指针换了）；② 把非法那一档的兜底改成 `String::new()` → 后两句红
+    /// （GBK 路径名那一档本来就是为了「整本仓库读得动」留的，见上面那段注释）。
+    #[test]
+    fn git_stdout_is_taken_over_rather_than_copied() {
+        let bytes = "diff --git a/x b/x\n+++ b/x\n".as_bytes().to_vec();
+        let ptr = bytes.as_ptr() as usize;
+        let text = decode_owned(bytes);
+        assert_eq!(text.as_ptr() as usize, ptr, "合法 UTF-8 的 stdout 又被复制了一份");
+
+        // 非法那一档只退回转码，**内容口径不许变**：一个坏字节不该把前面读对的中文也丢掉。
+        let mixed = decode_owned(vec![0xe4, 0xb8, 0xad, 0xff, 0x20]);
+        assert!(mixed.starts_with('\u{4e2d}'), "合法前缀没留着：{mixed:?}");
+        assert!(mixed.ends_with("\u{FFFD} "), "坏字节没换成 U+FFFD：{mixed:?}");
     }
 }

@@ -123,6 +123,100 @@ pub(crate) const COL_GRAPH: f32 = 48.0;
 pub(crate) const COL_AUTHOR: f32 = 96.0;
 pub(crate) const COL_DATE: f32 = 78.0;
 pub(crate) const NO_W: f32 = 30.0;
+
+/// 日志里那四列定宽列**可以拖**的当前宽度：图、提交号、作者、日期。
+///
+/// 传一个结构而不是四个 `f32`：这四格在每一处调用点都是成对读的，散着传早晚有一处传反。
+/// 默认档就是 §2 那四个常量（48 / 66 / 96 / 78），所以没拖过的时候、以及无头夹具不填这四格时，
+/// 排版和 S6 那批写死字面值的判据逐像素一致。
+/// 提交信息那一格不在这里：它是**唯一**弹性的那一格，宽度由其余四格和带宽决定，
+/// 拖它左边那条边界改的是它右边那一列（见 `ColEdge`）。
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) struct ColW {
+    pub(crate) graph: f32,
+    pub(crate) sha: f32,
+    pub(crate) author: f32,
+    pub(crate) date: f32,
+}
+
+impl Default for ColW {
+    fn default() -> ColW {
+        ColW { graph: COL_GRAPH, sha: COL_SHA, author: COL_AUTHOR, date: COL_DATE }
+    }
+}
+
+/// 拖拽的两档上下限。
+///
+/// 图列下限就是 §2 那个 48：四道正好落在 12/22/32/42、圆点右沿 46（见
+/// `four_lanes_stay_inside_the_forty_eight_point_column`），再往窄拖就要开始把车道
+/// 挤出列去。往上拖是**买车道**：道距写死 10，列宽 96 就装得下 8 道，
+/// 那条「八爪合并越界」的边界由此交给用户而不是我们再拍一个数。
+/// 提交号列上下限管的是「几位哈希 + 弹性那列还剩多少」，见 `revision_text`。
+/// 作者 / 日期两档是 2026-11-17 跟着「四列都能拖」加上的：下限 48 沿用图列那一档
+/// （§2 给的最窄列宽，也是提交号的下限），上限 320 沿用图列上限；真正把四列拦住的是
+/// `col_room` 那道带宽闸。出处见 DESIGN.md §7。
+pub(crate) const GRAPH_W_MIN: f32 = 48.0;
+pub(crate) const GRAPH_W_MAX: f32 = 320.0;
+pub(crate) const SHA_W_MIN: f32 = 48.0;
+pub(crate) const SHA_W_MAX: f32 = 240.0;
+pub(crate) const AUTHOR_W_MIN: f32 = 48.0;
+pub(crate) const AUTHOR_W_MAX: f32 = 320.0;
+pub(crate) const DATE_W_MIN: f32 = 48.0;
+pub(crate) const DATE_W_MAX: f32 = 320.0;
+/// 列边界上那条命中条的宽：6pt 居中压在 1pt 那条竖线上。
+/// 再窄就变成「要瞄准」——§2 那条竖线本身只有 1pt，谁也没法按得准。
+pub(crate) const COL_SPLIT_W: f32 = 6.0;
+
+impl ColW {
+    /// 夹回这四档。拖拽每帧都要过一次：`drag_delta` 累加到屏幕外面是不封顶的。
+    pub(crate) fn clamped(self) -> ColW {
+        ColW {
+            graph: self.graph.clamp(GRAPH_W_MIN, GRAPH_W_MAX),
+            sha: self.sha.clamp(SHA_W_MIN, SHA_W_MAX),
+            author: self.author.clamp(AUTHOR_W_MIN, AUTHOR_W_MAX),
+            date: self.date.clamp(DATE_W_MIN, DATE_W_MAX),
+        }
+    }
+}
+
+/// 弹性那一格（提交信息）的下限。四列各自守着自己的上下限，**合起来**还是能把这一格挤没：
+/// 窗口地板 860 那一档带宽只有 `860 − 188 = 672`，图列 320 + 提交号 240 + 作者 320 + 日期 320
+/// 就已经远超它了。这一挡只能在壳里算 —— widget 那一层不知道带宽是多少。
+/// 120 是「提交信息至少还认得出一个词」的自拍档，出处见 DESIGN.md §7。
+pub(crate) const MSG_W_MIN: f32 = 120.0;
+
+/// 某一列**最多**还能占多少：带宽减掉**其余三列**之和与弹性那一格的下限。
+/// `others` 由调用方按列算好（四列合谋正是这一道闸要拦的那种合谋）。
+/// 下限那一段（`.max(min)`）是给「窗口比四列之和还窄」那种理论情况兜底的，
+/// 有 §2 的窗口地板在，实践中走不到；但 `clamp` 的 `min > max` 是直接 panic，
+/// 不能把这条路留给运气。
+pub(crate) fn col_room(band: f32, others: f32, min: f32) -> f32 {
+    (band - others - MSG_W_MIN).max(min)
+}
+
+/// 等宽 11px 一个字符实测多宽（§2 那格 66 = 12 内缩 + 7 位 46.2 + 8 余量，反推出来的数）。
+pub(crate) const SHA_CHAR_W: f32 = 6.6;
+/// 提交号那一格右边留的余量，和上面那条公式里的 8 同一个来源。
+pub(crate) const SHA_PAD: f32 = 8.0;
+
+/// 提交号这一列**拖宽了要多看几位**：给进来的字仍是 git 自己算的短号（那保证唯一），
+/// 列够宽就从完整号里往后补，补到这一列装得下为止；补不满 40 位时无所谓，
+/// 那一列本来就是给人认号用的。
+/// **窄的时候一个字都不减**：短号的位数是「认得出这条提交最少要几位」，
+/// 把它切成 6 位就可能在忙仓库里撞号——那不是「列变窄」，那是认错提交。
+pub(crate) fn revision_text(short: &str, full: &str, sha_w: f32) -> String {
+    // 这一列装得下几位哈希：减去左内缩与右余量，再按等宽字宽除。
+    let fit = ((sha_w - COL_INSET - SHA_PAD) / SHA_CHAR_W).floor().max(1.0) as usize;
+    // 短号本身一位都不许切：那几位是 git 算出来的「认得出这条提交最少要几位」，
+    // 切一位就可能在一本忙仓库里撞号——那不是列变窄，那是认错提交。
+    // 完整号不是短号的后缀时（别的 git 算过、或短号带省略号）也照原样给短号，
+    // 不许拼出一个谁也没见过的号。
+    if short.chars().count() >= fit || !full.starts_with(short) {
+        return short.to_string();
+    }
+    full.chars().take(fit).collect()
+}
+
 /// 图序列的车道几何。§2 把图列从 57 收到 **48**，四档车道（§3.3 有 `LANE_1..4` 四枚色）
 /// 在旧档上装不下：第 0 道中心 22.75 + 3×12 = 58.75 早就越列。
 /// 于是拍成**第 0 道中心离列左缘 12、道距 10**：四道落在 12/22/32/42，圆点（半径 4）

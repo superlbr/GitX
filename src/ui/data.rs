@@ -94,7 +94,7 @@ pub(crate) fn snapshot_of(repo: &str, topo: bool, scope: &git::Scope) -> gitx::R
     // 日期序是 SourceTree 的默认；「层级顺序」把分支聚在一起，图序列读起来才是一条条分支。
     // 第一页走 `skip = 0`：核心层不发消息里那条 `--skip`（`the_page_offset_only_adds_skip` 钉过），
     // 所以这一句和原来分三条路的写法发给 git 的 argv 逐字节相同。
-    let commits = git::commits_page(repo, 0, LOG_PAGE, topo, &scope)?;
+    let commits = git::commits_page(repo, 0, LOG_PAGE, topo, &scope, status.op_rev.as_deref())?;
     // 车道在这里排完：这一句跑在 worker 线程上，帧里只剩「按行号取一条 GraphRow」。
     let graph = layout_graph(&commits);
     let branches = git::branches(repo)?;
@@ -180,7 +180,7 @@ pub(crate) fn spawn_file_log(tx: &Sender<Msg>, repo: &str, path: &str, seq: u64)
 pub(crate) fn spawn_history_patch(tx: &Sender<Msg>, repo: &str, oid: &str, path: &str, seq: u64, index: usize) {
     let (tx, repo, path, oid) = (tx.clone(), repo.to_owned(), path.to_owned(), oid.to_owned());
     gitx::lang::spawn(move || {
-        let lines = git::commit_patch(&repo, &oid, Some(&path)).map(|p| layout(&p, false)).unwrap_or_default();
+        let lines = git::commit_patch(&repo, &oid, Some(&path)).map(|p| layout(p, false)).unwrap_or_default();
         let _ = tx.send(Msg::HistoryPatch { repo, seq, path, index, lines });
     });
 }

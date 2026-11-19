@@ -10,7 +10,7 @@ use gitx::tr;
 use std::sync::mpsc::{Receiver, Sender};
 
 use crate::ui::graph::*;
-use crate::ui::theme::DESC_ROWS;
+use crate::ui::theme::{ColW, COL_AUTHOR, COL_DATE, COL_GRAPH, COL_SHA, DESC_ROWS};
 use crate::ui::diffmodel::*;
 
 /// 主区域选中的行。虚拟行「Uncommitted changes」就是工作区页——SourceTree 只有一页。
@@ -152,9 +152,9 @@ pub(crate) enum Action {
     MarkResolved(String),
     /// 把冲突标记放回去（`git checkout -m`），文件重新回到未解决那一组。
     MarkUnresolved(String),
-    /// 继续合并 / 遴选 / 变基。`state` 是打开这一刻的快照状态，只用来选文案。
+    /// 继续合并 / 遴选 / 变基 / 回滚。`state` 是打开这一刻的快照状态，只用来选文案。
     ContinueOp { state: String },
-    /// 终止合并 / 遴选 / 变基。会丢东西，`land` 里要过确认。
+    /// 终止合并 / 遴选 / 变基 / 回滚。会丢东西，`land` 里要过确认。
     AbortOp { state: String },
     /// 在浏览器里打开这个远端的仓库主页。`String` 是远端名（工具条那枚固定 `origin`，
     /// 侧栏「远端」的菜单带的是被右键那一条的名字）。
@@ -179,6 +179,19 @@ pub(crate) enum Action {
     /// 它不进 `needs_confirm`：开它的那张卡本身就是那一句「先问一下」——三档摆在你面前、
     /// 每一档写明丢什么，再叠一层确认只会让人以为第一下已经落了。
     Reset { oid: String, mode: git::ResetMode },
+    /// 回滚历史里那条提交：不改写历史，在它上面补一条反向提交（`git revert`）。
+    /// 和 `Reset` 的区别要说清：**这条一条提交都不删**，别人已经拉走的历史不用强推。
+    /// 不过确认卡（同 `Merge`）：它不删任何东西，冲突时 git 自己停在 `REVERT_HEAD` 上，
+    /// 横幅那句「未解决的回滚」和「继续 / 终止」接着说话——拦人的那一层在 core，不在卡上。
+    Revert(String),
+    /// 把某条提交里的**一块**反着打回工作区（差异区 hunk 头右端那枚「回滚区块」）。
+    /// 和 `Revert` 不是一回事：这条不落提交、不动历史，只在工作区那个文件上撤掉这一块。
+    /// `path` 为 `None` = 当前看的是整条提交的补丁，块号跨文件数（`git::hunk_patch` 同一套）。
+    RevertHunk { oid: String, path: Option<String>, hunk: usize },
+    /// 只回滚某条提交里的**一行**（差异区右键「回滚这一行」）。`added` = 那一行在提交里
+    /// 是新增还是删除，`no` 是它在那一侧的行号，`text` 是**去掉 `+`/`-` 之后**的正文。
+    /// 零上下文补丁的校验全在 `git::revert_line` 里（行号对不上就拒），所以这条也不过确认卡。
+    RevertLine { path: String, added: bool, no: u32, text: String },
 }
 
 /// 等在一帧之外跑的**原生面板**。为什么不当场就弹：`land()` 是在 `Panel::show` 的闭包跑完
@@ -544,6 +557,45 @@ fn bit(on: bool) -> &'static str {
         "true"
     } else {
         "false"
+    }
+}
+
+/// 拖过的四列宽度存在 core 那张 `settings` 表里（和 `gitx_prefs_*` 同一张）。
+///
+/// 没并进 `Prefs`：那一格是**偏好卡上那几枚真的接得通的开关**（见它的文档），
+/// 列宽不在卡上，硬塞进去只会让「prefs 变了」那条比较多带四格没人改的东西。
+impl ColW {
+    const KEY_GRAPH: &'static str = "gitx_col_graph_w";
+    const KEY_SHA: &'static str = "gitx_col_sha_w";
+    const KEY_AUTHOR: &'static str = "gitx_col_author_w";
+    const KEY_DATE: &'static str = "gitx_col_date_w";
+
+    /// 没库、没存过、或存的不是一个数 → §2 的默认档；再夹一遍，
+    /// 免得旧版本存下的越界值把排版钉在一个装不下车道的宽度上。
+    pub(crate) fn load(conn: Option<&Connection>) -> ColW {
+        let read = |key: &str, default: f32| -> f32 {
+            let Some(c) = conn else { return default };
+            db::get_setting(c, key)
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        };
+        ColW {
+            graph: read(Self::KEY_GRAPH, COL_GRAPH),
+            sha: read(Self::KEY_SHA, COL_SHA),
+            author: read(Self::KEY_AUTHOR, COL_AUTHOR),
+            date: read(Self::KEY_DATE, COL_DATE),
+        }
+        .clamped()
+    }
+
+    pub(crate) fn save(&self, conn: Option<&Connection>) {
+        let Some(c) = conn else { return };
+        let _ = db::set_setting(c, Self::KEY_GRAPH, &format!("{}", self.graph));
+        let _ = db::set_setting(c, Self::KEY_SHA, &format!("{}", self.sha));
+        let _ = db::set_setting(c, Self::KEY_AUTHOR, &format!("{}", self.author));
+        let _ = db::set_setting(c, Self::KEY_DATE, &format!("{}", self.date));
     }
 }
 
@@ -1002,6 +1054,10 @@ pub(crate) enum Msg {
     HistoryText { repo: String, seq: u64, path: String, index: usize, text: String },
     HistoryBlame { repo: String, seq: u64, path: String, lines: Vec<BlameLine> },
     Failed(String),
+    /// 动作**成功**落地后要说的一句话。绝大多数动作不需要它（提交完日志自己就换了、
+    /// 暂存完文件自己就挪了栏），但「回滚提交里的一块 / 一行」落点在工作区，而用户
+    /// 正看着那条提交的差异——那一格一个字都不会变，不说一句就等于「点了没反应」。
+    Note(String),
     /// 推送这一路**单独**回的字：成功 `Ok(())`、失败 `Err(原因)`。状态栏靠它报
     /// 「正在推送 / 推送完成 / 推送失败」，而不是只弹一条 toast。
     PushDone(std::result::Result<(), String>),
@@ -1071,6 +1127,10 @@ pub struct Gitx {
     pub(crate) scope: git::Scope,
     /// 「显示远程分支」：只管日志行上**远程药丸画不画**，不动取列表的参数。
     pub(crate) show_remote: bool,
+    /// 日志那四列**可以拖**的当前宽度（图、提交号、作者、日期）。默认档就是 §2 的
+    /// 48 / 66 / 96 / 78，所以没拖过的人看到的排版和以前逐像素一样；拖完松开那一刻落库
+    /// （`ColW::save`），下次起来还是这个样子。
+    pub(crate) log_cols: ColW,
     /// 日志还有下一页吗。上一次取回不满一页就是到底了，别再问。
     pub(crate) log_more: bool,
     /// 下一页在路上。不立这个牌子，滚到底的那几帧会连着发好几遍同一个请求。
@@ -1134,6 +1194,11 @@ pub struct Gitx {
     /// 第一次只把按钮换成「确认放弃」，仓库一个字节都不动（判据见
     /// `a_discard_needs_two_clicks`）。换差异、换仓库、按 Esc 都会取消。
     pub(crate) pending_discard: Option<usize>,
+    /// 差异区右键那一下落在 `diff` 的第几行上（「回滚这一行」要照着它取行号与正文）。
+    /// 为什么记在 state 里而不是帧里的局部变量：菜单开了之后指针就移到菜单上了，
+    /// 再按「指针底下是哪一行」去问会问空——那一项会在菜单开着的时候自己消失。
+    /// 右键那一帧 latch 进来，菜单关掉（`container_context_menu` 回 `None`）那一帧清掉。
+    pub(crate) diff_menu_line: Option<usize>,
     /// 「文件历史」浮层（见 `FileHistory`）。和模态卡一样铺满整屏，但它不是一次性动作，
     /// 所以单独一层、单独的状态。
     pub(crate) history: Option<FileHistory>,

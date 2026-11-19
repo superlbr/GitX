@@ -200,7 +200,7 @@ pub(crate) fn row_hot(resp: &egui::Response) -> bool {
 ///
 /// 交回 `Response` 而不是 `bool`：调用方还要给这一行挂右键菜单，菜单得挂在同一个
 /// 命中矩形上，用 `clicked()` 折成 bool 之后那枚矩形就找不回来了。
-pub(crate) fn log_row(ui: &mut egui::Ui, width: f32, cells: &Cells, active: bool, graph: Option<&GraphRow>) -> egui::Response {
+pub(crate) fn log_row(ui: &mut egui::Ui, width: f32, cells: &Cells, active: bool, graph: Option<&GraphRow>, cols: ColW) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, ROW_H), Sense::click());
     let p = ui.painter_at(rect);
     // §4.6 选中态：`ACCENT_SOFT` 铺底 + 左缘 2pt `ACCENT` 竖条，**文字不反白**。
@@ -235,13 +235,14 @@ pub(crate) fn log_row(ui: &mut egui::Ui, width: f32, cells: &Cells, active: bool
     // 与 `TEXT_SECONDARY` 两档灰度（§2 原则②）。选中那一行**不换色**，只加粗（§4.6）。
     let right = rect.max.x;
     // §2 五列：图 48 | 提交号 66 | 提交信息（弹性）| 作者 96 | 日期 78。文字一律从自己列的
-    // 左缘往里缩 `COL_INSET` 起笔。
-    let author_x = right - COL_DATE - COL_AUTHOR;
-    let date_x = right - COL_DATE;
+    // 左缘往里缩 `COL_INSET` 起笔。**四列的宽都可以拖**（`ColW`），默认档就是 §2 那四个数；
+    // 弹性只有提交信息那一格，它吃掉剩下的。
+    let author_x = right - cols.date - cols.author;
+    let date_x = right - cols.date;
     // 提交号：等宽 11px、比作者/日期再低一档（`TEXT_MUTED`）——它是指认用的坐标，
     // 不是正文。虚拟行没有号，这一段就空着。
     if !cells.short.is_empty() {
-        put_left(ui, band(rect, rect.min.x + COL_GRAPH + COL_INSET, COL_SHA - COL_INSET, ROW_H), |ui| {
+        put_left(ui, band(rect, rect.min.x + cols.graph + COL_INSET, cols.sha - COL_INSET, ROW_H), |ui| {
             ui.add(
                 Label::new(
                     RichText::new(cells.short.as_str())
@@ -261,14 +262,14 @@ pub(crate) fn log_row(ui: &mut egui::Ui, width: f32, cells: &Cells, active: bool
     // 而药丸、底色、hover 那几块都是按行中心摆的——差这 1.5pt 时按 y 认领图元的判据会认空。
     let meta = FontId { size: 12.0, family: ui.style().text_styles[&TextStyle::Body].family.clone() };
     for (x, w, txt) in [
-        (author_x + COL_INSET, COL_AUTHOR - COL_INSET, &cells.author),
-        (date_x + COL_INSET, COL_DATE - COL_INSET, &cells.date),
+        (author_x + COL_INSET, cols.author - COL_INSET, &cells.author),
+        (date_x + COL_INSET, cols.date - COL_INSET, &cells.date),
     ] {
         put_left(ui, band(rect, x, w, ROW_H), |ui| {
             ui.add(Label::new(RichText::new(txt.as_str()).font(meta.clone()).color(TEXT_SECONDARY)).truncate().selectable(false));
         });
     }
-    let x0 = rect.min.x + COL_GRAPH + COL_SHA + COL_INSET;
+    let x0 = rect.min.x + cols.graph + cols.sha + COL_INSET;
     // 药丸占掉提交信息列的开头，文字从药丸后面起笔。
     let x = if cells.badges.is_empty() { x0 } else { pill_row(&p, rect, &cells.badges, x0) + PILL_AFTER };
     let w = (author_x - x - 8.0).max(60.0);
@@ -961,30 +962,133 @@ pub(crate) fn hunk_button(ui: &mut egui::Ui, text: &str, right: f32, cy: f32) ->
     (clicked, w)
 }
 
-pub(crate) fn header_row(ui: &mut egui::Ui, width: f32) {
+/// 表头那四条**可以拖**的列边界：图 \| 提交号、提交号 \| 提交信息、提交信息 \| 作者、作者 \| 日期。
+///
+/// 一条边界管的是它**右边那一列**的宽：拖「提交信息 \| 作者」改的是作者那一格，
+/// 提交信息跟着伸缩。提交信息自己是弹性列，没有档位可拖——它左边那条边界归提交号，
+/// 它右边那条归作者，两边都动它就动。
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum ColEdge {
+    Graph,
+    Sha,
+    Author,
+    Date,
+}
+
+impl ColEdge {
+    /// 表头四条竖线从左到右的顺序，命中条按这一份铺。
+    pub(crate) const ALL: [ColEdge; 4] = [ColEdge::Graph, ColEdge::Sha, ColEdge::Author, ColEdge::Date];
+
+    /// 这一条边界拖的是哪一列的宽。
+    fn width(self, cols: ColW) -> f32 {
+        match self {
+            ColEdge::Graph => cols.graph,
+            ColEdge::Sha => cols.sha,
+            ColEdge::Author => cols.author,
+            ColEdge::Date => cols.date,
+        }
+    }
+
+    /// 这一列自己的下限：带宽闸给的那一档不许低过它。上限由 `ColW::clamped` 兜。
+    fn min(self) -> f32 {
+        match self {
+            ColEdge::Graph => GRAPH_W_MIN,
+            ColEdge::Sha => SHA_W_MIN,
+            ColEdge::Author => AUTHOR_W_MIN,
+            ColEdge::Date => DATE_W_MIN,
+        }
+    }
+
+    /// **其余三列**之和：带宽闸要从带宽里把它们扣掉。
+    fn others(self, cols: ColW) -> f32 {
+        match self {
+            ColEdge::Graph => cols.sha + cols.author + cols.date,
+            ColEdge::Sha => cols.graph + cols.author + cols.date,
+            ColEdge::Author => cols.graph + cols.sha + cols.date,
+            ColEdge::Date => cols.graph + cols.sha + cols.author,
+        }
+    }
+
+    /// 把这一列的宽写成 `w`，其余三列原样带过去。
+    fn with(self, cols: ColW, w: f32) -> ColW {
+        match self {
+            ColEdge::Graph => ColW { graph: w, ..cols },
+            ColEdge::Sha => ColW { sha: w, ..cols },
+            ColEdge::Author => ColW { author: w, ..cols },
+            ColEdge::Date => ColW { date: w, ..cols },
+        }
+    }
+
+    /// 拖这一下的增量是**加**还是**减**在这一列的宽上：看这一列钉在哪一边。
+    ///
+    /// 图 / 提交号从窗口左缘往右排，它的边界是这一列的**右缘**，往右拖是变宽。
+    /// 作者 / 日期从窗口右缘往左排，它的边界是这一列的**左缘**，往右拖是变窄。
+    /// 符号只在这儿翻一处，翻的目标只有一个：**边界跟着指针走**
+    /// （`every_column_boundary_follows_the_pointer` 量的就是这一件事）。用户不需要知道
+    /// 自己那一下是让哪一列变宽，他只需要看到那条竖线始终在手指底下。
+    fn signed(self, dx: f32) -> f32 {
+        match self {
+            ColEdge::Graph | ColEdge::Sha => dx,
+            ColEdge::Author | ColEdge::Date => -dx,
+        }
+    }
+}
+
+/// 在某一列的边界上横拖 `dx` 之后的四列宽度：**两道闸**各管一件事。
+///
+/// - 这一列自己的两档：下限 `edge.min()` 是这里拍的（带宽闸给的档不许低过它），
+///   上限由 `ColW::clamped` 兜——四格各守一对，见 `theme.rs` 那八枚 `*_W_MIN/MAX`。
+/// - `col_room`：带宽扣掉**其余三列**与弹性那一格的下限。四列都能拖之后，
+///   常数档管不住「四列一起顶到各自上限」这种合谋——那只有知道带宽的这一层拦得住。
+///
+/// 写在 widget 这一层而不是 `ColW` 上：`ColEdge` 是表头那四条命中条的概念，
+/// 上下限、指针方向和带宽闸都跟着它走，拆两处早晚有一处漏一列。
+pub(crate) fn drag_column(cols: ColW, edge: ColEdge, dx: f32, band: f32) -> ColW {
+    let min = edge.min();
+    let want = (edge.width(cols) + edge.signed(dx)).clamp(min, col_room(band, edge.others(cols), min));
+    edge.with(cols, want).clamped()
+}
+
+/// 这一帧在某一条列边界上拖了多少、以及这一下完了没有。
+/// `done` 单独立一枚而不是「dx == 0」：拖到最后一帧的增量本来就可能是 0，
+/// 而落库要挂在**松开那一帧**上，不能挂在「没挪动」上。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ColDrag {
+    pub(crate) edge: ColEdge,
+    pub(crate) dx: f32,
+    pub(crate) done: bool,
+}
+
+/// 表头那一行，顺带回答「这一帧有没有在拖列边界」。
+///
+/// 交回而不是直接改宽度：这一位在面板闭包里跑，`self` 正被 `snap` 借着（同 `Intent`）。
+pub(crate) fn header_row(ui: &mut egui::Ui, width: f32, cols: ColW) -> Option<ColDrag> {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, LOG_HEAD_H), Sense::hover());
     let p = ui.painter();
     let right = rect.max.x;
     // 表头文字走 §3.4「次要」档（12px `TEXT_SECONDARY`，预览稿 `.lh{font-size:12}`），
     // 列的排法**跟着数据那一行同一条竖线起笔**：各列的文字都离自己列的左边线 `COL_INSET`。
     // 「图表」仍旧整格居中（预览稿 `.lh .g` 空着、`.lr` 那一格画的是图元）。
-    let g = band(rect, rect.min.x, COL_GRAPH, 13.0);
+    let g = band(rect, rect.min.x, cols.graph, 13.0);
     p.text(g.center_top(), Align2::CENTER_TOP, tr!("图表", "Graph"), FontId::proportional(12.0), TEXT_SECONDARY);
-    let author_x = right - COL_DATE - COL_AUTHOR;
-    let date_x = right - COL_DATE;
-    let sha_x = rect.min.x + COL_GRAPH;
+    // 作者 / 日期从右缘往左定，这两格的宽现在也归 `ColW`（拖「作者 | 日期」这条边界
+    // 动的是日期那一格，作者跟着整列平移）。
+    let author_x = right - cols.date - cols.author;
+    let date_x = right - cols.date;
+    let sha_x = rect.min.x + cols.graph;
     for (x, w, label) in [
-        (sha_x + COL_INSET, COL_SHA - COL_INSET, tr!("提交号", "Revision")),
-        (sha_x + COL_SHA + COL_INSET, author_x - sha_x - COL_SHA - COL_INSET, tr!("提交信息", "Message")),
-        (author_x + COL_INSET, COL_AUTHOR - COL_INSET, tr!("作者", "Author")),
-        (date_x + COL_INSET, COL_DATE - COL_INSET, tr!("日期", "Date")),
+        (sha_x + COL_INSET, cols.sha - COL_INSET, tr!("提交号", "Revision")),
+        (sha_x + cols.sha + COL_INSET, author_x - sha_x - cols.sha - COL_INSET, tr!("提交信息", "Message")),
+        (author_x + COL_INSET, cols.author - COL_INSET, tr!("作者", "Author")),
+        (date_x + COL_INSET, cols.date - COL_INSET, tr!("日期", "Date")),
     ] {
         p.text(band(rect, x, w, 13.0).left_top(), Align2::LEFT_TOP, label, FontId::proportional(12.0), TEXT_SECONDARY);
     }
     // 列边界上的**四条**竖线（1pt 宽、16pt 高）：图 \| 提交号、提交号 \| 提交信息、
     // 提交信息 \| 作者、作者 \| 日期。
     let y0 = rect.center().y - RULE_H / 2.0;
-    for x in [sha_x, sha_x + COL_SHA, author_x, date_x] {
+    let edges = [sha_x, sha_x + cols.sha, author_x, date_x];
+    for x in edges {
         p.line_segment([pos2(x, y0), pos2(x, y0 + RULE_H)], Stroke::new(1.0, BORDER_SUBTLE));
     }
     // 表头上下各一条横线，把这一条从筛选条与日志里隔开。
@@ -996,6 +1100,28 @@ pub(crate) fn header_row(ui: &mut egui::Ui, width: f32) {
         [pos2(rect.min.x, rect.max.y - 0.5), pos2(right, rect.max.y - 0.5)],
         Stroke::new(1.0, BORDER_SUBTLE),
     );
+    // **四条**竖线上各压一条 `COL_SPLIT_W` 宽的命中条：按住左右拖就改这一列的宽，
+    // 鼠标扫过去光标换成 `ResizeEast`（那是「这儿能拖」唯一说得出话的方式）。
+    // 这一段排在**所有绘制之后**：`ui.painter()` 借的是 `&ui`，而 `allocate_rect` 要 `&mut ui`。
+    let mut drag = None;
+    for (edge, x) in ColEdge::ALL.iter().copied().zip(edges) {
+        let r = Rect::from_min_max(
+            pos2(x - COL_SPLIT_W / 2.0, rect.min.y),
+            pos2(x + COL_SPLIT_W / 2.0, rect.max.y),
+        );
+        let resp = ui.allocate_rect(r, Sense::drag());
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeEast);
+        }
+        // `drag_stopped` 那一帧的 `drag_delta` 已经不再可靠，所以松开这帧只报「拖完了」
+        // （落库），宽度留给前面那些 `dragged` 帧去累加。
+        if resp.drag_stopped() {
+            drag = Some(ColDrag { edge, dx: 0.0, done: true });
+        } else if resp.dragged() {
+            drag = Some(ColDrag { edge, dx: resp.drag_delta().x, done: false });
+        }
+    }
+    drag
 }
 
 // ------------------------------------------------------------------------ 小组件
@@ -1374,13 +1500,14 @@ pub(crate) fn needs_confirm(a: &Action) -> bool {
     )
 }
 
-/// 两种操作轨迹在横幅和确认卡上的叫法。SourceTree 的中文文案：合并叫「合并」，
-/// 遴选叫「遴选」，变基叫「变基」。
+/// 几种操作轨迹在横幅和确认卡上的叫法。SourceTree 的中文文案：合并叫「合并」，
+/// 遴选叫「遴选」，变基叫「变基」，回滚叫「回滚」。
 pub(crate) fn op_noun(state: &str) -> &'static str {
     match state {
         "merge" => tr!("合并", "merge"),
         "cherry-pick" => tr!("遴选", "cherry-pick"),
         "rebase" => tr!("变基", "rebase"),
+        "revert" => tr!("回滚", "revert"),
         _ => tr!("操作", "operation"),
     }
 }
@@ -1392,6 +1519,7 @@ pub(crate) fn op_title(state: &str) -> Option<&'static str> {
         "merge" => Some(tr!("未解决的合并：", "Unresolved merge:")),
         "cherry-pick" => Some(tr!("未解决的遴选：", "Unresolved cherry-pick:")),
         "rebase" => Some(tr!("未解决的变基:", "Unresolved rebase:")),
+        "revert" => Some(tr!("未解决的回滚：", "Unresolved revert:")),
         _ => None,
     }
 }
@@ -1584,6 +1712,10 @@ pub(crate) fn commit_menu(ui: &mut egui::Ui, oid: &str, subject: &str, intent: &
     menu_card(ui, tr!("从这里新建分支", "New branch from here"), || Modal::new_branch_at(Some(full.clone())), intent);
     menu_card(ui, tr!("在这条提交上打标签", "Tag this commit"), || Modal::new_tag(full.clone(), subject.to_owned()), intent);
     menu_item(ui, tr!("合并到当前分支", "Merge into current branch"), || Action::Merge(full.clone()), intent);
+    // 回滚排在合并后面：两条都是「把另一条提交的内容带进当前历史」，但回滚**不改写**任何东西——
+    // 它落一条反向提交，已经推出去的历史不用强推。所以这一条不过确认卡（和合并同一条理由：
+    // 它丢不了工作区里的改动，真会撞车时 git 自己会拦住「local changes would be overwritten」）。
+    menu_item(ui, tr!("回滚这条提交", "Revert this commit"), || Action::Revert(full.clone()), intent);
     // 重置走**卡**而不是确认框：三档的差别是「你的改动还在不在」，一句话的确认框装不下，
     // 而这一句正是用户按下去之前唯一想知道的事。名字里写清「当前分支」——挪的是站着的那条。
     menu_card(
@@ -1772,7 +1904,7 @@ pub(crate) fn conflict_section(
     }
 }
 
-/// 进行中的合并/遴选/变基横幅。只在 `repo_state != "none"` 时画，正常仓库的几何一点不动。
+/// 进行中的合并/遴选/变基/回滚横幅。只在 `repo_state != "none"` 时画，正常仓库的几何一点不动。
 /// `continue` 与 `abort` 都走 `land` 那条路（由 `needs_confirm` 拦一道）。
 pub(crate) fn op_banner(ui: &mut egui::Ui, state: &str, conflicts: usize, act: &mut Option<Action>) {
     let Some(title) = op_title(state) else { return };
@@ -1856,11 +1988,11 @@ pub(crate) fn history_diff_row(ui: &mut egui::Ui, width: f32, line: &DiffLine) {
     }
     let x = rect.min.x + NO_W * 2.0 + 6.0;
     let rich = match line.kind {
-        Kind::Hunk => RichText::new(&line.text).font(font.clone()).color(TEXT_MUTED),
+        Kind::Hunk => RichText::new(line.text.as_str()).font(font.clone()).color(TEXT_MUTED),
         // 和差异区同一条例（§3.1）：增/删行连字一起染色。
-        Kind::Add => RichText::new(&line.text).font(font.clone()).color(ADD_FG),
-        Kind::Del => RichText::new(&line.text).font(font.clone()).color(DEL_FG),
-        _ => RichText::new(&line.text).font(font).color(fg),
+        Kind::Add => RichText::new(line.text.as_str()).font(font.clone()).color(ADD_FG),
+        Kind::Del => RichText::new(line.text.as_str()).font(font.clone()).color(DEL_FG),
+        _ => RichText::new(line.text.as_str()).font(font).color(fg),
     };
     put_left(ui, band(rect, x, (rect.max.x - x).max(40.0), th), |ui| {
         ui.add(Label::new(rich).truncate());

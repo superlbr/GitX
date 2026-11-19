@@ -11,6 +11,16 @@ use super::theme::{TEXT_PRIMARY, TEXT_MUTED, STATUS_H};
 /// 常驻反而让人对右下角那格字熟视无睹——原来那格的问题就在这。
 const SHOW_SECS: f64 = 8.0;
 const TOAST_W: f32 = 520.0;
+/// 卡片最多长多高。toast 锚在底部、往上长，所以这个高度直接决定它盖掉上面多少内容：
+/// 一条带「git 原文」的失败提示有 12 行，实测卡片上沿到 y 330，而停在冲突里的操作
+/// 横幅（「继续回滚 / 终止回滚」两枚按钮在 319–334）正压在底下——点不动，等它 8 秒
+/// 自己消失又不是办法。超出的部分改成卡内滚动：一个字不少，但不再霸占内容区。
+/// 96 = 6 行 × 16pt 行高（12pt 字号），够读完中文那句 + `error:` 那一行。
+const TOAST_MAX_H: f32 = 96.0;
+/// 文字那一栏的换行宽度：卡片最大宽 520，减去左右各 12 的内边距、× 那 20、× 前面
+/// 那点空隙（实测 7，取 8）。量内容高度时要按同一个宽度折行，否则量出来的行数
+/// 和真的画出来的对不上。
+const TOAST_TEXT_W: f32 = TOAST_W - 12.0 - 12.0 - 20.0 - 8.0;
 
 /// 卡片描边比 1px 分隔线深半档：toast 悬在白底内容区上，`BORDER_SUBTLE` 会糊掉，
 /// 所以取「控件描边」那一档 `BORDER_STRONG`（旧那枚 `#d0d3d9` 和它本是同一个灰）。
@@ -33,6 +43,29 @@ pub(crate) fn show(ctx: &egui::Context, note: &mut Option<String>, at: &mut Opti
         return;
     }
     let mut close = false;
+    // 按 `TOAST_TEXT_W` 折一遍，量这条提示真实要多高；再和上限取小，就是卡片给文字那一栏的高度。
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        &text,
+        0.0,
+        egui::text::TextFormat {
+            font_id: FontId::proportional(12.0),
+            color: TEXT_PRIMARY,
+            ..Default::default()
+        },
+    );
+    job.wrap = egui::text::TextWrapping {
+        max_width: TOAST_TEXT_W,
+        max_rows: usize::MAX,
+        break_anywhere: true,
+        ..Default::default()
+    };
+    job.break_on_newline = true;
+    let text_h = ctx
+        .fonts_mut(|f| f.layout_job(job.clone()))
+        .size()
+        .y
+        .min(TOAST_MAX_H);
     egui::Area::new(egui::Id::unique("gitx-toast"))
         .anchor(Align2::CENTER_BOTTOM, vec2(0.0, -(STATUS_H + 8.0)))
         .order(egui::Order::Foreground)
@@ -51,7 +84,13 @@ pub(crate) fn show(ctx: &egui::Context, note: &mut Option<String>, at: &mut Opti
                 .show(ui, |ui| {
                     ui.set_max_width(TOAST_W);
                     ui.horizontal(|ui| {
-                        ui.add(egui::Label::new(egui::RichText::new(&text).size(12.0).color(TEXT_PRIMARY)).wrap());
+                        egui::ScrollArea::vertical()
+                            .max_height(text_h)
+                            .min_scrolled_height(text_h)
+                            .auto_shrink([true, true])
+                            .show(ui, |ui| {
+                                ui.add(egui::Label::new(egui::RichText::new(&text).size(12.0).color(TEXT_PRIMARY)).wrap());
+                            });
                         // 整张卡都能点关（原来那格就是点击消失），× 给鼠标一个显式目标。
                         // 用的是乘号「×」（U+00D7），排版符号，不是 emoji——UI 禁 emoji 是契约第②条。
                         let (r, resp) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::click());

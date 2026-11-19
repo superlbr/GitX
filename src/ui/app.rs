@@ -146,6 +146,8 @@ impl Gitx {
         // 决定下面要不要恢复上次那本。走不到 `Gitx::new` 的判据读不到这些初值，
         // 所以「读配置」这件事由 `Prefs::load` 自己承担（见 `state.rs` 上那段注释）。
         let prefs = Prefs::load(conn.as_ref());
+        // 列宽要在 `conn` 被移进结构体**之前**读出来，理由同上（`Prefs::load` 那一行）。
+        let log_cols = ColW::load(conn.as_ref());
         let mut app = Gitx {
             conn,
             repos,
@@ -172,6 +174,7 @@ impl Gitx {
             topo: prefs.topo,
             scope: default_scope(),
             show_remote: prefs.show_remote,
+            log_cols,
             // 真壳一上来就允许翻页：第一页取回不满一页时，`Msg::More` 会把这块牌子拧死。
             log_more: true,
             log_more_busy: false,
@@ -202,6 +205,7 @@ impl Gitx {
             board_open_url: None,
             target: None,
             pending_discard: None,
+            diff_menu_line: None,
             history: None,
             hist_seq: 0,
             modal: None,
@@ -338,8 +342,12 @@ impl Gitx {
             eff_scope(&self.scope, snap.status.detached_at.is_some()),
             self.tx.clone(),
         );
+        // 下一页得**带着同一条 pending rev**：`--skip` 数的是那一次遍历的顺序，
+        // 第一页的行走范围里有它、第二页没有，接上来的就是两条对不上的链子
+        // （重叠或整批漏掉），而且 `skip` 本身还是按带着它的那一页算出来的。
+        let pending = snap.status.op_rev.clone();
         gitx::lang::spawn(move || {
-            let _ = tx.send(match git::commits_page(&repo, skip, LOG_PAGE, topo, &scope) {
+            let _ = tx.send(match git::commits_page(&repo, skip, LOG_PAGE, topo, &scope, pending.as_deref()) {
                 Ok(commits) => Msg::More { repo, seq, commits },
                 Err(e) => Msg::Failed(format!("{repo}: {e}")),
             });
@@ -461,6 +469,9 @@ impl Gitx {
         let Some(repo) = self.repo.clone() else { return };
         self.seq += 1;
         self.pending_discard = None;
+        // 右键 latch 的那一行属于**上一份**补丁：换差异之后同一个下标指的是别一行，
+        // 留着就会让「回滚这一行」指向用户没点过的内容。
+        self.diff_menu_line = None;
         self.target = Some(target.clone());
         let (seq, label, tx) = (self.seq, patch_label(&target), self.tx.clone());
         // 整份差异里要画文件头带：多文件时它是唯一的分界；单文件差异顶上的标题已经写着路径。
@@ -469,7 +480,7 @@ impl Gitx {
         };
         self.busy = true;
         gitx::lang::spawn(move || {
-            let lines = patch_of(&repo, &target).map(|p| layout(&p, show_files)).unwrap_or_default();
+            let lines = patch_of(&repo, &target).map(|p| layout(p, show_files)).unwrap_or_default();
             let _ = tx.send(Msg::Patch { repo, seq, label, lines });
         });
     }
@@ -834,6 +845,9 @@ impl Gitx {
                 Action::StageHunk { path, hunk } => git::stage_hunk(&repo, path, *hunk),
                 Action::UnstageHunk { path, hunk } => git::unstage_hunk(&repo, path, *hunk),
                 Action::DiscardHunk { path, hunk } => git::discard_hunk(&repo, path, *hunk),
+                // 这两条的落点是**工作区**，不是历史：补丁来自 `git show`，反着打回去。
+                Action::RevertHunk { oid, path, hunk } => git::revert_hunk(&repo, oid, path.as_deref(), *hunk),
+                Action::RevertLine { path, added, no, text } => git::revert_line(&repo, path, *added, *no, text),
                 Action::Commit(m) => git::commit(&repo, m, false, &[], false, false).map(|_| ()),
                 Action::Amend(m) => git::commit(&repo, m, true, &[], false, false).map(|_| ()),
                 // 先落提交再推：推送失败时报错，但提交**已经在**了，不往回滚——
@@ -907,6 +921,9 @@ impl Gitx {
                 // 三档里只有硬会碰工作区，而那一档在卡上写明了「找不回来」，
                 // 所以这条路不再叠确认框（叠了会让人以为第一下已经落了）。
                 Action::Reset { oid, mode } => git::reset(&repo, oid, *mode),
+                // 回滚不改写历史：合并提交由 `git::revert` 自己补 `--mainline 1`，
+                // 冲突时它停在半路上，下一次快照的 `repo_state` 就是 "revert"。
+                Action::Revert(oid) => git::revert(&repo, oid),
                 Action::ResolveOurs(p) => git::resolve_ours(&repo, p),
                 Action::ResolveTheirs(p) => git::resolve_theirs(&repo, p),
                 Action::MarkResolved(p) => git::mark_resolved(&repo, p),
@@ -947,6 +964,27 @@ impl Gitx {
             let is_push = matches!(action, Action::PushRefs { .. } | Action::CommitAndPush { .. });
             match r {
                 Ok(()) => {
+                    // 「回滚区块 / 回滚这一行」的落点在工作区，而用户正看着那条提交的差异——
+                    // 那一格一个字都不会变，不说一句就等于「点了没反应」。这两条是**唯一**
+                    // 需要成功提示的动作（其余动作在列表/索引上自己就看得见）。
+                    match &action {
+                        Action::RevertHunk { hunk, .. } => {
+                            let _ = tx.send(Msg::Note(
+                                tr!(
+                                    format!("已把第 {hunk} 块回滚到工作区（历史没动）"),
+                                    format!("Reverted hunk {hunk} into the working tree (history untouched)")
+                                )
+                                .to_owned(),
+                            ));
+                        }
+                        Action::RevertLine { .. } => {
+                            let _ = tx.send(Msg::Note(
+                                tr!("已回滚这一行到工作区（历史没动）", "Reverted this line into the working tree (history untouched)")
+                                    .to_owned(),
+                            ));
+                        }
+                        _ => {}
+                    }
                     // 动作之后重新取一次快照：排序方式得跟着用户那枚开关，不然「层级顺序」
                     // 只在开仓那一次生效，点完提交按钮日志就退回日期序。
                     let _ = tx.send(match snapshot_of(&repo, topo, &scope) {
@@ -962,12 +1000,14 @@ impl Gitx {
                         // 推送失败只发 `PushDone(Err)`：状态栏报「推送失败」，原因进 toast。
                         let _ = tx.send(Msg::PushDone(Err(e.to_string())));
                     } else {
-                        // pull / merge 这类会改写工作区的操作失败时，工作区往往已经进了冲突态
+                        // pull / merge / revert 这类会改写工作区的操作失败时，工作区往往已经进了冲突态
                         // （git 把冲突文件写进工作区之后才非零退出）。若只弹错误、不重取快照，
                         // 界面就停在操作前的状态，unmerged 文件不显示，`op_banner`/`conflict_section`
                         // 也就不画——用户于是以为「冲突没法处理」。这里补一次快照，把已有的冲突
                         // 解决入口（中止 / 继续 / 标记为已解决）露出来。
-                        if matches!(action, Action::PullFrom { .. } | Action::Merge(_)) {
+                        // 回滚是同一族：`REVERT_HEAD` 也是 git 写完冲突文件才留下的，
+                        // 少了这一次重取，横幅那两枚「继续回滚 / 终止回滚」一辈子出不来。
+                        if matches!(action, Action::PullFrom { .. } | Action::Merge(_) | Action::Revert(_)) {
                             if let Ok(s) = snapshot_of(&repo, topo, &scope) {
                                 let _ = tx.send(Msg::Loaded { repo, snap: Box::new(s) });
                             }
@@ -1789,6 +1829,11 @@ impl Gitx {
                         }
                     }
                     self.busy = false;
+                }
+                Msg::Note(s) => {
+                    if !s.is_empty() {
+                        self.note = Some(s);
+                    }
                 }
                 Msg::Failed(e) => {
                     if !e.is_empty() {
@@ -3401,11 +3446,17 @@ impl Gitx {
         let char_w = ui.fonts_mut(|f| f.glyph_width(&font, 'M')).max(1.0);
         let gutter = NO_W * 2.0 + 6.0;
         let content_w = width.max(gutter + self.diff_cols as f32 * char_w + 16.0);
-        // 「只动这一块」那两枚按钮的落点：只有**工作区**的单文件差异有区块可动
-        // （某条提交早就落库了；未跟踪文件在 `git diff` 里根本没有补丁，打不出第二块）。
+        // hunk 头那枚按钮的落点：工作区只有**单文件**差异有区块可动（未跟踪文件在
+        // `git diff` 里根本没有补丁，打不出第二块）；提交那一格反过来，只有它能「回滚」，
+        // 而它没有暂存/放弃（早就落库了）。
         let ops = self.hunk_ops();
+        // 提交那一格的反向：只有它有「回滚区块」，和上面那两枚互斥（一格差异只能有一种去向）。
+        let revert = self.revert_ops();
         let pending = self.pending_discard;
         let mut hit: Option<Action> = None;
+        // 这一帧右键落在补丁的第几行（`diff` 的下标）。菜单开着的时候指针已经移到菜单上了，
+        // 再问「指针底下是哪一行」会问空，所以必须在**右键那一帧**记住。
+        let mut right_row: Option<usize> = None;
         // 「这一帧有没有人碰过放弃那枚」：`None` = 没碰，状态原样留着；
         // `Some(Some(n))` = 第一下， armed 在第 n 块；`Some(None)` = 第二下或点了别的块，拆掉。
         let mut arm: Option<Option<usize>> = None;
@@ -3459,6 +3510,16 @@ impl Gitx {
                     continue;
                 }
                 let (rect, _) = ui.allocate_exact_size(Vec2::new(content_w, DIFF_ROW_H), Sense::hover());
+                // 右键落在这一行：记下它在**整份补丁**里的下标（不是可见行里的序号）。
+                // 判据用的是指针位置与这一行的矩形，不依赖任何控件的 `Sense`——
+                // 容器那枚右键菜单是 `container_context_menu`，它本来就只看 rect。
+                if right_row.is_none() && ui.input(|i| i.pointer.secondary_clicked()) {
+                    if let Some(p) = ui.input(|i| i.pointer.interact_pos()) {
+                        if rect.contains(p) {
+                            right_row = Some(rows[r]);
+                        }
+                    }
+                }
                 let p = ui.painter_at(rect);
                 let bg = match line.kind {
                     Kind::Add => ADD_BG,
@@ -3479,12 +3540,12 @@ impl Gitx {
                 let rich = match line.kind {
                     // hunk 头在 `layout`（工作线程）里就已经翻成人话了，帧里只管画。
                     // 这儿原来还带一份自己的翻译，两条规则各写一遍——见 `a_hunk_row_reads_as_a_block_number_and_line_range`。
-                    Kind::Hunk => RichText::new(&line.text).font(font.clone()).color(TEXT_MUTED),
+                    Kind::Hunk => RichText::new(line.text.as_str()).font(font.clone()).color(TEXT_MUTED),
                     // §3.1 的增/删两行是**连字一起染**（预览稿 `.dl.a`/`.dl.d` 同一条规则），
                     // 不是只铺一条底色带、正文仍然黑。
-                    Kind::Add => RichText::new(&line.text).font(font.clone()).color(ADD_FG),
-                    Kind::Del => RichText::new(&line.text).font(font.clone()).color(DEL_FG),
-                    _ => RichText::new(&line.text).font(font.clone()).color(fg),
+                    Kind::Add => RichText::new(line.text.as_str()).font(font.clone()).color(ADD_FG),
+                    Kind::Del => RichText::new(line.text.as_str()).font(font.clone()).color(DEL_FG),
+                    _ => RichText::new(line.text.as_str()).font(font.clone()).color(fg),
                 };
                 // 文字那一格只按**看得见**的宽度申请（和 hunk 按钮同一个道理：跟着
                 // 内容右缘走会跑到屏幕外）。`.extend()` 不是 `.truncate()`：申请窄了
@@ -3495,12 +3556,10 @@ impl Gitx {
                 });
                 // 参考图把「暂存区块 / 放弃区块」钉在 hunk 头那一行的**右端**
                 // （x 977..1032、1041..1096，带右缘 1105），不是弹在鼠标底下——一直在，
-                // 所以看得见也点得中。
-                if let (Some(n), Some(&(staged, ref path))) = (line.hunk, ops.as_ref()) {
-                    // 只有**头那一行**带按钮。`line.hunk` 在块里每一行都有值（将来按行暂存要用），
-                    // 所以这一句 `Kind::Hunk` 不能省——第一版没写，结果一块六行就长了六组按钮，
-                    // 判据 `the_buttons_follow_which_pane_the_diff_is` 数出来 12 枚。
-                    if line.kind == Kind::Hunk {
+                // 所以看得见也点得中。提交那一格同一枚位置上换成「回滚区块」：同样只有**头那一行**带，
+                // `line.hunk` 在块里每一行都有值。
+                if line.kind == Kind::Hunk {
+                    if let (Some(n), Some(&(staged, ref path))) = (line.hunk, ops.as_ref()) {
                         let cy = rect.center().y;
                         // 按钮钉在**看得见的那条右缘**，不是内容右缘：横向滚动之后
                         // 内容右缘在屏幕外，按钮跟着跑就没法点了。
@@ -3546,6 +3605,21 @@ impl Gitx {
                         if disarm {
                             arm = Some(None);
                         }
+                    } else if let (Some(n), Some((oid, path))) = (line.hunk, revert.as_ref()) {
+                        // 只剩这一枚：没有第二枚要排，所以不碰 `right`。
+                        let (hit_revert, _) = hunk_button(
+                            ui,
+                            tr!("回滚区块", "Revert hunk"),
+                            ui.clip_rect().right() - HUNK_BTN_EDGE,
+                            rect.center().y,
+                        );
+                        if hit_revert {
+                            hit = Some(Action::RevertHunk {
+                                oid: oid.clone(),
+                                path: path.clone(),
+                                hunk: n,
+                            });
+                        }
                     }
                 }
                 fix_pitch(ui, rect);
@@ -3568,26 +3642,51 @@ impl Gitx {
             _ => None,
         };
         let mut copy: Option<String> = None;
-        area.container_context_menu(|ui| {
-            ui.label(RichText::new(tr!("复制", "Copy")).size(11.0).color(TEXT_MUTED));
-            if ui
-                .add_enabled(file.is_some(), egui::Button::new(tr!("文件路径", "File path")).small())
-                .clicked()
-            {
-                copy = file.clone();
-                ui.close();
-            }
-            if ui.add(egui::Button::new(tr!("整份差异", "Whole diff")).small()).clicked() {
-                copy = Some(self.diff.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n"));
-                ui.close();
-            }
-            if oid.is_some() && ui.add(egui::Button::new(tr!("提交号", "Commit SHA")).small()).clicked() {
-                copy = oid.clone();
-                ui.close();
-            }
-        });
+        // 菜单里那一条「回滚这一行」的落点：右键那一帧记下的行 + 当前 `target` 算好。
+        // 算在菜单之前：菜单开着的时候指针已经在菜单上，不能再拿指针去问行号。
+        let can_revert_line = self.revert_line_action().is_some();
+        let mut revert_pick: Option<Action> = None;
+        let menu_open = area
+            .container_context_menu(|ui| {
+                ui.label(RichText::new(tr!("复制", "Copy")).size(11.0).color(TEXT_MUTED));
+                if ui
+                    .add_enabled(file.is_some(), egui::Button::new(tr!("文件路径", "File path")).small())
+                    .clicked()
+                {
+                    copy = file.clone();
+                    ui.close();
+                }
+                if ui.add(egui::Button::new(tr!("整份差异", "Whole diff")).small()).clicked() {
+                    copy = Some(self.diff.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n"));
+                    ui.close();
+                }
+                if oid.is_some() && ui.add(egui::Button::new(tr!("提交号", "Commit SHA")).small()).clicked() {
+                    copy = oid.clone();
+                    ui.close();
+                }
+                // 「回滚这一行」只在**提交的差异**里出现，而且只对着增/删行。工作区那两格
+                // 已经有「放弃区块 / 暂存区块」管同一处改动，再来一条同名不同义的项只会让人点错。
+                if can_revert_line {
+                    ui.separator();
+                    if ui.add(egui::Button::new(tr!("回滚这一行", "Revert this line")).small()).clicked() {
+                        revert_pick = self.revert_line_action();
+                        ui.close();
+                    }
+                }
+            })
+            .is_some();
+        if let Some(a) = revert_pick {
+            hit = Some(a);
+        }
         if let Some(text) = copy {
             ui.ctx().copy_text(text);
+        }
+        // 右键那一帧 latch 进来；菜单关掉（`container_context_menu` 回 `None`）那一帧清掉。
+        // 菜单开着的那几帧 `right_row` 是 `None`，不清 —— 清了下一帧菜单项就自己消失了。
+        if let Some(row) = right_row {
+            self.diff_menu_line = Some(row);
+        } else if !menu_open {
+            self.diff_menu_line = None;
         }
         if let Some(next) = arm {
             self.pending_discard = next;
@@ -3657,6 +3756,53 @@ impl Gitx {
         }
     }
 
+    /// 这一格差异能不能「回滚区块」。只有**某条提交**的补丁有这一档：贮藏那一格是另一条
+    /// 原文（`stash_patch`），把它的补丁反打回工作区等于替用户丢改动，不叫「回滚历史」。
+    /// `path` 为 `None` = 整条提交的补丁，块号跨文件数，和 `hunk_ops` 那边同一套口径。
+    pub(crate) fn revert_ops(&self) -> Option<(String, Option<String>)> {
+        match &self.target {
+            Some(Target::Commit { oid, path }) => Some((oid.clone(), path.clone())),
+            _ => None,
+        }
+    }
+
+    /// 右键那一行能不能「回滚这一行」。只认提交差异里的增/删行：上下文行在提交里没有
+    /// 可回滚的内容，文件头与 hunk 头也不是正文。行号与正文的校验全在 `git::revert_line`。
+    ///
+    /// 正文要从 `DiffLine::text` 里**去掉行首那一个 `+`/`-`**：`layout` 存的是补丁原文，
+    /// 而 core 要的是「这一行本来是什么」。
+    pub(crate) fn revert_line_action(&self) -> Option<Action> {
+        let row = self.diff_menu_line?;
+        let Some(Target::Commit { path, .. }) = &self.target else { return None };
+        let line = self.diff.get(row)?;
+        let (added, no) = match line.kind {
+            Kind::Add => (true, line.new?),
+            Kind::Del => (false, line.old?),
+            // 文件头、hunk 头、上下文行都不在「这一行」的范围里。
+            Kind::File | Kind::Hunk | Kind::Ctx => return None,
+        };
+        // 整条提交的补丁里每一行只记「第几个文件」；路径得从那一条文件头带上取。
+        // 单文件差异的路径就写在 `target` 上，不必再扫。
+        let path = match path {
+            Some(p) => p.clone(),
+            None => {
+                let file = line.file;
+                self.diff[..=row]
+                    .iter()
+                    .rev()
+                    .find(|l| l.kind == Kind::File && l.file == file)?
+                    .text
+                    .to_string()
+            }
+        };
+        let body = match line.kind {
+            Kind::Add => line.text.as_str().strip_prefix('+')?,
+            Kind::Del => line.text.as_str().strip_prefix('-')?,
+            _ => return None,
+        };
+        Some(Action::RevertLine { path, added, no, text: body.to_owned() })
+    }
+
     // ------------------------------------------------------------------- 日志
     pub(crate) fn log_band(&mut self, ui: &mut egui::Ui) {
         let mut intent = Intent::default();
@@ -3682,6 +3828,10 @@ impl Gitx {
         // 日志条右端那枚「搜索」：侧栏那一行去掉之后它是**唯一**的入口。
         let mut open_search = false;
         let width = ui.available_width();
+        // 两列的可拖宽度在闭包**外面**拷成局部（同 `Intent` 那批理由：`self` 正被 `snap` 借着）。
+        // 闭包里只汇报「这一帧拖了哪条边、拖了多少」，宽度与落库都在这里改。
+        let cols = self.log_cols;
+        let mut col_drag: Option<ColDrag> = None;
         let mut want_topo = self.topo;
         let mut want_scope = self.scope.clone();
         let mut want_remote = self.show_remote;
@@ -3781,7 +3931,9 @@ impl Gitx {
                         }
                     });
                 });
-                header_row(ui, width);
+                if let Some(d) = header_row(ui, width, cols) {
+                    col_drag = Some(d);
+                }
                 // 搜索开着、这一次什么都没捞到：列表那一块是空的，`show_rows` 一个字都不画。
                 // 空态得写明，不然看着像「搜索坏了」而不像「没有命中」——尤其框里那个词
                 // 是人自己打的，他会怀疑自己敲错了地方。
@@ -3829,7 +3981,7 @@ impl Gitx {
                             let h = &hits[r];
                             let cells = Cells {
                                 subject: h.commit.subject.clone(),
-                                short: h.commit.short_id.clone(),
+                                short: revision_text(&h.commit.short_id, &h.commit.id, cols.sha),
                                 author: format!("{} <{}>", h.commit.author, h.commit.author_email),
                                 date: h.date.clone(),
                                 badges: visible_badges(&h.badges, remote_shown),
@@ -3841,7 +3993,7 @@ impl Gitx {
                             // 数字空间——两份列表不会在同一帧里出现，所以撞不上；真哪天并排画，
                             // 这里要换成按提交编号发。
                             let resp = ui
-                                .push_id(r, |ui| log_row(ui, width, &cells, sel == hit, None))
+                                .push_id(r, |ui| log_row(ui, width, &cells, sel == hit, None, cols))
                                 .inner;
                             if resp.clicked() && hit != sel {
                                 intent.goto = Some(hit);
@@ -3870,7 +4022,7 @@ impl Gitx {
                             let c = &snap.commits[i];
                             Cells {
                                 subject: c.subject.clone(),
-                                short: c.short_id.clone(),
+                                short: revision_text(&c.short_id, &c.id, cols.sha),
                                 // 作者列：名字带尖括号邮箱（旧参考图这一格是
                                 // `baorong <superlbr@126.com>`；§2 只给了列宽 96，超出的部分
                                 // 由 `band` 截断）。
@@ -3904,7 +4056,7 @@ impl Gitx {
                             Sel::Search(_) => usize::MAX,
                         };
                         let resp = ui
-                            .push_id(key, |ui| log_row(ui, width, &cells, sel == hit, graph))
+                            .push_id(key, |ui| log_row(ui, width, &cells, sel == hit, graph, cols))
                             .inner;
                         if resp.clicked() && hit != sel {
                             intent.goto = Some(hit);
@@ -3920,6 +4072,16 @@ impl Gitx {
                 });
             });
         self.log_filter = query;
+        // 拖列边界：每一帧把增量并进那一列的宽，**松开那一帧**才落库。
+        // 落库不跟着帧走：一次拖拽几十帧，写几十遍同一格没有意义，而中途的值还没夹稳。
+        // 两道闸都在 `drag_column` 里：各列自己的上下限，加上 `col_room` 那道**带宽**闸——
+        // 四列一起顶到各自上限照样能把弹性那一格（提交信息）挤没，常数档管不了这种合谋。
+        if let Some(d) = col_drag {
+            self.log_cols = drag_column(self.log_cols, d.edge, d.dx, width);
+            if d.done {
+                self.log_cols.save(self.conn.as_ref());
+            }
+        }
         if need_more {
             self.ask_for_more();
         }

@@ -18,6 +18,11 @@ pub(crate) enum Seg {
     Tail(usize),
     /// 合并的另一边：从本行圆点弯到 `to` 车道在这一行的行底。
     Arm { from: usize, to: usize },
+    /// 同一个提交被排在几条道上（菱形：几条支线都接到它）时，本行只认第一条，
+    /// 其余那些道**并到本行的圆点上**：从 `from` 车道的行顶弯进 `to` 车道的圆点。
+    /// 没有这一段，`from` 那道上从上面一路走过来的线走到这一行的行顶就断了 ——
+    /// 上面还有线、这一行一个字都没有、下面也没东西接着，用户看到的就是「线条不连贯」。
+    Join { from: usize, to: usize },
 }
 
 #[derive(Clone, Debug)]
@@ -56,9 +61,11 @@ pub(crate) fn layout_graph(commits: &[Commit]) -> Vec<GraphRow> {
                 k
             }
         };
+        let mut joins: Vec<usize> = Vec::new();
         for k in 0..lanes.len() {
             if k != lane && lanes[k].as_deref() == Some(c.id.as_str()) {
                 lanes[k] = None;
+                joins.push(k);
             }
         }
         let mut segs = Vec::new();
@@ -69,6 +76,11 @@ pub(crate) fn layout_graph(commits: &[Commit]) -> Vec<GraphRow> {
             if k != lane && lanes[k].is_some() {
                 segs.push(Seg::Through(k));
             }
+        }
+        // 腾出来的那几条道各自**还有一条从上面走进本行的线**，所以每条都得留下一段
+        // 并回来的弯线；排在 `Through` 之后、`Tail` 之前，读起来是「先处理进来的线」。
+        for from in joins {
+            segs.push(Seg::Join { from, to: lane });
         }
         match c.parents.split_first() {
             Some((first, rest)) => {
@@ -99,6 +111,18 @@ pub(crate) fn lane_x(min_x: f32, lane: usize) -> f32 {
     min_x + LANE0_X + lane as f32 * LANE_W
 }
 
+/// 一条竖直方向上的弯线：两个端点都落在车道中心线上，控制点沿 y 各让开 55%。
+/// 让开的比例是抄旧版的：水平方向不甩出去，两条车道挨得再近也不会在线上打结。
+fn bezier(p: &egui::Painter, a: eframe::egui::Pos2, b: eframe::egui::Pos2, stroke: egui::Stroke) {
+    let d = (b.y - a.y) * 0.55;
+    p.add(egui::epaint::CubicBezierShape::from_points_stroke(
+        [a, a + vec2(0.0, d), b - vec2(0.0, d), b],
+        false,
+        Color32::TRANSPARENT,
+        stroke,
+    ));
+}
+
 /// 画这一行的图元：先线后点，点盖在线头上看着才像「一个提交」。
 pub(crate) fn graph_cell(p: &egui::Painter, row: Rect, g: &GraphRow) {
     let (top, mid, bottom) = (row.min.y, row.center().y, row.max.y);
@@ -116,14 +140,15 @@ pub(crate) fn graph_cell(p: &egui::Painter, row: Rect, g: &GraphRow) {
                 p.line_segment([pos2(x(*k), mid), pos2(x(*k), bottom)], stroke(*k));
             }
             Seg::Arm { from, to } => {
-                let (a, b) = (pos2(x(*from), mid), pos2(x(*to), bottom));
-                let d = (b.y - a.y) * 0.55;
-                p.add(egui::epaint::CubicBezierShape::from_points_stroke(
-                    [a, a + vec2(0.0, d), b - vec2(0.0, d), b],
-                    false,
-                    Color32::TRANSPARENT,
-                    stroke(*to),
-                ));
+                // 颜色跟着**悬着的那一头**：这一条的上头接的是本行的圆点（第 `from` 道），
+                // 下头要一路走进第 `to` 道，所以按 `to` 上色。
+                bezier(p, pos2(x(*from), mid), pos2(x(*to), bottom), stroke(*to));
+            }
+            Seg::Join { from, to } => {
+                // 和 `Arm` 反过来：下面接的是本行的圆点（第 `to` 道），上面那条线
+                // 还得从第 `from` 道一路走进来，所以按 `from` 上色——否则在这一行的
+                // 行顶上会换色，看着还是「断了一截」。
+                bezier(p, pos2(x(*from), top), pos2(x(*to), mid), stroke(*from));
             }
         }
     }

@@ -55,6 +55,9 @@ use crate::viewport;
             topo: false,
             scope: git::Scope::Current,
             show_remote: true,
+            // 列宽按 §2 的默认档摆：夹具没有数据库，`ColW::load(None)` 也返回这个，
+            // 要测拖宽或宽档排版的判据自己把它拧上去。
+            log_cols: ColW::default(),
             // 侧栏「远端」在夹具里是**收起**的：产品默认展开 `origin`（只露前 3 条），
             // 但那样会给下面每条「侧栏第 n 行落在哪个 y」的判据各加 3 行，量到的就不是
             // 原本那些钉死的数了。默认展开由 `the_origin_is_open_before_anyone_clicks_it` 单独验。
@@ -102,6 +105,7 @@ use crate::viewport;
             // 也让 hunk 那两枚按钮在整份补丁上**不出现**（没有单一文件路径可打）。
             target: Some(Target::Working { staged: false, path: None, untracked: false }),
             pending_discard: None,
+            diff_menu_line: None,
             history: None,
             hist_seq: 0,
             modal: None,
@@ -225,6 +229,9 @@ use crate::viewport;
                 ],
                 stash_count: 0,
                 repo_state: String::new(),
+                // 公共夹具走「没有正在进行的操作」那一条；带 pending 的那一档由
+                // 判据自己摆上来（要钉的正是冲突时历史列表多了哪些提交）。
+                op_rev: None,
             },
             commits,
             branches,
@@ -1821,7 +1828,7 @@ use crate::viewport;
     }
 
     /// 已暂存那一格只有「取消暂存区块」，**没有**「放弃区块」：索引里的东西不会被这一格丢掉。
-    /// 某条提交的差异两枚都不许出现（早就落库了，没有区块可动）。
+    /// 某条提交的差异换成**另一枚**「回滚区块」：它不动索引也不动历史，只把那一块反打回工作区。
     /// 问的是**整组文案**而不是「有没有某个词」——「取消暂存区块」里含着「暂存区块」，
     /// 逐词 `contains` 的写法会把这一条判据自己骗过去（第一版就是这么假绿了一次）。
     #[test]
@@ -1847,8 +1854,14 @@ use crate::viewport;
             labels(&mut a)
         };
         assert_eq!(staged, ["取消暂存区块"], "已暂存那格的按钮组不对");
+        let commit = {
+            let mut a = loaded();
+            a.target = Some(Target::Commit { oid: "0".repeat(40), path: Some("src/loose.rs".to_owned()) });
+            labels(&mut a)
+        };
+        assert_eq!(commit, ["回滚区块"], "某条提交那一格该是这一枚（它不落提交、只反打回工作区）");
         for (what, t) in [
-            ("某条提交的差异", Target::Commit { oid: "0".repeat(40), path: Some("src/loose.rs".to_owned()) }),
+            ("贮藏的差异", Target::Stash { oid: "0".repeat(40), path: Some("src/loose.rs".to_owned()) }),
             ("整份差异（没有单一文件）", Target::Working { staged: false, path: None, untracked: false }),
             ("未跟踪文件", Target::Working { staged: false, path: Some("src/loose.rs".to_owned()), untracked: true }),
         ] {
@@ -2624,8 +2637,8 @@ use crate::viewport;
 
         // 差异区：只给一条提交，日志那边固定占两行，多出来的都是差异行。
         let (diff_few, diff_many) = (
-            rows(&mut filled(1, &layout(&patch(400), false))),
-            rows(&mut filled(1, &layout(&patch(40_000), false))),
+            rows(&mut filled(1, &layout(patch(400), false))),
+            rows(&mut filled(1, &layout(patch(40_000), false))),
         );
         assert!(diff_few > log_few, "差异区总共才排 {} 行，比日志还少：差异没进帧", diff_few);
         assert_eq!(diff_few, diff_many, "差异 400→40000 行，行数 {diff_few}→{diff_many}：虚拟化失效");
@@ -2795,6 +2808,75 @@ use crate::viewport;
 
     fn click_section_box(app: &mut Gitx, title: &str) {
         click_box_in_row(app, title, CHK_HEAD_X);
+    }
+
+    /// 表头那四条**可以拖**的列边界在屏幕上的落点。要哪一条就报它**右边那一列**的表头词：
+    /// 「提交号」= 图 | 提交号、「提交信息」= 提交号 | 提交信息、「作者」= 提交信息 | 作者、
+    /// 「日期」= 作者 | 日期。
+    /// 从**画出来的表头文字**量，不拿常量加加减减自己算自己：那条竖线在哪，命中条就该在哪。
+    fn boundary_at(app: &mut Gitx, column: &str) -> Pos2 {
+        boundary_at_size(app, column, WIN_W, WIN_H)
+    }
+
+    /// 同上，指定窗口尺寸：§2 的窗口地板那一档才是「四列合起来挤没弹性列」的现场。
+    fn boundary_at_size(app: &mut Gitx, column: &str, w: f32, h: f32) -> Pos2 {
+        let out = frame_at(app, w, h);
+        let head = head_band(&out);
+        let y = (*head.start() + *head.end()) / 2.0;
+        // 表头每格文字都从自己列的左缘往里缩 `COL_INSET`，反推就是列边界。
+        pos2(text_rect(&out, column, head).min.x - COL_INSET, y)
+    }
+
+    /// 一帧里表头**后四格**文字的左缘（提交号、提交信息、作者、日期；图那一格画的是图元）。
+    /// 列宽判据全靠它：拖之前量一次、拖之后再量一次，比的是屏幕上的竖线而不是 `log_cols` 自己报的数。
+    fn header_edges(app: &mut Gitx) -> [f32; 4] {
+        header_edges_at(app, WIN_W, WIN_H)
+    }
+
+    /// 同上，指定窗口尺寸。
+    fn header_edges_at(app: &mut Gitx, w: f32, h: f32) -> [f32; 4] {
+        let out = frame_at(app, w, h);
+        let head = head_band(&out);
+        let mut edges = [0.0; 4];
+        for (e, label) in edges.iter_mut().zip(["提交号", "提交信息", "作者", "日期"]) {
+            *e = text_rect(&out, label, head.clone()).min.x;
+        }
+        edges
+    }
+
+    /// 在表头那条列边界上按住、横拖 `dx`、（`release` 时）松手。默认窗口尺寸。
+    fn drag_boundary(app: &mut Gitx, from: Pos2, dx: f32, release: bool) {
+        drag_boundary_in(app, from, dx, release, WIN_W, WIN_H)
+    }
+
+    /// 同上，但换成指定尺寸的窗口：`col_room` 那一挡吃的是**带宽**，
+    /// 只在 §2 的窗口地板 860 上才判得出来。
+    /// 分四帧走完：`Response::drag_delta` 报的是**这一帧比上一帧**挪了多少，
+    /// 一帧到位虽然也加得出来，但分几帧才像真人的手，顺带把「中途不落库」走一遍。
+    fn drag_boundary_in(app: &mut Gitx, from: Pos2, dx: f32, release: bool, w: f32, h: f32) {
+        let ctx = egui::Context::default();
+        style(&ctx);
+        let btn = |pos: Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut frames: Vec<Vec<egui::Event>> = vec![
+            vec![egui::Event::PointerMoved(from)],
+            vec![egui::Event::PointerMoved(from), btn(from, true)],
+        ];
+        for i in 1..=4 {
+            let at = pos2(from.x + dx * (i as f32 / 4.0), from.y);
+            frames.push(vec![egui::Event::PointerMoved(at)]);
+        }
+        if release {
+            let end = pos2(from.x + dx, from.y);
+            frames.push(vec![egui::Event::PointerMoved(end), btn(end, false)]);
+        }
+        for events in frames {
+            ctx.run_ui(raw_input_at(w, h, events), |ui| app.shell(ui)).textures_delta.clear();
+        }
     }
 
     /// 一次完整点击的三帧。焦点记在 `Context` 的 memory 里，所以要留住同一个 ctx 让它跨帧活著
@@ -2969,13 +3051,178 @@ use crate::viewport;
             "两条支线都得从主线这一行穿过去，一条都不能少"
         );
         // 最后两行（并回主线之后）只剩第 0 条道：上面那些道一个都不许还占着。
-        assert_eq!(rows[5].segs, vec![Seg::Stem(0), Seg::Tail(0)], "并回那一行还占着别的道");
+        // 而那两条腾出来的道**不是「不画了」**——各留一段并回圆点的弯线，
+        // 否则上面走进来的线到这一行的行顶就没人接了（`every_line_that_enters_a_row_leaves_it`）。
+        assert_eq!(
+            rows[5].segs,
+            vec![
+                Seg::Stem(0),
+                Seg::Join { from: 1, to: 0 },
+                Seg::Join { from: 2, to: 0 },
+                Seg::Tail(0)
+            ],
+            "并回那一行要么还占着别的道，要么把它上面那两截线丢了：{rows:?}"
+        );
         assert_eq!(rows[6].segs, vec![Seg::Stem(0)], "根提交那行画了多余的东西");
         assert!(
             lanes.iter().max().map(|m| *m + 1).unwrap_or(0) <= 4,
             "用掉了 {} 条道，{COL_GRAPH}pt 只装得下 4 条",
             lanes.iter().max().unwrap_or(&0) + 1
         );
+    }
+
+    /// 「线条不连贯」的**结构**判据，不数像素也不赌某个形状：
+    /// 上一行**行底**还接着走的那些车道，必须正好是下一行**行顶**有东西画进去的那些。
+    /// 少一条 = 上面有一截线走进这一行就没人接，画出来就是断的；多一条 = 凭空冒出一截线。
+    /// 杀伤路径：把 `layout_graph` 里腾车道那一段的 `joins.push(k)` 去掉 ——
+    /// 上面那个 `a_rejoin…` 会跟着红，但这一条红的正是「断」这件事本身。
+    #[test]
+    fn every_line_that_enters_a_row_leaves_it_again() {
+        // 行顶有线的道：竖着穿过去的、从上一行接着往下走的（Stem 只画在本行道那一个点之上）、
+        // 以及从别的道并回本行圆点的那一段。
+        let at_top = |r: &GraphRow| -> Vec<usize> {
+            let mut v: Vec<usize> = r
+                .segs
+                .iter()
+                .filter_map(|s| match s {
+                    Seg::Stem(k) | Seg::Through(k) => Some(*k),
+                    Seg::Join { from, .. } => Some(*from),
+                    Seg::Arm { .. } | Seg::Tail(_) => None,
+                })
+                .collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        // 行底有线的道：贯穿的、本行提交往下接第一个父提交的、合并另一端弯过去的。
+        let at_bottom = |r: &GraphRow| -> Vec<usize> {
+            let mut v: Vec<usize> = r
+                .segs
+                .iter()
+                .filter_map(|s| match s {
+                    Seg::Through(k) | Seg::Tail(k) => Some(*k),
+                    Seg::Arm { to, .. } => Some(*to),
+                    Seg::Stem(_) | Seg::Join { .. } => None,
+                })
+                .collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        let check = |rows: &[GraphRow], what: &str| {
+            for (i, r) in rows.iter().enumerate() {
+                if i + 1 < rows.len() {
+                    assert_eq!(
+                        at_bottom(r),
+                        at_top(&rows[i + 1]),
+                        "{what}：第 {i} 行行底是 {:?}，第 {} 行行顶却接住 {:?}",
+                        at_bottom(r),
+                        i + 1,
+                        at_top(&rows[i + 1])
+                    );
+                }
+            }
+            // 顶上不许有悬空的线走进来，尾巴上也不许有走不完的都裁干净。
+            if let Some(first) = rows.first() {
+                assert!(at_top(first).is_empty(), "{what}：第一行之上就有线：{:?}", at_top(first));
+            }
+            if let Some(last) = rows.last() {
+                assert!(
+                    at_bottom(last).is_empty(),
+                    "{what}：最后一行下面还挂着 {:?} 截没人接的线",
+                    at_bottom(last)
+                );
+            }
+        };
+        // 直排历史（全在第 0 道）和菱形（同一条提交被排在几道上）是两种截然不同的接法，
+        // 只钉一种等于给另一半留了盲区。列表是**新的在上**，`layout_graph` 认的就是这个顺序。
+        check(&layout_graph(&branch_commits()), "菱形 + 两次合并");
+        let linear: Vec<Commit> = (0..6)
+            .rev()
+            .map(|i| Commit {
+                id: format!("c{i}"),
+                short_id: format!("c{i}"),
+                author: "包融".to_owned(),
+                author_email: "br@example.com".to_owned(),
+                date: "2026-10-20T11:41:07+08:00".to_owned(),
+                subject: format!("主题{i}"),
+                parents: if i == 0 { vec![] } else { vec![format!("c{}", i - 1)] },
+            })
+            .collect();
+        check(&layout_graph(&linear), "直排历史");
+    }
+
+    /// 图元里的**线段与弯线**，各带上自己那一笔的颜色。`graph_marks` 只要形状，
+    /// 「颜色连不连贯」那条判据必须连色一起问——线条接得上却换了色，看着还是一截断的。
+    fn graph_strokes(out: &egui::FullOutput) -> (Vec<([Pos2; 2], Color32)>, Vec<([Pos2; 4], Color32)>) {
+        let in_content = |c: &egui::epaint::ClippedShape| c.clip_rect.min.x >= SIDEBAR_W - 0.5;
+        let lane32 = |col: Color32| LANE_COLORS.contains(&col);
+        let solid = |m: &egui::epaint::ColorMode| match m {
+            egui::epaint::ColorMode::Solid(c) if lane32(*c) => Some(*c),
+            _ => None,
+        };
+        let mut lines = Vec::new();
+        let mut curves = Vec::new();
+        for c in &out.shapes {
+            if !in_content(c) {
+                continue;
+            }
+            match &c.shape {
+                egui::Shape::LineSegment { points, stroke } if lane32(stroke.color) => lines.push((*points, stroke.color)),
+                egui::Shape::CubicBezier(b) => {
+                    if let Some(col) = solid(&b.stroke.color) {
+                        curves.push((b.points, col));
+                    }
+                }
+                _ => {}
+            }
+        }
+        (lines, curves)
+    }
+
+    /// 一截弯线的颜色由**还悬着的那一头**定：往下甩去接别的道的那头（`Arm`）、
+    /// 从上面一路走进本行的那头（`Join`）。接住圆点的那一头不算——那颗点是它 own 那道的色。
+    /// 上面那条 `every_line_that_enters_a_row_leaves_it_again` 判的是「线接得上」，
+    /// 这一条判的是「颜色也接得上」：换色在行的边界上等于又断了一截，而这正是这次报上来的症状。
+    #[test]
+    fn a_curve_is_coloured_by_the_end_that_is_still_hanging() {
+        let out = frame_at(&mut branched(), WIN_W, WIN_H + STATUS_H);
+        let (dots, _, _) = graph_marks(&out);
+        let left = dots.iter().map(|d| d.x).fold(f32::INFINITY, f32::min);
+        // 圆点所在的 y 就是那一行的中心：弯线有一头必须正好落在那儿，另一头落在行边界上。
+        let at_dot = |y: f32| dots.iter().any(|d| (d.y - y).abs() < 0.6);
+        let lane_of = |x: f32| ((x - left) / LANE_W).round() as usize;
+        let (_, curves) = graph_strokes(&out);
+        assert!(!curves.is_empty(), "帧里一条弯线都没有，下面那圈断言是空判");
+        let mut down = 0;
+        let mut up = 0;
+        for (pts, col) in &curves {
+            let (a, b) = (pts[0], pts[3]);
+            let (hanging, joined) = match (at_dot(a.y), at_dot(b.y)) {
+                (false, true) => (a, b),
+                (true, false) => (b, a),
+                both => panic!("一条弯线的两端落在圆点中心线上的个数是 {both:?}，两头都该有去处：{pts:?}"),
+            };
+            let lane = lane_of(hanging.x);
+            assert_eq!(
+                *col,
+                lane_color(lane),
+                "弯线悬着的那头在第 {lane} 道（{:?}），上的却是 {col:?} 的色——行的边界上会换色，看着就是断了一截",
+                hanging
+            );
+            assert!(
+                (lane_of(joined.x) as f32 - (joined.x - left) / LANE_W).abs() < 0.2,
+                "弯线接圆点的那头没落在车道中心上：{:?}",
+                joined
+            );
+            // 悬着的那头在下面 = 本行往别的道甩出去（`Arm`），在上面 = 别的道走进本行（`Join`）。
+            if hanging.y > joined.y {
+                down += 1;
+            } else {
+                up += 1;
+            }
+        }
+        assert!(down > 0 && up > 0, "这一帧只出现了一种弯线（往下 {down} 条、往上 {up} 条），两种颜色的走法只验了一半");
     }
 
     /// 整列都得待在那 49pt 里。圆点、竖线、弯线的端点一个都不许越界——越出去就是压到提交号那一列。
@@ -2985,7 +3232,9 @@ use crate::viewport;
         let out = frame_at(&mut branched(), WIN_W, WIN_H + STATUS_H);
         let (dots, lines, arms) = graph_marks(&out);
         assert_eq!(dots.len(), 7, "七条提交该有七个点");
-        assert_eq!(arms.len(), 2, "两次合并该有两条弯线");
+        // 两次合并各一条 `Arm`，并回 `L1` 那一行再把上面两条道各自接回圆点、各一条 `Join`
+        // ——两种在形状上是同一种图元（弯线），所以这里一起数。
+        assert_eq!(arms.len(), 4, "两次合并 + 两截并回，该有四条弯线");
         for x in dots
             .iter()
             .map(|d| d.x)
@@ -3785,6 +4034,175 @@ use crate::viewport;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 一本「HEAD 那条提交改了两块」的真仓库，差异区停在**那条提交的整份补丁**上。
+    /// 起点用 `scratch_repo`（它自带一本 main 仓库 + 一条已暂存改动），先把那处改动落成提交，
+    /// 再摆三十行、把第 2/20 行改掉提交——两块隔得比 3 行上下文远，`git show` 才切成两块。
+    fn commit_blocks_repo(tag: &str) -> (Gitx, std::path::PathBuf, String) {
+        let dir = scratch_repo(tag);
+        git_in(&dir, &["commit", "-q", "-m", "落掉暂存"]);
+        let base: String = (1..=30).map(|i| format!("第 {i} 行\n")).collect();
+        std::fs::write(dir.join("thirty.txt"), &base).unwrap();
+        git_in(&dir, &["add", "thirty.txt"]);
+        git_in(&dir, &["commit", "-q", "-m", "三十行"]);
+        let edited: String = (1..=30)
+            .map(|i| match i {
+                2 => "第 2 行改过了\n".to_owned(),
+                20 => "第 20 行改过了\n".to_owned(),
+                _ => format!("第 {i} 行\n"),
+            })
+            .collect();
+        std::fs::write(dir.join("thirty.txt"), &edited).unwrap();
+        git_in(&dir, &["commit", "-q", "-am", "两处"]);
+        let oid = git_in(&dir, &["rev-parse", "HEAD"]);
+        let path = dir.to_str().expect("utf-8 路径").to_owned();
+        let mut app = blank();
+        app.open(&path);
+        pump(&mut app, |a| a.snap.is_some());
+        app.select(Sel::Commit(0));
+        pump(&mut app, |a| !a.diff.is_empty() && a.patch_label.contains("提交的全部改动"));
+        (app, dir, oid)
+    }
+
+    /// 一本「HEAD 那条提交加了一行」的真仓库，差异区停在那条提交的整份补丁上。
+    fn commit_one_line_repo(tag: &str) -> (Gitx, std::path::PathBuf, String) {
+        let dir = scratch_repo(tag);
+        // `scratch_repo` 把那处改动留在索引里；落成提交之后工作区是干净的，
+        // 「回滚」才只能来自那条提交的补丁。
+        git_in(&dir, &["commit", "-q", "-m", "加第二行"]);
+        let oid = git_in(&dir, &["rev-parse", "HEAD"]);
+        let path = dir.to_str().expect("utf-8 路径").to_owned();
+        let mut app = blank();
+        app.open(&path);
+        pump(&mut app, |a| a.snap.is_some());
+        app.select(Sel::Commit(0));
+        pump(&mut app, |a| !a.diff.is_empty() && a.patch_label.contains("提交的全部改动"));
+        (app, dir, oid)
+    }
+
+    /// 右键按住某一行、松手、再空跑一帧（菜单在松开那一帧才排进层里）。
+    /// 和 `menu_pick` 同一套规矩：全程共用一个 `Context`，换一个就等于菜单已经关了。
+    fn right_click(app: &mut Gitx, ctx: &egui::Context, over: &str) {
+        let Some(at) = locate(ctx, app, over) else {
+            panic!("窗口里没有「{over}」这一行");
+        };
+        let btn = |pressed: bool| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        for events in [
+            vec![egui::Event::PointerMoved(at)],
+            vec![egui::Event::PointerMoved(at), btn(true)],
+            vec![egui::Event::PointerMoved(at), btn(false)],
+            vec![egui::Event::PointerMoved(at)],
+        ] {
+            ctx.run_ui(raw_input(events), |ui| app.shell(ui))
+                .textures_delta
+                .clear();
+        }
+    }
+
+    /// 端到端：点「回滚区块」= 只把那**一块**反打回工作区，另一块原样留着，历史一条不动。
+    /// 走的是真仓库 + 真 `git apply -R`：一份单块补丁 git 收不收，只有真 git 说了算。
+    #[test]
+    fn clicking_the_revert_block_button_reverts_that_block_into_the_working_tree() {
+        let (mut app, dir, oid) = commit_blocks_repo("revert-block");
+        assert_eq!(blocks(&mut app), vec![1, 2], "夹具没造出两块，后面什么都没验");
+        let before = std::fs::read_to_string(dir.join("thirty.txt")).unwrap();
+        assert!(before.contains("第 2 行改过了") && before.contains("第 20 行改过了"), "夹具起点不对：{before}");
+        assert!(click_text(&mut app, "回滚区块"), "hunk 行上没有「回滚区块」");
+        pump(&mut app, |a| {
+            std::fs::read_to_string(dir.join("thirty.txt"))
+                .map(|s| !s.contains("第 2 行改过了") && s.contains("第 20 行改过了"))
+                .unwrap_or(false)
+                && a.note.as_deref().map(|n| n.contains("回滚")).unwrap_or(false)
+        });
+        let after = std::fs::read_to_string(dir.join("thirty.txt")).unwrap();
+        assert!(after.contains("第 2 行\n"), "第 1 块没还原成上一版：{after}");
+        assert!(after.contains("第 20 行改过了"), "把第 2 块也一起回滚了：{after}");
+        assert_eq!(git_in(&dir, &["rev-parse", "HEAD"]), oid, "回滚一块动了历史");
+        assert_eq!(git_in(&dir, &["rev-list", "--count", "HEAD"]), "4", "回滚一块改写了提交数");
+        assert!(app.note.as_deref().unwrap_or("").contains("回滚"), "成功之后一个字都没说：{:?}", app.note);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 端到端：右键「回滚这一行」= 只删掉那条提交新增的那一行，历史不动、索引不碰。
+    /// 正文里那个 `+` 必须**被去掉**才交给 core（`revert_line` 要的是「这一行本来是什么」）；
+    /// 带着 `+` 去比对会在「第 2 行已经不一样了」那档被拒，文件一个字都不会变——这条判据一并钉住。
+    #[test]
+    fn the_line_menu_reverts_only_that_line_into_the_working_tree() {
+        let (mut app, dir, oid) = commit_one_line_repo("revert-line");
+        let before = std::fs::read_to_string(dir.join("a.txt")).unwrap();
+        assert_eq!(before, "一行\n第二行\n", "夹具起点不对");
+        menu_pick(&mut app, "+第二行", "回滚这一行");
+        pump(&mut app, |a| {
+            std::fs::read_to_string(dir.join("a.txt")).map(|s| s == "一行\n").unwrap_or(false)
+                && a.note.as_deref().map(|n| n.contains("回滚")).unwrap_or(false)
+        });
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "一行\n", "那一行没删干净");
+        assert_eq!(git_in(&dir, &["rev-parse", "HEAD"]), oid, "回滚一行动了历史");
+        assert_eq!(git_in(&dir, &["diff", "--cached", "--name-only"]), "", "回滚一行把东西放进了索引");
+        // 菜单关掉之后 latch 必须清掉：留着的话下一次右键会指向上一次那一行。
+        assert_eq!(app.diff_menu_line, None, "菜单关掉之后还 latch 着");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 整条提交的补丁里跨文件那一档：右键第二个文件里的新增行，路径要从**那条文件头**上取，
+    /// 不能拿第一个文件的名字顶上去（顶错了回滚的就是别的文件）。
+    #[test]
+    fn the_line_menu_picks_the_file_that_line_belongs_to() {
+        let dir = scratch_repo("revert-line-files");
+        git_in(&dir, &["commit", "-q", "-m", "落掉暂存"]);
+        std::fs::write(dir.join("a.txt"), "一行\n甲新增\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "乙\n乙新增\n").unwrap();
+        git_in(&dir, &["add", "a.txt", "b.txt"]);
+        git_in(&dir, &["commit", "-q", "-m", "两个文件各加一行"]);
+        let oid = git_in(&dir, &["rev-parse", "HEAD"]);
+        let path = dir.to_str().expect("utf-8 路径").to_owned();
+        let mut app = blank();
+        app.open(&path);
+        pump(&mut app, |a| a.snap.is_some());
+        app.select(Sel::Commit(0));
+        pump(&mut app, |a| !a.diff.is_empty() && a.patch_label.contains("提交的全部改动"));
+
+        menu_pick(&mut app, "+乙新增", "回滚这一行");
+        pump(&mut app, |a| {
+            std::fs::read_to_string(dir.join("b.txt")).map(|s| s == "乙\n").unwrap_or(false)
+                && a.note.as_deref().map(|n| n.contains("回滚")).unwrap_or(false)
+        });
+        assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "乙\n", "b.txt 那一行没删掉");
+        assert!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap().contains("甲新增"),
+            "把 a.txt 那一行也一起回滚了（路径取错文件）"
+        );
+        assert_eq!(git_in(&dir, &["rev-parse", "HEAD"]), oid, "回滚一行动了历史");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 工作区那两格**不出现**「回滚这一行」：同一处改动已经有「暂存区块 / 放弃区块」，
+    /// 再来一条同名不同义的项只会让人点错。菜单本身照开（复制那几项还在）。
+    #[test]
+    fn the_line_menu_is_only_offered_for_a_commit() {
+        let (mut app, dir) = open_repo("revert-line-scope");
+        // 先把索引里那条改动落掉，再在工作区留一条**未暂存**的改动——差异区才有正文可右键。
+        git_in(&dir, &["commit", "-q", "-m", "落掉暂存"]);
+        std::fs::write(dir.join("a.txt"), "一行\n新的一行\n").unwrap();
+        app.request(Target::Working { staged: false, path: Some("a.txt".to_owned()), untracked: false });
+        pump(&mut app, |a| !a.diff.is_empty());
+
+        let ctx = egui::Context::default();
+        style(&ctx);
+        right_click(&mut app, &ctx, "+新的一行");
+        assert!(
+            locate(&ctx, &mut app, "回滚这一行").is_none(),
+            "工作区那格也长出了「回滚这一行」"
+        );
+        // 菜单没整个坏掉：复制那几项还在。
+        assert!(locate(&ctx, &mut app, "整份差异").is_some(), "工作区的右键菜单整个没了");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 「放弃区块」要按两下。**第一下只翻按钮，仓库一个字节不许动**——这一条钉的就是这半步：
     /// 少了它，误点一下「放弃」直接把用户没提交的行删掉，而且没有任何判据会红。
     #[test]
@@ -4256,6 +4674,470 @@ use crate::viewport;
         assert_eq!(COL_INSET, 12.0, "列内缩 12 出自预览稿 `.lr{{padding:0 12px}}`（§2 没给这一档）");
         assert_eq!((LANE0_X, LANE_W), (12.0, 10.0), "第 0 道中心 12、道距 10：48pt 装四道的唯一拍法（§7）");
         assert_eq!(FILE_ROW_H, 24.0, "§2 文件表「行高 24」——它和日志的 28 是两回事，不许共用一枚常量");
+    }
+
+    /// 图列右边界往右拖 40pt：**只有图列变宽**。提交号那一格跟着往右挪 40，
+    /// 而作者/日期钉在窗口右缘、一个字都不动（§2 的弹性只有提交信息那一格）。
+    /// 边界从画出来的表头文字量（`boundary_at`），拖完再量一遍 `header_edges`——
+    /// 判的是屏幕上的那条竖线，不是 `app.log_cols` 自己怎么说。
+    #[test]
+    fn dragging_the_graph_boundary_widens_only_the_graph_column() {
+        let mut app = ragged();
+        let from = boundary_at(&mut app, "提交号");
+        let before = header_edges(&mut app);
+        drag_boundary(&mut app, from, 40.0, true);
+        assert!(
+            (app.log_cols.graph - (COL_GRAPH + 40.0)).abs() < 0.5,
+            "拖了 40pt，图列宽从 {:?} 只走到 {:?}",
+            COL_GRAPH,
+            app.log_cols.graph
+        );
+        assert_eq!(app.log_cols.sha, COL_SHA, "拖图列的边界不该动提交号那格的宽");
+        let after = header_edges(&mut app);
+        assert!(
+            (after[0] - (before[0] + 40.0)).abs() < 0.5,
+            "提交号列的左缘没跟着往右走 40：{:?} → {:?}",
+            before[0],
+            after[0]
+        );
+        assert!(
+            (after[1] - (before[1] + 40.0)).abs() < 0.5,
+            "提交信息列的左缘没跟着往右走 40：{:?} → {:?}",
+            before[1],
+            after[1]
+        );
+        // 反向变异：把 `header_row` 里那条边界从 `rect.min.x + cols.graph` 写成 `min_x + COL_GRAPH`，
+        // 上面几条会红；但「作者/日期从右往左定」这条只有在这儿判才抓得住——它抓的是**拖错列**。
+        assert_eq!((after[2], after[3]), (before[2], before[3]), "拖图列把作者/日期两格挪走了");
+        // 数据行也得跟着走（`log_row` 用的是同一个 `cols`）：只把表头拖宽、行还钉在旧的 48 上，
+        // 是这一族最容易漏的那种半截实现。
+        let out = frame(&mut app);
+        let sha_row = text_rect(&out, "a10000", rows_band(&out)).min.x;
+        assert!(
+            (sha_row - (SIDEBAR_W + app.log_cols.graph + COL_INSET)).abs() < 0.5,
+            "表头拖到 {:?} 了，数据行的提交号还钉在旧列宽上（x={sha_row}）",
+            app.log_cols.graph
+        );
+    }
+
+    /// 提交号右边界往右拖 60pt：**只有提交号那格变宽**，而且真的多看几位哈希。
+    /// 「多看几位」判的是**画出来的字**：`ragged()` 的完整号是 `a1` 后面补零，
+    /// 所以行上那块文字只要比 `a1` 长、且多出来的全是零，就是**从完整号里往后补的**——
+    /// 不是把短号重复了一遍，也不是 `revision_text` 自己算完自己验。
+    #[test]
+    fn dragging_the_revision_boundary_widens_only_that_column_and_shows_more_hash() {
+        let mut app = ragged();
+        let from = boundary_at(&mut app, "提交信息");
+        let before = header_edges(&mut app);
+        let short_sha = {
+            let out = frame(&mut app);
+            text_rect(&out, "a1", rows_band(&out)).min.x
+        };
+        drag_boundary(&mut app, from, 60.0, true);
+        assert!(
+            (app.log_cols.sha - (COL_SHA + 60.0)).abs() < 0.5,
+            "拖了 60pt，提交号宽从 {:?} 只走到 {:?}",
+            COL_SHA,
+            app.log_cols.sha
+        );
+        assert_eq!(app.log_cols.graph, COL_GRAPH, "拖提交号的边界不该动图列");
+        let after = header_edges(&mut app);
+        assert!(
+            (after[1] - (before[1] + 60.0)).abs() < 0.5,
+            "提交信息列的左缘没给提交号让出 60：{:?} → {:?}",
+            before[1],
+            after[1]
+        );
+        assert_eq!((after[0], after[2], after[3]), (before[0], before[2], before[3]), "图列与右侧两格跟着漂了");
+        // 拖宽之后再看那一格：左缘不变（还是图列 + 内缩），内容变长。
+        let out = frame(&mut app);
+        let rc = text_rect(&out, "a1", rows_band(&out));
+        assert!((rc.min.x - short_sha).abs() < 0.5, "提交号那一格的起笔位漂了");
+        let shown = all_text_rects(&out, rows_band(&out), &["a1"])
+            .into_iter()
+            .next()
+            .expect("拖宽后提交号那一格空了")
+            .0;
+        assert!(shown.len() > 6, "拖宽 60pt 后还是默认那 6 位「{shown}」，没从完整号里补位");
+        assert!(shown.starts_with("a1") && shown[2..].bytes().all(|b| b == b'0'), "补出来的不是完整号：「{shown}」");
+    }
+
+    /// 某一列现在的宽，按**表头词**取。判据比的是屏幕上那一格，读得懂。
+    fn col_w(cols: ColW, column: &str) -> f32 {
+        match column {
+            "图" => cols.graph,
+            "提交号" => cols.sha,
+            "作者" => cols.author,
+            "日期" => cols.date,
+            _ => panic!("没有「{column}」这一列"),
+        }
+    }
+
+    /// 四档上下限：往界外拖只是顶在天花板/地板上，不越、也不把列拖没。
+    /// `drag_delta` 每帧累加，人手能把它加到屏幕外面去——所以这里是**硬夹**，
+    /// 而夹紧之后下一帧的边界落点也得跟着回来（不然命中条跑到列外面，第二段就拖不动了）。
+    ///
+    /// 右边两列的**方向是反的**：作者/日期钉在窗口右缘，拖的是它们的**左缘**，
+    /// 所以想拖宽得往左拖。这一条把符号一起判了——只测 `log_cols` 的数字，
+    /// 翻错符号的实现照样能顶到同一对常数上。
+    #[test]
+    fn column_widths_are_clamped_to_the_two_bounds() {
+        // (命中条用哪列表头定位, 拖的是哪一列, 往**宽**那一头的越界量, 往**窄**那一头的越界量,
+        //  上下限, 边界在列的哪一头：true = 右缘（往右拖变宽）)
+        let cases = [
+            ("提交号", "图", 400.0, -100.0, (GRAPH_W_MIN, GRAPH_W_MAX), true),
+            ("提交信息", "提交号", 400.0, -100.0, (SHA_W_MIN, SHA_W_MAX), true),
+            ("作者", "作者", -400.0, 400.0, (AUTHOR_W_MIN, AUTHOR_W_MAX), false),
+            ("日期", "日期", -400.0, 400.0, (DATE_W_MIN, DATE_W_MAX), false),
+        ];
+        for (label, column, wide, narrow, (min, max), right_edge) in cases {
+            let mut app = ragged();
+            let drag = |app: &mut Gitx, dx: f32| {
+                let from = boundary_at(app, label);
+                drag_boundary(app, from, dx, true);
+            };
+            // 先验「这一条边界真的拖得动这一列」，否则下面两行顶在常数档上是空判。
+            drag(&mut app, 8.0);
+            assert!(
+                (col_w(app.log_cols, column) - col_w(ColW::default(), column)).abs() > 0.5,
+                "在「{label}」这条边界上拖 8pt，{column} 一列没动——后面上下限都是空判"
+            );
+            drag(&mut app, narrow);
+            assert_eq!(col_w(app.log_cols, column), min, "{column}可以拖到自己的下限 {min} 之下");
+            let from = boundary_at(&mut app, label);
+            let before = col_w(app.log_cols, column);
+            drag(&mut app, wide);
+            assert_eq!(col_w(app.log_cols, column), max, "{column}没夹在上限 {max} 上");
+            // 顶到上限之后，下一帧的命中条必须回到列边界上（而不是留在手指拖出去的地方）。
+            let again = boundary_at(&mut app, label);
+            let moved = max - before;
+            let want = if right_edge { from.x + moved } else { from.x - moved };
+            assert!(
+                (again.x - want).abs() < 0.5,
+                "{column}顶到上限 {max} 之后，「{label}」的命中条还留在拖出界的那个位置：{:?}（该在 {want}）",
+                again.x
+            );
+        }
+        // §2 之外的这八档改了要连 DESIGN.md 一起改（图/提交号那两档是最早拍的，作者/日期沿用同一族）。
+        assert_eq!(
+            (GRAPH_W_MIN, GRAPH_W_MAX, SHA_W_MIN, SHA_W_MAX, AUTHOR_W_MIN, AUTHOR_W_MAX, DATE_W_MIN, DATE_W_MAX),
+            (48.0, 320.0, 48.0, 240.0, 48.0, 320.0, 48.0, 320.0),
+            "四列的上下限是 §2 没给的那几档（DESIGN.md §7），动一档就得改账本"
+        );
+    }
+
+    /// 四条边界**都**跟手：各往右拖 24pt，量的是拖完之后屏幕上那四条竖线，
+    /// 不是 `log_cols` 自己报的数；顺带证明**只动自己那一列**。
+    ///
+    /// 为什么方向在右边两列上是反的：作者/日期从窗口右缘往左排，它们的边界是**左缘**。
+    /// 少 `ColEdge::signed` 那个负号的话，指针往右、竖线往左，用户第一下就撞见；
+    /// 而只看宽度数字这种实现照样「拖得动」——所以这一条判的是竖线落在哪。
+    #[test]
+    fn every_column_boundary_follows_the_pointer() {
+        // (命中条定位用的表头词, 这一条拖的是哪一列, `header_edges` 里那条竖线的下标, 往右拖 24 之后那一格该走的方向)
+        let cases = [
+            ("提交号", "图", 0, 24.0),
+            ("提交信息", "提交号", 1, 24.0),
+            ("作者", "作者", 2, -24.0),
+            ("日期", "日期", 3, -24.0),
+        ];
+        for (label, column, edge, want) in cases {
+            let mut app = ragged();
+            let from = boundary_at(&mut app, label);
+            let before = header_edges(&mut app);
+            drag_boundary(&mut app, from, 24.0, true);
+            let after = header_edges(&mut app);
+            assert!(
+                (after[edge] - (before[edge] + 24.0)).abs() < 0.5,
+                "在「{label}」这条边界上往右拖 24，屏幕上那条竖线从 {:?} 只走到 {:?}",
+                before[edge],
+                after[edge]
+            );
+            assert!(
+                (col_w(app.log_cols, column) - (col_w(ColW::default(), column) + want)).abs() < 0.5,
+                "拖「{label}」这条边界，{column} 该走 {want:?}，实际走了 {:?}（右边两列的符号翻错了？）",
+                col_w(app.log_cols, column) - col_w(ColW::default(), column)
+            );
+            for other in ["图", "提交号", "作者", "日期"].iter().filter(|c| **c != column) {
+                assert_eq!(
+                    col_w(app.log_cols, other),
+                    col_w(ColW::default(), other),
+                    "拖「{label}」把 {other} 那一列也带跑了"
+                );
+            }
+        }
+        // 拖最左边那条（图 | 提交号）时，右边两格钉在窗口右缘，**一格竖线都不许挪**。
+        let mut app = ragged();
+        let from = boundary_at(&mut app, "提交号");
+        let before = header_edges(&mut app);
+        drag_boundary(&mut app, from, 24.0, true);
+        let after = header_edges(&mut app);
+        assert_eq!((after[2], after[3]), (before[2], before[3]), "拖图列的边界把作者/日期的竖线挪走了");
+        // 拖日期那条边界时**作者整列跟着平移**：它的宽没变，但它的左缘是
+        // `右缘 − 日期 − 作者` 定的，日期一窄它就往右挪。这一条钉的是「日期钉在右缘」
+        // 这个排法本身——它不在任何一列的宽度里。
+        let mut app = ragged();
+        let from = boundary_at(&mut app, "日期");
+        let before = header_edges(&mut app);
+        drag_boundary(&mut app, from, 24.0, true);
+        let after = header_edges(&mut app);
+        assert_eq!(app.log_cols.author, COL_AUTHOR, "拖日期的边界不该改作者的宽");
+        assert!(
+            (after[2] - (before[2] + 24.0)).abs() < 0.5,
+            "日期窄了 24，作者那一列却没跟着往右挪：{:?} → {:?}",
+            before[2],
+            after[2]
+        );
+        assert_eq!((after[0], after[1]), (before[0], before[1]), "拖日期把左边两列的竖线也挪了");
+        // 数据行也得跟着表头走（`log_row` 用的是同一份 `cols`）：只把表头拖宽、行里的作者
+        // 还钉在旧的 96 上，是这一族最容易漏的那种半截实现——上面那些判据量的都是表头。
+        let mut app = ragged();
+        let from = boundary_at(&mut app, "作者");
+        drag_boundary(&mut app, from, -40.0, true);
+        assert!(
+            (app.log_cols.author - (COL_AUTHOR + 40.0)).abs() < 0.5,
+            "往左拖 40 该把作者拖宽，实际 {:?}（方向翻了？）",
+            app.log_cols.author
+        );
+        let out = frame(&mut app);
+        let row = text_rect(&out, "包融", rows_band(&out)).min.x;
+        let want = WIN_W - app.log_cols.date - app.log_cols.author + COL_INSET;
+        assert!(
+            (row - want).abs() < 1.0,
+            "表头把作者拖到 {:?} 了，数据行里的作者还钉在旧列宽上（x={row}，该在 {want}）",
+            app.log_cols.author
+        );
+        // 日期列也拖一次（往左 30 = 拖宽到 108），不然这一格只量到默认档、等于没判。
+        let from = boundary_at(&mut app, "日期");
+        drag_boundary(&mut app, from, -30.0, true);
+        assert!(
+            (app.log_cols.date - (COL_DATE + 30.0)).abs() < 0.5,
+            "往左拖 30 该把日期拖宽，实际 {:?}",
+            app.log_cols.date
+        );
+        // 日期那一格给的是相对文案（「今天 09:05」），文字跟着本机时区漂，按内容找会假红；
+        // 改成按位置找——一行里最靠右的那块文字就是日期。
+        let out = frame(&mut app);
+        let rightmost = all_text_rects(&out, rows_band(&out), &[""])
+            .into_iter()
+            .map(|(_, rc)| rc.min.x)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            (rightmost - (WIN_W - app.log_cols.date + COL_INSET)).abs() < 1.0,
+            "数据行里的日期没贴住当前日期列的左缘（x={rightmost}，该在 {:?}）",
+            WIN_W - app.log_cols.date + COL_INSET
+        );
+        let row = text_rect(&out, "包融", rows_band(&out)).min.x;
+        assert!(
+            (row - (WIN_W - app.log_cols.date - app.log_cols.author + COL_INSET)).abs() < 1.0,
+            "日期拖宽之后作者那一列整列该往左让，数据行里的作者却没跟着走（x={row}）"
+        );
+    }
+
+    /// 四列**合起来**也不许把弹性那一格（提交信息）挤没。窗口压在 §2 的地板 860 上：
+    /// 带宽只有 672，四列各自的上限加起来远超它，所以真正拦人的是 `col_room` 那道带宽闸。
+    /// 为什么这一挡非要在壳里算：各列的上下限是常数档，而「还剩多少给提交信息」
+    /// 只有知道**带宽**的那一层答得出。同一个 320 在 1050 的窗里没事，在 860 里就把字挤没了。
+    ///
+    /// 两半各判一种合谋：
+    /// 1. 图列先顶到带宽给的 312（不是它自己的上限 320），之后另外三列**一格都拖不动**。
+    /// 2. 反过来作者先吃满 320，日期就只能拿到 `672 − 48 − 66 − 320 − 120 = 118`，
+    ///    四列之和 + 120 正好等于带宽：弹性那一格一档没多、一档没少。
+    #[test]
+    fn four_columns_together_cannot_squeeze_out_the_message_column() {
+        let band = MIN_W - SIDEBAR_W;
+        let drag = |app: &mut Gitx, label: &str, dx: f32| {
+            let from = boundary_at_size(app, label, MIN_W, WIN_H);
+            drag_boundary_in(app, from, dx, true, MIN_W, WIN_H);
+        };
+        // —— 1. 图列先顶到带宽那一档。
+        let mut app = ragged();
+        let room = band - COL_SHA - COL_AUTHOR - COL_DATE - MSG_W_MIN;
+        assert!(
+            room < GRAPH_W_MAX,
+            "夹具失效：窗口地板 860 给图列留的 {room}pt 比它自己的上限 {GRAPH_W_MAX} 还宽，下面几条都成空判"
+        );
+        drag(&mut app, "提交号", 400.0);
+        assert!(
+            (app.log_cols.graph - room).abs() < 0.5,
+            "图列在 860 的窗里没停在「提交信息还剩 {MSG_W_MIN}」那一档：拖到 {:?}，该停在 {room}",
+            app.log_cols.graph
+        );
+        for (label, column, dx) in [("提交信息", "提交号", 400.0), ("作者", "作者", -400.0), ("日期", "日期", -400.0)] {
+            drag(&mut app, label, dx);
+            assert_eq!(
+                col_w(app.log_cols, column),
+                col_w(ColW::default(), column),
+                "图列已经顶到带宽给的档了，{column} 还能拖宽 = 拿提交信息换"
+            );
+        }
+        let edges = header_edges_at(&mut app, MIN_W, WIN_H);
+        assert!(
+            edges[2] - edges[1] >= MSG_W_MIN - 0.5,
+            "四列顶到拖不动为止后，提交信息那一格只剩 {:?}（下限 {MSG_W_MIN}）",
+            edges[2] - edges[1]
+        );
+
+        // —— 2. 作者先吃满自己的上限，日期接着只能拿带宽剩下的那一档。
+        let mut app = ragged();
+        drag(&mut app, "作者", -400.0);
+        assert_eq!(app.log_cols.author, AUTHOR_W_MAX, "作者在自己那一档上没夹住");
+        drag(&mut app, "日期", -400.0);
+        let left_for_date = band - COL_GRAPH - COL_SHA - AUTHOR_W_MAX - MSG_W_MIN;
+        assert!(
+            left_for_date > DATE_W_MIN,
+            "夹具失效：作者吃满 320 之后带宽连日期的下限都没剩（{left_for_date}），下面那条是空判"
+        );
+        assert!(
+            (app.log_cols.date - left_for_date).abs() < 0.5,
+            "日期该停在带宽剩下的 {left_for_date}，实际停在 {:?}",
+            app.log_cols.date
+        );
+        let sum = app.log_cols.graph + app.log_cols.sha + app.log_cols.author + app.log_cols.date;
+        assert!(
+            (band - sum - MSG_W_MIN).abs() < 0.5,
+            "四列宽之和 {sum} 加弹性下限不等于带宽 {band}：提交信息那一格此刻是 {:?}",
+            band - sum
+        );
+        let edges = header_edges_at(&mut app, MIN_W, WIN_H);
+        assert!(
+            (edges[2] - edges[1] - MSG_W_MIN).abs() < 0.5,
+            "屏幕上提交信息那一格不是正好剩 {MSG_W_MIN}，而是 {:?}",
+            edges[2] - edges[1]
+        );
+    }
+
+    /// 松手才落库，中途一个字都不写；落库那一份读回来要跟屏上的一致。
+    /// 键名写死字面量：它是**用户机器上的持久状态**，改了等于让所有人回到默认档。
+    #[test]
+    fn dragging_a_column_boundary_persists_only_on_release() {
+        let db_file = temp_db("colw");
+        let mut app = ragged();
+        app.conn = Some(db::open(db_file.to_str().unwrap()).expect("临时库"));
+        assert_eq!(ColW::load(app.conn.as_ref()), ColW::default(), "没存过就该是 §2 的默认档");
+
+        // 按住拖一半（不松手）：宽度已经变了，库里还得是空的。
+        let from = boundary_at(&mut app, "提交号");
+        drag_boundary(&mut app, from, 24.0, false);
+        assert!(
+            (app.log_cols.graph - (COL_GRAPH + 24.0)).abs() < 0.5,
+            "中途就没跟上手：图列 {:?}",
+            app.log_cols.graph
+        );
+        for key in ["gitx_col_graph_w", "gitx_col_sha_w", "gitx_col_author_w", "gitx_col_date_w"] {
+            let stored = db::get_setting(app.conn.as_ref().unwrap(), key).ok().flatten();
+            assert_eq!(stored.as_deref(), None, "「{key}」在松手之前就落库了");
+        }
+        // 松手。
+        let from = boundary_at(&mut app, "提交号");
+        drag_boundary(&mut app, from, 8.0, true);
+        let stored = db::get_setting(app.conn.as_ref().unwrap(), "gitx_col_graph_w").ok().flatten();
+        assert_eq!(stored.as_deref(), Some("80"), "松手那一刻没落库（屏上 {:?}）", app.log_cols.graph);
+        // 落库写的是**这一整份**：`ColW` 是一个结构，`save` 一次写四格，没拖的那三格按当前值
+        // （§2 的 66 / 96 / 78）一起写进去。比「只写动过的那格」少一个能把四格写到一半的机会。
+        for (key, want) in [("gitx_col_sha_w", "66"), ("gitx_col_author_w", "96"), ("gitx_col_date_w", "78")] {
+            let stored = db::get_setting(app.conn.as_ref().unwrap(), key).ok().flatten();
+            assert_eq!(stored.as_deref(), Some(want), "没拖的那一格「{key}」落库成了别的数（默认档是 {want}）");
+        }
+        assert_eq!(ColW::load(app.conn.as_ref()), app.log_cols, "重启读回来的和拖完屏上的不是同一份");
+        // 右边那两列也得真的回得来：`save` 少写一格、或 `load` 少读一格，上面那条比对抓不到
+        // （它只比 `log_cols`，而 `log_cols` 是内存里那份）。所以这里走一遍「拖日期 → 落库 → 读回来」。
+        let from = boundary_at(&mut app, "日期");
+        drag_boundary(&mut app, from, -20.0, true);
+        assert!(
+            (app.log_cols.date - (COL_DATE + 20.0)).abs() < 0.5,
+            "往左拖 20 该把日期拖宽，实际 {:?}（方向翻了？）",
+            app.log_cols.date
+        );
+        assert_eq!(
+            db::get_setting(app.conn.as_ref().unwrap(), "gitx_col_date_w").ok().flatten().as_deref(),
+            Some("98"),
+            "日期松手没落库（屏上 {:?}）",
+            app.log_cols.date
+        );
+        let reloaded = ColW::load(app.conn.as_ref());
+        assert_eq!((reloaded.date, reloaded.author), (app.log_cols.date, app.log_cols.author), "日期/作者读回来的不是屏上那一份");
+        let _ = std::fs::remove_file(&db_file);
+    }
+
+    /// 拖宽图列**买的是车道**：道距写死 10（`LANE_W`，§7），48pt 只够四道，
+    /// 那条「八爪合并越出列去」的老边界就此交给用户。这条用五道（一个提交五个父亲）
+    /// 走一遍真拖拽：拖到 96pt 后五个圆点的左右沿全在新列里。
+    #[test]
+    fn widening_the_graph_column_buys_lane_capacity_for_an_octopus_merge() {
+        let node = |id: &str, parents: &[&str]| Commit {
+            id: id.to_owned(),
+            short_id: id.to_owned(),
+            subject: format!("主题{id}"),
+            author: "包融".to_owned(),
+            author_email: "br@example.com".to_owned(),
+            date: "2026-10-20T11:41:07+08:00".to_owned(),
+            parents: parents.iter().map(|p| p.to_string()).collect(),
+        };
+        let commits = vec![
+            node("P", &["L", "B", "C", "D", "E"]),
+            node("E", &["L"]),
+            node("D", &["L"]),
+            node("C", &["L"]),
+            node("B", &["L"]),
+            node("L", &["R"]),
+            node("R", &[]),
+        ];
+        let lanes: Vec<usize> = layout_graph(&commits).iter().map(|r| r.lane).collect();
+        assert_eq!(lanes.iter().max(), Some(&4), "夹具自己没铺到第 4 道（{lanes:?}），下面那条判据是空判");
+        let mut app = filled(1, &[]);
+        let snap = app.snap.as_mut().expect("filled 造好了快照");
+        snap.commits = commits;
+        snap.graph = layout_graph(&snap.commits);
+
+        let from = boundary_at(&mut app, "提交号");
+        drag_boundary(&mut app, from, 48.0, true);
+        assert!(
+            (app.log_cols.graph - (COL_GRAPH + 48.0)).abs() < 0.5,
+            "图列没拖到 96pt（{:?}），下面判的是旧列宽",
+            app.log_cols.graph
+        );
+        // 表头那条命中条**跟着列宽走**：图列顶到 96 后边界落在 284，还留在旧位置的话第二段就拖不动了。
+        let after = boundary_at(&mut app, "提交号");
+        assert!(
+            (after.x - (SIDEBAR_W + app.log_cols.graph)).abs() < 0.5,
+            "命中条还留在旧边界 x={after:?}，列宽已经到 {:?}",
+            app.log_cols.graph
+        );
+        let out = frame_at(&mut app, WIN_W, WIN_H + STATUS_H);
+        let (dots, _, _) = graph_marks(&out);
+        assert_eq!(lanes_of(&dots).into_iter().max(), Some(4), "第 4 道的圆点没进帧：{dots:?}");
+        for d in &dots {
+            assert!(
+                d.x - DOT_R >= SIDEBAR_W && d.x + DOT_R <= SIDEBAR_W + app.log_cols.graph,
+                "半径 4 的圆点落在 x={:?}，越出拖宽后的图列（{SIDEBAR_W}..{:?}）",
+                d.x,
+                SIDEBAR_W + app.log_cols.graph
+            );
+        }
+    }
+
+    /// `revision_text` 那三档规则单独钉——上面几条判的是「拖宽之后帧里长了」，这一条钉的是
+    /// 帧里看不见的两个边界：**窄的时候一位都不许切**（切了就可能在忙仓库里认错提交），
+    /// 以及**完整号不是短号的前缀时不许拼出一个谁也没见过的号**。
+    #[test]
+    fn the_revision_cell_never_cuts_the_short_id_and_extends_only_from_the_full_id() {
+        let full = |tail: &str| format!("a1{tail}{}", "0".repeat(38 - tail.chars().count()));
+        // 默认档 66pt 装得下 6 位：2 位的短号从完整号里补到 6 位。
+        assert_eq!(revision_text("a1", &full(""), COL_SHA), "a10000");
+        // git 自己给的 7 位短号在这一档已经 ≥ fit → 一位不动。
+        let git_full = format!("abc1234{}", "d".repeat(33));
+        assert_eq!(revision_text("abc1234", &git_full, COL_SHA), "abc1234");
+        // 窄到 48（这一档的下限）只装得下 4 位，7 位短号**一位都不许减**：
+        // 那几位是「认得出这条提交最少要几位」，切一位就可能在一本忙仓库里撞号。
+        assert_eq!(revision_text("abc1234", &git_full, SHA_W_MIN), "abc1234", "列变窄把短号切了");
+        // 宽档 130 → 装得下 16 位，从完整号里往后补到 16 位。
+        assert_eq!(revision_text("a1", &full("bc"), 130.0).chars().count(), 16);
+        // 补到底也不许超过 40 位（完整号一共就 40 位）。
+        assert_eq!(revision_text("a1", &full("bc"), 400.0).chars().count(), 40);
+        // 短号不是完整号的前缀（别的 git 算过、或带省略号）→ 照原样给短号，
+        // 不许拼出一个谁也没见过的号。
+        assert_eq!(revision_text("ff…", &full("bc"), 200.0), "ff…");
     }
 
     /// 提交信息列开头那一串 ref 药丸（§4.5：浅底 + 同色描边 + 深色字、圆角 999、11/600；
@@ -7954,6 +8836,58 @@ use crate::viewport;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 端到端，走用户那句原话的路径：在 gitx 里点「合并」→ 撞出冲突 → 历史列表里必须
+    /// 看得见**正被合进来**的那几条提交。
+    ///
+    /// 那几条只从 `MERGE_HEAD` 可达，而日志平时只走 HEAD，所以冲突那一场用户在列表里
+    /// 找不到该点开的提交（报症状的原话：「看不到冲突的提交」）。
+    /// 杀伤路径：把 `snapshot_of` 里传给 `commits_page` 的那条 rev 改回 `None` ——
+    /// 横幅、冲突文件、解决入口全都在，红的只有这一条。
+    #[test]
+    fn a_conflicted_merge_in_gitx_shows_the_incoming_commits_in_the_history() {
+        let dir = scratch_repo("merge-conflict-log");
+        // 夹具留了一处**已暂存**的改动；带着它切分支会被 git 拦下来，
+        // 报出来的就是 checkout 的错，而不是我要问的那件事。
+        git_in(&dir, &["reset", "-q", "--hard", "HEAD"]);
+        git_in(&dir, &["checkout", "-q", "-b", "side"]);
+        std::fs::write(dir.join("a.txt"), "那边的改法\n").unwrap();
+        git_in(&dir, &["commit", "-q", "-am", "那边的提交"]);
+        git_in(&dir, &["checkout", "-q", "main"]);
+        std::fs::write(dir.join("a.txt"), "这边的改法\n").unwrap();
+        git_in(&dir, &["commit", "-q", "-am", "这边的提交"]);
+
+        let path = dir.to_str().expect("utf-8 路径").to_owned();
+        let mut app = blank();
+        app.open(&path);
+        pump(&mut app, |a| a.snap.as_ref().is_some_and(|s| s.commits.len() == 2));
+        // 夹具自己得先在**没有**正在进行操作的那一侧，否则下面测的是别的东西。
+        assert_eq!(app.snap.as_ref().unwrap().status.repo_state, "none");
+        let before = app.snap.as_ref().unwrap().taken_at;
+        assert!(app.act(Action::Merge("side".to_owned())), "「合并」没被接住");
+        pump(&mut app, |a| a.snap.as_ref().is_some_and(|s| s.taken_at > before));
+        let snap = app.snap.as_ref().unwrap();
+        assert_eq!(snap.status.repo_state, "merge", "gitx 里点出来的冲突没被认成进行中的合并");
+        let subs: Vec<String> = snap.commits.iter().map(|c| c.subject.clone()).collect();
+        assert!(
+            subs.contains(&"那边的提交".to_owned()),
+            "冲突的历史列表里没有正被合进来的提交：{subs:?}"
+        );
+        // 补第二条 rev 不能反过来把 HEAD 那一侧挤掉：`git log <sha>` 单看一条就是
+        // 「只看这条的祖先」，一进合并我的提交全没了，比原来那个 bug 更响。
+        for want in ["这边的提交", "起点"] {
+            assert!(subs.contains(&want.to_owned()), "HEAD 那一侧少了「{want}」：{subs:?}");
+        }
+        // 新加进来的那几条也得**排进图序列**，否则行号对不上、那一列会画歪。
+        assert_eq!(snap.graph.len(), snap.commits.len(), "图序列和提交列表对不上行号");
+        // 只信快照等于让被测对象自己出证词：仓库里那条哨兵得真的指向列表里那条提交。
+        assert_eq!(
+            git_in(&dir, &["rev-parse", "MERGE_HEAD"]),
+            snap.status.op_rev.as_deref().unwrap(),
+            "op_rev 和仓库里那条哨兵对不上"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 状态栏在分离时说的两句话：HEAD 现在**在哪条提交**上，以及**怎么回去**。
     /// 完整号只印前 8 位（那一排还要放 ↑2 和右边的路径）；两条出口都要钉——
     /// 记得住分支名就给「回到 main」，一开始就没在分支上（空仓库、或刚 clone 就检出）
@@ -10053,6 +10987,127 @@ use crate::viewport;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ------------------------------------------------------- 右键回滚一条提交（#C-2）
+    //
+    // 产品说法：日志一行的右键里加一项「回滚这条提交」，点一下就走——它不落卡、不过确认框，
+    // 因为它**什么都不删**：在那条提交上面补一条反向提交，已经推出去的历史不用强推。
+    // 拦人的那一层留给 core：冲突时 git 自己停在 `REVERT_HEAD` 上，横幅与「继续回滚 / 终止回滚」
+    // 接着说话（这一族在合并那边已经有判据，回滚这一档是新的 kind）。
+    // 判据两头：干净那一头证明**点下去真的动了 git**，冲突那一头证明**没静默吞掉半截操作**。
+
+    /// 两条提交的干净夹具：`起点` → `第二条`（a.txt 多出「第二行」），工作区干净。
+    fn revert_repo(tag: &str) -> (Gitx, std::path::PathBuf) {
+        let dir = scratch_repo(tag);
+        git_in(&dir, &["commit", "-q", "-m", "第二条"]);
+        assert_eq!(git_in(&dir, &["status", "--porcelain"]), "", "夹具没把暂存那笔改动提交掉");
+        let mut app = blank();
+        app.open(dir.to_str().unwrap());
+        pump(&mut app, |a| a.snap.as_ref().map(|s| s.commits.len()).unwrap_or(0) >= 2);
+        (app, dir)
+    }
+
+    /// 右键「回滚这条提交」：当场落一条反向提交，工作区回到上一版，**而历史一条没少**。
+    /// 走真点击而不是 `app.act`：菜单项换成别的行、`full` 写成 `HEAD`、或者点下去只画了
+    /// 一条 toast，这一条都会红。
+    #[test]
+    fn reverting_from_a_log_row_lands_an_inverse_commit_without_a_confirm_card() {
+        let (mut app, dir) = revert_repo("revert-clean");
+        let second = git_in(&dir, &["rev-parse", "HEAD"]);
+        menu_pick(&mut app, "第二条", "回滚这条提交");
+        assert!(app.modal.is_none(), "回滚不该压一张确认卡（它不删东西，历史也不用改写）");
+        pump(&mut app, |a| a.snap.as_ref().map(|s| s.commits.len()).unwrap_or(0) == 3);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "一行\n",
+            "回滚没把那条提交加的行撤掉"
+        );
+        assert_eq!(git_in(&dir, &["log", "-1", "--format=%s"]), "Revert \"第二条\"", "顶上那条不是回滚提交");
+        assert_eq!(git_in(&dir, &["rev-list", "--count", "HEAD"]), "3", "回滚不该改写历史");
+        assert_eq!(git_in(&dir, &["cat-file", "-t", &second]), "commit", "被回滚的那条提交本身没了");
+        assert_eq!(app.snap.as_ref().unwrap().status.repo_state, "none", "干净的回滚之后不该挂着进行中的操作");
+        // 新落那条得在**日志里看得见**：快照重取只换数据不画字的话，用户看到的是「点了没反应」。
+        let out = warm_frame(&mut app);
+        let all: Vec<String> = texts(&out).into_iter().map(|(t, _)| t).collect();
+        assert!(
+            all.iter().any(|t| t.starts_with("Revert \"第二条\"")),
+            "回滚提交落了库却没出现在历史列表里：{all:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回滚撞上冲突时**不许静默**：横幅换成「未解决的回滚」、正卡住的那条提交还在历史里、
+    /// 继续 / 终止两枚都带操作名，而终止把仓库放回原样。
+    /// 这一条同时钉住 batch A 那套 sentinel 机制对新 kind 是**通的**——`op_at` 少一条
+    /// `REVERT_HEAD` 分支的话，横幅、冲突分组、那两枚按钮会一起消失，用户只剩一条 toast。
+    #[test]
+    fn a_revert_that_conflicts_stops_under_a_revert_banner() {
+        let dir = scratch_repo("revert-conflict");
+        git_in(&dir, &["commit", "-q", "-m", "第二条"]);
+        // 后来把「第二行」改成别的话：回滚「第二条」时那一处正撞上，git 停在半路上。
+        std::fs::write(dir.join("a.txt"), "一行\n改过的\n").unwrap();
+        // `-a` 而不是裸 `commit -m`：上面那笔改动没 `add`，裸提交只会报
+        // 「no changes added to commit」——夹具的这一步不该看本机的脸色。
+        git_in(&dir, &["commit", "-q", "-a", "-m", "第三条"]);
+        let head = git_in(&dir, &["rev-parse", "HEAD"]);
+        let mut app = blank();
+        app.open(dir.to_str().unwrap());
+        pump(&mut app, |a| a.snap.as_ref().map(|s| s.commits.len()).unwrap_or(0) >= 3);
+
+        menu_pick(&mut app, "第二条", "回滚这条提交");
+        pump(&mut app, |a| a.snap.as_ref().is_some_and(|s| s.status.repo_state == "revert"));
+        let snap = app.snap.as_ref().unwrap();
+        assert_eq!(
+            snap.status.op_rev.as_deref(),
+            Some(git_in(&dir, &["rev-parse", "HEAD~1"]).as_str()),
+            "横幅底下那条「正卡住的提交」不是被回滚的那一条"
+        );
+        let out = warm_frame(&mut app);
+        let all: Vec<String> = texts(&out).into_iter().map(|(t, _)| t).collect();
+        assert!(
+            all.iter().any(|t| t == "未解决的回滚：冲突：1"),
+            "停在冲突上的回滚没有自己的横幅（合并那套没跟着管 revert）：{all:?}"
+        );
+        assert!(all.iter().any(|t| t == "冲突的文件（1）"), "冲突文件没进那一组：{all:?}");
+        assert!(all.iter().any(|t| t == "继续回滚"), "横幅上没有「继续回滚」：{all:?}");
+        assert!(all.iter().any(|t| t == "终止回滚"), "横幅上没有「终止回滚」：{all:?}");
+        // 「看不到冲突的提交」那一族的老账：被回滚的那条只从 REVERT_HEAD 可达，
+        // 日志按 HEAD 走的话它一条都不出现。
+        assert!(
+            all.iter().any(|t| t == "第二条"),
+            "正卡住的那条提交没出现在历史列表里：{all:?}"
+        );
+        // 这一条真正要钉的东西：失败提示（toast）从底部往上长，一条带「git 原文」的有 12 行，
+        // 没有限制时实测卡片上沿爬到 y 330，把横幅那两枚按钮整个压在底下——点「终止回滚」只
+        // 关掉提示，仓库还停在半路上（用户说的「不能处理冲突合并」就是这个）。
+        let btn = all_text_rects(&out, 0.0..=WIN_H, &["终止回滚"])
+            .into_iter()
+            .next()
+            .expect("横幅上没有「终止回滚」")
+            .1;
+        let want_bottom = WIN_H - STATUS_H - 8.0;
+        let card = rounded(&out)
+            .into_iter()
+            .filter(|(_, r, _)| (r.max.y - want_bottom).abs() < 1.5 && r.width() > 100.0)
+            .map(|(_, r, _)| r)
+            .next()
+            .expect("状态栏上方没有 toast 卡片");
+        assert!(card.min.y > btn.max.y, "失败提示压住了横幅按钮：卡片 {card:?}，按钮 {btn:?}");
+
+        // 终止：过一张确认卡（`needs_confirm`），按下去把仓库放回原样。
+        assert!(click_text_exact(&mut app, "终止回滚"), "点不到横幅上的「终止回滚」");
+        assert!(app.modal.is_some(), "终止回滚之前没先问一句");
+        assert!(click_warm(&mut app, "确定"), "确认卡上没有「确定」");
+        pump(&mut app, |a| a.snap.as_ref().is_some_and(|s| s.status.repo_state == "none"));
+        assert_eq!(git_in(&dir, &["rev-parse", "HEAD"]), head, "终止把 HEAD 弄走了");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "一行\n改过的\n",
+            "终止之后冲突标记还留在工作区里"
+        );
+        assert_eq!(git_in(&dir, &["status", "--porcelain"]), "", "终止回滚之后工作区不干净");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // -------------------------------------------------- 侧栏「远端」点开第三级（#c-2）
     //
     // 产品说法：点开一条远端 = 看它下面的分支，点一条分支 = 切过去（本地没有就以 `--track` 建一条）。
@@ -10184,4 +11239,113 @@ use crate::viewport;
             body.contains("std::process::exit(0)"),
             "关窗没有提前结束进程，而是交回 eframe 去 drop 窗口——带 Touch Bar 的 Mac 上那一下会 SIGABRT"
         );
+    }
+
+    // ================================================================ 内存这一批（2026-11-17）
+    // 三条判据钉的都是**结构**，不钉字节数：占用多少由分配器和机器说了算，
+    // 「正文是不是一块、图标挂在不挂、stdout 有没有被复制」才是我们改得动的东西。
+
+    /// 差异正文**不许一行复制一块**。2026-11-17 在同一台机器上实测的两档：
+    ///
+    /// | 形状 | 常驻 | 分配次数 | 峰值 |
+    /// |---|---|---|---|
+    /// | 一行一个 `String`（改造前） | 3.49 MB | 30 001 | 4.99 MB |
+    /// | 整份补丁一块 `Arc<str>` + 每行记区间 | 2.06 MB | 2 | 3.54 MB |
+    ///
+    /// 那是 30 002 行的工作区差异（1.43 MB 正文）。真正的代价不在那 3.5 MB，而在
+    /// **30 001 次小块分配**：`vmmap` 的活动分配数从 38 400 跳到 68 688，
+    /// `phys_footprint` 跟着 +15.8 MB（73 → 88.8），也就是说 1.4 MB 的正文付出了
+    /// 大约 12 MB 脏页——每块按 64 字节取整、摸过的页再不还给系统。
+    /// 反向变异（把 `layout` 改回逐行 `DiffText::owned(line.to_owned())`）红的是
+    /// 第一句：两行不再同一块里，第二句连长度都对不上。
+    #[test]
+    fn the_diff_body_shares_one_text_block() {
+        let d = layout(PATCH, true);
+        let body: Vec<&DiffLine> = d
+            .iter()
+            .filter(|l| matches!(l.kind, Kind::Add | Kind::Del | Kind::Ctx))
+            .collect();
+        assert!(body.len() >= 3, "夹具补丁里正文行太少，量不出「共一块」：{}", body.len());
+        for (i, w) in body.windows(2).enumerate() {
+            assert!(
+                w[0].text.shares_arena(&w[1].text),
+                "第 {i} 条正文行和下一条不在同一块文本里：差异正文又被逐行复制了"
+            );
+            assert_eq!(
+                w[0].text.arena_len(),
+                PATCH.len(),
+                "正文那块文本不是整份补丁：{} vs {}",
+                w[0].text.arena_len(),
+                PATCH.len()
+            );
+        }
+        // 区间指着哪一段，必须还是那一行本身（游标算错一格，画出来的就是半个词）。
+        let texts: Vec<&str> = body.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec![" 上下文甲", "-删掉的一行", "+加上的一行", "+又加一行", " 上下文乙"],
+            "正文行和补丁原文对不上"
+        );
+        // 块头那句「块 1： 行 8-11」是现写的文案，不许冒充补丁里的一段。
+        let head = d.iter().find(|l| l.kind == Kind::Hunk).expect("夹具补丁里该有一块");
+        assert!(
+            !head.text.shares_arena(&body[0].text),
+            "块头和正文共用了同一块文本：那句翻译被指回补丁里了"
+        );
+        assert!(head.text.arena_len() < PATCH.len(), "块头那块文本比整份补丁还长？");
+    }
+
+    /// 上面那条判据的游标是按字节走的，而 `str::lines()` 只砍 `\n` 与 `\r\n`
+    /// （单独的 `\r` 留在正文里）——CRLF 的补丁（Windows 上 `core.autocrlf` working）
+    /// 跨错一格，每一行就都多带一个 `\r`：画出来是行的尾巴，搜索时是「搜不到」，
+    /// 复制出去是坏文件。这一条把两种行尾摆在一起逐行对，`layout` 里的区间算术才有闸。
+    #[test]
+    fn a_crlf_patch_lays_out_the_same_lines_as_an_lf_one() {
+        let lf = "diff --git a/x b/x\n+++ b/x\n@@ -1,2 +1,2 @@\n-老的一行\n+新的一行\n";
+        let crlf = lf.replace('\n', "\r\n");
+        let (a, b) = (layout(lf, true), layout(crlf.clone(), true));
+        assert_eq!(a.len(), b.len(), "行尾换成 \\r\\n，排出来的行数就变了");
+        for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+            assert_eq!(x.kind, y.kind, "第 {i} 行的类型变了");
+            assert_eq!(x.file, y.file, "第 {i} 行的户口变了");
+            assert_eq!(x.hunk, y.hunk, "第 {i} 行的块号变了");
+            assert_eq!(
+                x.text.as_str(),
+                y.text.as_str(),
+                "第 {i} 行在 \\r\\n 那一档里多带/少带了什么"
+            );
+            assert!(!y.text.as_str().contains('\r'), "第 {i} 行正文里还留着 \\r");
+        }
+        assert_eq!(
+            b.iter().filter(|l| l.kind == Kind::Ctx || l.kind == Kind::Add).count(),
+            1,
+            "夹具该只有一条新增落进正文"
+        );
+        // 共一块那条在 CRLF 档同样成立：那块文本就是 `crlf` 本身（两字节行尾也在里面）。
+        let add = b.iter().find(|l| l.kind == Kind::Add).expect("没有新增行");
+        assert_eq!(add.text.arena_len(), crlf.len(), "CRLF 档的正文块不是整份补丁");
+    }
+
+    /// 窗口图标只挂在**真会读它**的那一档。winit 0.30 在 macOS 上的 `set_window_icon`
+    /// 是空函数，源码注释写明「macOS doesn't have window icons」
+    /// （`winit-0.30.13/src/platform_impl/macos/window_delegate.rs:1541`），
+    /// 而我们为这张屏幕上不存在的图付的是：解一次 1024² 的 PNG（4 MB RGBA）+ 把它
+    /// 常驻在 viewport 属性里。macOS 的 Dock 那张另有来源（`.app` 里的 `.icns`，
+    /// `scripts/bundle-macos.sh` 用同一张 PNG 切），所以这一省什么都不丢。
+    /// 反向变异：把那条 `#[cfg]` 摘掉 → macOS 档红。
+    #[test]
+    fn the_window_icon_is_only_paid_for_where_the_os_reads_it() {
+        let v = crate::viewport();
+        if cfg!(target_os = "macos") {
+            assert!(
+                v.icon.is_none(),
+                "macOS 的窗口图标根本不被读，却把一张 1024² 的 RGBA 常驻在 viewport 属性里"
+            );
+        } else {
+            let icon = v.icon.expect("这一档的窗口管理器/任务栏靠窗口图标认应用，不能省");
+            assert!(icon.width >= 128, "窗口图标只有 {}，任务栏里会糊", icon.width);
+        }
+        // 省掉图标不许顺手把标题也省了：`cmd+tab` 之外，判据 `the_window_itself_is_floored_at_the_measured_size`
+        // 量的那四格都还在这儿。
+        assert!(v.title.as_deref().unwrap_or("").starts_with("GitX "), "窗口标题没了：{:?}", v.title);
     }

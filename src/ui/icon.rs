@@ -4,17 +4,25 @@
 //! 打包 macOS 的 `.app` 时由 `scripts/bundle-macos.sh` 拿同一张图切 `.icns`，
 //! 所以**只有一份图标素材**，两边不会长得不一样。
 
+/// macOS 那一档整模块都不编译（见下面 `PNG` 那段），导入也跟着条件走，否则零警告门禁
+/// 会在 mac 的产品构建里报一条 unused import。
+#[cfg(any(not(target_os = "macos"), test))]
 use eframe::egui;
 
-/// 打包时嵌进二进制的源图。
+/// 打包时嵌进二进制的源图。macOS 那一档不嵌（`app_icon` 在非 mac 才编译，见 `main.rs`
+/// 里 `viewport()` 那段注释）：不用的字节没必要跟着二进制走。
+/// 测试仍要读它——那三条判据钉的是素材本身，跟平台无关。
+#[cfg(any(not(target_os = "macos"), test))]
 const PNG: &[u8] = include_bytes!("../../assets/icon.png");
 
 /// 给 `ViewportBuilder::with_icon` 用。解不出来就 panic：图标是我们自己打包进来的，
 /// 解码失败只可能是素材坏了，静默退回默认图标会让「没有图标」这件事再偷偷发生一次。
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn app_icon() -> egui::IconData {
     decode(PNG).unwrap_or_else(|e| panic!("打包进去的 assets/icon.png 解不出来：{e}"))
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
 fn decode(bytes: &[u8]) -> Result<egui::IconData, String> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
     // 只认 8 位 RGBA：源图就是我们自己写出来的，转色反而多一处可能出错的地方。

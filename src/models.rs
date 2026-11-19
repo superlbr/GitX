@@ -40,11 +40,19 @@ pub struct RecentOpen {
 /// `step`/`total` 只有变基给得出（读 git-dir 里的 `msgnum`/`end`），合并与遴选是
 /// `None` —— 界面必须能把「第 3 / 12 步」和「正在合并」分开说，把 `None` 显示成
 /// 「0 / 0」是谎报进度。
+///
+/// `rev` 是这次操作**正卡在那条提交上**的那条号，来自同一批哨兵文件的第一行
+/// （合并 = `MERGE_HEAD`，遴选 = `CHERRY_PICK_HEAD`，变基 = `REBASE_HEAD`）。
+/// 它是历史列表能不能看见这场冲突的**唯一**依据：那几条提交只从 `MERGE_HEAD` 可达，
+/// 而 `git log` 只走 HEAD，于是冲突时「正在被合进来的那批」一条都不出现。
+/// `None` = 文件读不出或形状不对，界面按「没有正在进行的操作」处理，不许把
+/// 一个垃圾串塞进 `git log` 的位置参数。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Op {
     pub kind: String,
     pub step: Option<u32>,
     pub total: Option<u32>,
+    pub rev: Option<String>,
 }
 
 /// 首屏「最近」面板里一个仓库的那份摘要。字段按「角标要画什么」选，不按「git 能给什么」：
@@ -297,6 +305,10 @@ pub struct RepoStatus {
     pub files: Vec<FileStatus>,
     pub stash_count: u32,
     pub repo_state: String,
+    /// 进行中那次操作卡住的提交（`Op::rev` 的另一层投影，正常仓库是 `None`）。
+    /// 历史列表把它作为**额外一条 rev** 交给 `git log`，否则那场冲突正卡着的提交
+    /// 只从 `MERGE_HEAD` 可达、在只走 HEAD 的日志里一条都不出现。
+    pub op_rev: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

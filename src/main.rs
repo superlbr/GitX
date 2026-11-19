@@ -19,22 +19,28 @@ use eframe::egui;
 /// 真窗口唯一的配置。拆成函数只为一件事：窗口约束在无头画布上量不到，判据只能读这个对象
 /// （见 `the_window_itself_is_floored_at_the_measured_size`）。
 fn viewport() -> egui::ViewportBuilder {
-    egui::ViewportBuilder::default()
+    let v = egui::ViewportBuilder::default()
         .with_inner_size([WIN_W, WIN_H])
         .with_min_inner_size([MIN_W, MIN_H])
         // 标题栏不画（见下面三条开关），所以 Dock / Mission Control / `cmd+tab`
         // 里认这个应用只能靠这里。版本一并写上：系统那一列没有别的可读。
         .with_title(format!("GitX {}", crate::ui::VERSION))
-        // 窗口图标。macOS 的 Dock 图标来自 `.app` 里的 `.icns`（`scripts/bundle-macos.sh`），
-        // 这一条是给 Linux/Windows 和窗口管理器用的；两边读的是同一张 `assets/icon.png`。
-        .with_icon(crate::ui::icon::app_icon())
         // 参考图里那一行 52pt 是**标题栏本身**：红绿灯 + 仓库名 + 11 枚按钮同在一行。
         // 我们原来在它下面又画了一条工具栏，于是窗口顶部白占一条 28pt 的系统标题栏，
         // 而且仓库名排在 x=9 —— 正被红绿灯盖着。这三条开关把两条带合成一条。
         // `title_shown(false)`：仓库名由我们自己画（macOS 的标题会居中，参考图那个是左对齐的）。
         .with_titlebar_shown(false)
         .with_fullsize_content_view(true)
-        .with_title_shown(false)
+        .with_title_shown(false);
+    // 窗口图标。macOS 那一档**不挂**：winit 0.30 在 mac 上的 `set_window_icon` 是一句空函数
+    // （源码注释写明「macOS doesn't have window icons」），而解一张 1024² 的 PNG 要 4 MB
+    // RGBA，挂进 viewport 属性里就是 4 MB 常驻 —— 换来的是屏幕上什么都不多。
+    // Dock 上那张图另有来源：`.app` 里的 `.icns`（`scripts/bundle-macos.sh` 拿同一张 PNG 切）。
+    // Linux/Windows 的窗口管理器和任务栏认这个应用靠它，那一档照旧要。
+    // 判据：`the_window_icon_is_only_paid_for_where_the_os_reads_it`。
+    #[cfg(not(target_os = "macos"))]
+    let v = v.with_icon(crate::ui::icon::app_icon());
+    v
 }
 
 fn main() -> eframe::Result {
